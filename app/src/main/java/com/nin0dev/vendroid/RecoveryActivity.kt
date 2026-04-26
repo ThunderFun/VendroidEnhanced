@@ -2,20 +2,14 @@ package com.nin0dev.vendroid
 
 import android.content.Context
 import android.content.Intent
-import android.graphics.Color
 import android.os.Bundle
-import android.view.WindowManager
 import androidx.appcompat.app.AppCompatActivity
+import android.webkit.CookieManager
 import com.google.android.material.card.MaterialCardView
 
 class RecoveryActivity : AppCompatActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-
-        window.clearFlags(WindowManager.LayoutParams.FLAG_TRANSLUCENT_STATUS)
-        window.statusBarColor = Color.TRANSPARENT
-        window.clearFlags(WindowManager.LayoutParams.FLAG_TRANSLUCENT_NAVIGATION)
-        window.navigationBarColor = Color.TRANSPARENT
 
         setContentView(R.layout.activity_recovery)
 

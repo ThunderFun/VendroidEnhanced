@@ -2,105 +2,197 @@ package com.nin0dev.vendroid.webview
 
 import android.content.ComponentName
 import android.content.Context
+import android.content.SharedPreferences
 import android.content.pm.PackageManager
+import android.graphics.Color
 import android.view.View.GONE
 import android.view.View.VISIBLE
 import android.webkit.JavascriptInterface
 import android.webkit.WebView
 import android.widget.LinearLayout
+import androidx.core.content.edit
+import androidx.core.view.WindowInsetsCompat
+import androidx.core.view.WindowInsetsControllerCompat
 import com.google.android.material.textfield.TextInputEditText
 import com.nin0dev.vendroid.MainActivity
 import com.nin0dev.vendroid.R
 import com.nin0dev.vendroid.utils.Constants
+import com.nin0dev.vendroid.utils.Logger.e
 import java.io.File
+import java.io.FileOutputStream
+import java.lang.ref.WeakReference
+import java.net.HttpURLConnection
+import java.util.concurrent.Executors
 
-class VencordNative(private val activity: MainActivity, private val wv: WebView) {
+class VencordNative(private val activity: WeakReference<MainActivity>, wv: WebView) {
+    private val wvRef: WeakReference<WebView> = WeakReference(wv)
+
+    companion object {
+        private val ICON_NAMES = arrayOf("Main", "Jolly", "Discord", "Retro", "TS12")
+        @Volatile
+        private var currentIcon: String = "Main"
+    }
+
+    @Volatile
+    var overlayActive = false
+        private set
+
+    private var originalStatusBarColor: Int = 0
+
+    private val settingsPrefs: SharedPreferences? by lazy { activity.get()?.getSharedPreferences("settings", Context.MODE_PRIVATE) }
+
+    private val executor = Executors.newSingleThreadExecutor()
+
+    @Volatile
+    private var quickCssLayout: LinearLayout? = null
+    @Volatile
+    private var loadingScreenLayout: LinearLayout? = null
+    @Volatile
+    private var webview: WebView? = null
+    @Volatile
+    private var cssEditText: TextInputEditText? = null
+
+    fun shutdown() {
+        executor.shutdown()
+    }
+
+    @JavascriptInterface
+    fun setOverlayActive(active: Boolean) {
+        overlayActive = active
+        val act = activity.get() ?: return
+        act.runOnUiThread {
+            val controller = WindowInsetsControllerCompat(act.window, act.window.decorView)
+            if (active) {
+                originalStatusBarColor = act.window.statusBarColor
+                act.window.statusBarColor = Color.BLACK
+                controller.systemBarsBehavior = WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+                controller.hide(WindowInsetsCompat.Type.navigationBars())
+            } else {
+                act.window.statusBarColor = originalStatusBarColor
+                controller.show(WindowInsetsCompat.Type.navigationBars())
+            }
+        }
+    }
+
     @JavascriptInterface
     fun goBack() {
-        activity.runOnUiThread {
-            if (wv.canGoBack()) wv.goBack() else  // no idea what i was smoking when I wrote this
-                activity.getActionBar()
+        activity.get()?.runOnUiThread {
+            val wv = wvRef.get() ?: return@runOnUiThread
+            if (wv.canGoBack()) wv.goBack() else
+                activity.get()?.getActionBar()
         }
     }
 
     @JavascriptInterface
     fun updateVencord() {
-        val sPrefs = activity.getSharedPreferences("settings", Context.MODE_PRIVATE)
-        val vendroidFile = File(activity.filesDir, "vencord.js")
-        val conn = HttpClient.fetch(
-            sPrefs.getString(
-                "vencordLocation",
-                if (
+        executor.execute {
+            var conn: HttpURLConnection? = null
+            try {
+                val act = activity.get() ?: return@execute
+                val sPrefs = settingsPrefs ?: return@execute
+                val vendroidFile = File(act.filesDir, "vencord.js")
+                val defaultUrl = if (
                     sPrefs.getString("clientMod", "vencord") == "equicord"
                 ) Constants.EQUICORD_BUNDLE_URL else Constants.JS_BUNDLE_URL
-            )
-        )
-        vendroidFile.writeText(HttpClient.readAsText(conn.inputStream))
-        activity.showDiscordToast("Updated Vencord, restart to apply changes!", "SUCCESS")
+                val vencordLocation = sPrefs.getString("vencordLocation", defaultUrl) ?: defaultUrl
+                conn = HttpClient.fetch(vencordLocation)
+                conn.inputStream.use { input ->
+                    FileOutputStream(vendroidFile).use { output ->
+                        input.copyTo(output)
+                    }
+                }
+                act.runOnUiThread {
+                    act.showDiscordToast("Updated Vencord, restart to apply changes!", "SUCCESS")
+                }
+            } catch (e: Exception) {
+                activity.get()?.let { e("Failed to update Vencord", e) }
+            } finally {
+                conn?.disconnect()
+            }
+        }
     }
 
     @JavascriptInterface
     fun updateVendroid() {
-        activity.checkUpdates(ignoreSetting = true)
+        activity.get()?.checkUpdates(ignoreSetting = true)
     }
 
     @JavascriptInterface
     fun getString(id: String, defaultValue: String): String {
-        val sPrefs = activity.getSharedPreferences("settings", Context.MODE_PRIVATE)
+        val sPrefs = settingsPrefs ?: return defaultValue
         return try {
-            sPrefs.getString(id, defaultValue)!!;
+            sPrefs.getString(id, defaultValue) ?: defaultValue
         } catch (e: Exception) {
-            "None";
+            defaultValue
         }
     }
 
     @JavascriptInterface
     fun getBool(id: String, defaultValue: Boolean): Boolean {
-        val sPrefs = activity.getSharedPreferences("settings", Context.MODE_PRIVATE)
+        val sPrefs = settingsPrefs ?: return false
         return try {
-            sPrefs.getBoolean(id, defaultValue);
+            sPrefs.getBoolean(id, defaultValue)
         } catch (e: Exception) {
-            false;
+            false
         }
     }
 
     @JavascriptInterface
     fun setString(id: String, value: String) {
-        val sPrefs = activity.getSharedPreferences("settings", Context.MODE_PRIVATE)
-        val e = sPrefs.edit()
-        if(id == "clientMod") e.putInt("lastMajorUpdateThatUserHasUpdatedVencord", 0)
-        e.putString(id, value)
-        e.apply()
+        val sPrefs = settingsPrefs ?: return
+        sPrefs.edit {
+            if (id == "clientMod") putInt("lastMajorUpdateThatUserHasUpdatedVencord", 0)
+            putString(id, value)
+        }
     }
 
     @JavascriptInterface
     fun setBool(id: String, value: Boolean) {
-        val sPrefs = activity.getSharedPreferences("settings", Context.MODE_PRIVATE)
-        val e = sPrefs.edit()
-        e.putBoolean(id, value)
-        e.apply()
+        val sPrefs = settingsPrefs ?: return
+        sPrefs.edit {
+            putBoolean(id, value)
+        }
     }
 
     @JavascriptInterface
     fun changeAppIcon(id: String) {
-        val icons = arrayOf("Main", "Jolly", "Discord", "Retro", "TS12")
-        for (icon in icons) {
-            activity.packageManager.setComponentEnabledSetting(
-                ComponentName(activity.applicationContext,
-                "com.nin0dev.vendroid.${icon}MainActivity"
-            ), if (icon == id) PackageManager.COMPONENT_ENABLED_STATE_ENABLED else PackageManager.COMPONENT_ENABLED_STATE_DISABLED, PackageManager.DONT_KILL_APP)
-        }
+        val act = activity.get() ?: return
+        if (id == currentIcon) return
+        val pm = act.packageManager
+        val pkg = act.applicationContext
+        pm.setComponentEnabledSetting(
+            ComponentName(pkg, "com.nin0dev.vendroid.${currentIcon}MainActivity"),
+            PackageManager.COMPONENT_ENABLED_STATE_DISABLED,
+            PackageManager.DONT_KILL_APP
+        )
+        pm.setComponentEnabledSetting(
+            ComponentName(pkg, "com.nin0dev.vendroid.${id}MainActivity"),
+            PackageManager.COMPONENT_ENABLED_STATE_ENABLED,
+            PackageManager.DONT_KILL_APP
+        )
+        currentIcon = id
     }
 
     @JavascriptInterface
     fun openQuickCss(quickCss: String) {
-        activity.runOnUiThread {
-            activity.findViewById<LinearLayout>(R.id.quickcss).visibility = VISIBLE
-            activity.findViewById<LinearLayout>(R.id.loading_screen).visibility = GONE
-            activity.findViewById<WebView>(R.id.webview).visibility = GONE
-            activity.findViewById<TextInputEditText>(R.id.css).setText(quickCss)
+        val act = activity.get() ?: return
+        act.runOnUiThread {
+            val quickCssView = quickCssLayout ?: act.findViewById<LinearLayout>(R.id.quickcss).also { quickCssLayout = it }
+            val loadingView = loadingScreenLayout ?: act.findViewById<LinearLayout>(R.id.loading_screen).also { loadingScreenLayout = it }
+            val wvView = webview ?: act.findViewById<WebView>(R.id.webview).also { webview = it }
+            val cssEdit = cssEditText ?: act.findViewById<TextInputEditText>(R.id.css).also { cssEditText = it }
+            quickCssView.visibility = VISIBLE
+            loadingView.visibility = GONE
+            wvView.visibility = GONE
+            cssEdit.setText(quickCss)
         }
     }
 
-
+    @JavascriptInterface
+    fun dismissLoadingScreen() {
+        val act = activity.get() ?: return
+        act.runOnUiThread {
+            act.dismissLoadingScreen()
+        }
+    }
 }

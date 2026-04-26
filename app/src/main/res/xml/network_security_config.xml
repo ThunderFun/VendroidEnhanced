@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="utf-8"?>
+<network-security-config>
+    <!-- Enforce HTTPS for Discord domains -->
+    <domain-config cleartextTrafficPermitted="false">
+        <domain includeSubdomains="true">discord.com</domain>
+        <domain includeSubdomains="true">discordapp.com</domain>
+        <domain includeSubdomains="true">discord.gg</domain>
+    </domain-config>
+
+    <!-- Allow cleartext for local development / non-HTTPS Vencord hosts -->
+    <base-config cleartextTrafficPermitted="false">
+        <trust-anchors>
+            <certificates src="system" />
+        </trust-anchors>
+    </base-config>
+
+    <!-- Debug-only: allow cleartext for local development -->
+    <debug-overrides cleartextTrafficPermitted="true">
+        <trust-anchors>
+            <certificates src="system" />
+            <certificates src="user" />
+        </trust-anchors>
+    </debug-overrides>
+</network-security-config>

@@ -6,7 +6,7 @@ object Logger {
     private const val TAG = "Vencord"
     @JvmStatic
     fun e(message: String?) {
-        Log.e(TAG, message!!)
+        Log.e(TAG, message.orEmpty())
     }
 
     @JvmStatic
@@ -16,16 +16,16 @@ object Logger {
 
     @JvmStatic
     fun w(message: String?) {
-        Log.w(TAG, message!!)
+        Log.w(TAG, message.orEmpty())
     }
 
     @JvmStatic
     fun i(message: String?) {
-        Log.i(TAG, message!!)
+        Log.i(TAG, message.orEmpty())
     }
 
     @JvmStatic
     fun d(message: String?) {
-        Log.d(TAG, message!!)
+        Log.d(TAG, message.orEmpty())
     }
 }

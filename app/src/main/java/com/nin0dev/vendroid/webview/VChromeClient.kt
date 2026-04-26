@@ -1,22 +1,53 @@
 package com.nin0dev.vendroid.webview
 
 import android.content.ActivityNotFoundException
+import android.graphics.Color
 import android.net.Uri
+import android.view.View
 import android.webkit.ConsoleMessage
 import android.webkit.ConsoleMessage.MessageLevel
 import android.webkit.ValueCallback
 import android.webkit.WebChromeClient
 import android.webkit.WebView
+import android.widget.FrameLayout
+import androidx.core.view.WindowInsetsCompat
+import androidx.core.view.WindowInsetsControllerCompat
 import com.nin0dev.vendroid.MainActivity
+import com.nin0dev.vendroid.R
 import com.nin0dev.vendroid.utils.Logger.d
 import com.nin0dev.vendroid.utils.Logger.e
 import com.nin0dev.vendroid.utils.Logger.i
 import com.nin0dev.vendroid.utils.Logger.w
-import java.util.Locale
+import java.lang.ref.WeakReference
 
-class VChromeClient(private val activity: MainActivity) : WebChromeClient() {
+class VChromeClient(activity: MainActivity) : WebChromeClient() {
+    private val activityRef: WeakReference<MainActivity> = WeakReference(activity)
+    private var customView: View? = null
+    private var customViewCallback: CustomViewCallback? = null
+    private var originalStatusBarColor: Int = 0
+    private lateinit var fullscreenContainer: FrameLayout
+    private lateinit var webview: WebView
+    private var viewsInitialized = false
+    private var insetsController: WindowInsetsControllerCompat? = null
+    val isFullscreen: Boolean get() = customView != null
+
+    private fun ensureViewsInitialized(activity: MainActivity) {
+        if (!viewsInitialized) {
+            fullscreenContainer = activity.findViewById(R.id.fullscreen_container)
+            webview = activity.findViewById(R.id.webview)
+            viewsInitialized = true
+        }
+    }
+
+    private fun getInsetsController(activity: MainActivity): WindowInsetsControllerCompat {
+        return insetsController ?: WindowInsetsControllerCompat(activity.window, activity.window.decorView).also {
+            insetsController = it
+        }
+    }
+
     override fun onConsoleMessage(msg: ConsoleMessage): Boolean {
-        val m = String.format(Locale.ENGLISH, "[Javascript] %s @ %d: %s", msg.message(), msg.lineNumber(), msg.sourceId())
+        if (!com.nin0dev.vendroid.BuildConfig.DEBUG) return true
+        val m = "[Javascript] ${msg.message()} @ ${msg.lineNumber()}: ${msg.sourceId()}"
         when (msg.messageLevel()) {
             MessageLevel.DEBUG -> d(m)
             MessageLevel.ERROR -> e(m)
@@ -31,6 +62,8 @@ class VChromeClient(private val activity: MainActivity) : WebChromeClient() {
         filePathCallback: ValueCallback<Array<Uri>>,
         fileChooserParams: FileChooserParams
     ): Boolean {
+        val activity = activityRef.get() ?: return false
+
         activity.filePathCallback?.onReceiveValue(null)
         activity.filePathCallback = null
 
@@ -43,6 +76,46 @@ class VChromeClient(private val activity: MainActivity) : WebChromeClient() {
         } catch (e: ActivityNotFoundException) {
             activity.filePathCallback = null
             false
+        }
+    }
+
+    override fun onShowCustomView(view: View, callback: CustomViewCallback) {
+        if (customView != null) {
+            callback.onCustomViewHidden()
+            customViewCallback?.onCustomViewHidden()
+            return
+        }
+        customView = view
+        customViewCallback = callback
+        val activity = activityRef.get() ?: return
+        ensureViewsInitialized(activity)
+        fullscreenContainer.addView(view)
+        fullscreenContainer.visibility = View.VISIBLE
+        webview.visibility = View.GONE
+        val controller = getInsetsController(activity)
+        controller.systemBarsBehavior = WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+        controller.hide(WindowInsetsCompat.Type.navigationBars())
+        originalStatusBarColor = activity.window.statusBarColor
+        activity.window.statusBarColor = Color.BLACK
+    }
+
+    override fun onHideCustomView() {
+        if (customView == null) return
+        val activity = activityRef.get() ?: return
+        fullscreenContainer.visibility = View.GONE
+        fullscreenContainer.removeView(customView)
+        webview.visibility = View.VISIBLE
+        val controller = getInsetsController(activity)
+        controller.show(WindowInsetsCompat.Type.navigationBars())
+        activity.window.statusBarColor = originalStatusBarColor
+        customViewCallback?.onCustomViewHidden()
+        customView = null
+        customViewCallback = null
+    }
+
+    fun hideCustomView() {
+        if (customView != null) {
+            onHideCustomView()
         }
     }
 }

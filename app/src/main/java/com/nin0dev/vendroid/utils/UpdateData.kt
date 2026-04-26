@@ -8,12 +8,12 @@ data class UpdateData(
 )
 
 data class Update(
-    @SerializedName("title") val title: String,
-    @SerializedName("text") val text: String
+    @SerializedName("title") val title: String?,
+    @SerializedName("text") val text: String?
 )
 
 data class Announcement(
-    @SerializedName("id") val id: Int,
-    @SerializedName("title") val title: String,
-    @SerializedName("text") val text: String
+    @SerializedName("id") val id: Long,
+    @SerializedName("title") val title: String?,
+    @SerializedName("text") val text: String?
 )
