@@ -51,6 +51,7 @@ class MainActivity : Activity() {
     private var loadingScreenDismissed = false
     private var loadingAnimationRunnable: Runnable? = null
     private var loadingTimeoutRunnable: Runnable? = null
+    private var loadingDismissRunnable: Runnable? = null
     private val fetchExecutor = Executors.newSingleThreadExecutor()
     private var loadingAnimStartTime: Long = 0
     private val mainHandler = Handler(Looper.getMainLooper())
@@ -114,9 +115,10 @@ class MainActivity : Activity() {
                 val conn = HttpClient.fetch(url)
                 val response = HttpClient.readAsText(conn.inputStream, conn.contentLength.coerceAtLeast(8192))
                 conn.disconnect()
-                val updateData = gson.fromJson<UpdateData>(response, UpdateData::class.java)
+                val updateData = gson.fromJson<UpdateData>(response, UpdateData::class.java) ?: return@execute
 
                 runOnUiThread {
+                    if (isFinishing || isDestroyed) return@runOnUiThread
                     if (updateData.update != null && sPrefs.getBoolean("checkVDEUpdates", true)) {
                         MaterialAlertDialogBuilder(this@MainActivity)
                             .setIcon(R.drawable.baseline_system_update_24)
@@ -172,7 +174,9 @@ class MainActivity : Activity() {
 
     fun scheduleLoadingScreenDismiss(delayMs: Long) {
         if (loadingScreenDismissed) return
-        mainHandler.postDelayed({ dismissLoadingScreen() }, delayMs)
+        val runnable = Runnable { dismissLoadingScreen() }
+        loadingDismissRunnable = runnable
+        mainHandler.postDelayed(runnable, delayMs)
     }
 
     private fun startLoadingAnimation() {
@@ -254,6 +258,7 @@ class MainActivity : Activity() {
         s.setRenderPriority(android.webkit.WebSettings.RenderPriority.HIGH)
         s.mediaPlaybackRequiresUserGesture = false
         s.mixedContentMode = android.webkit.WebSettings.MIXED_CONTENT_COMPATIBILITY_MODE
+        s.setBuiltInZoomControls(false)
 
         android.webkit.CookieManager.getInstance().setAcceptThirdPartyCookies(wv!!, true)
 
@@ -381,6 +386,8 @@ class MainActivity : Activity() {
 
     override fun onDestroy() {
         loadingTimeoutRunnable?.let { mainHandler.removeCallbacks(it) }
+        loadingDismissRunnable?.let { mainHandler.removeCallbacks(it) }
+        loadingDismissRunnable = null
         loadingAnimationRunnable?.let { mainHandler.removeCallbacks(it) }
         loadingAnimationRunnable = null
         wv?.onPause()

@@ -811,6 +811,7 @@ video {
 
     function closeImageOverlay() {
         if (!imgOverlay) return;
+        if (imgOverlay._resetImgTransform) imgOverlay._resetImgTransform();
         try { ModalEscapeHandler.action(); } catch(e) {}
         imgOverlay.remove();
         imgOverlay = null;
@@ -871,14 +872,115 @@ video {
         closeImageOverlay();
         src = toFullResUrl(src);
         const overlay = document.createElement("div");
-        overlay.style.cssText = "position:fixed;top:0;left:0;width:100vw;height:100vh;background:rgba(0,0,0,0.95);display:flex;align-items:center;justify-content:center;z-index:2147483646;outline:none;";
+        overlay.style.cssText = "position:fixed;top:0;left:0;width:100vw;height:100vh;background:rgba(0,0,0,0.95);display:flex;align-items:center;justify-content:center;z-index:2147483646;outline:none;overflow:hidden;touch-action:none;";
         overlay.setAttribute("tabindex", "-1");
         overlay.focus({ preventScroll: true });
 
         const img = document.createElement("img");
         img.src = src;
-        img.style.cssText = "max-width:100vw;max-height:100vh;width:auto;height:auto;object-fit:contain;";
+        img.style.cssText = "max-width:100vw;max-height:100vh;width:auto;height:auto;object-fit:contain;transform-origin:0 0;";
         img.setAttribute("tabindex", "-1");
+        img.draggable = false;
+
+        let imgScale = 1, imgTx = 0, imgTy = 0;
+        let pinchStartDist = 0, pinchStartScale = 1, pinchStartTx = 0, pinchStartTy = 0, pinchMidX = 0, pinchMidY = 0;
+        let pinchLayoutLeft = 0, pinchLayoutTop = 0, imgLayoutWidth = 0, imgLayoutHeight = 0;
+        let panStartX = 0, panStartY = 0, panStartTx = 0, panStartTy = 0;
+        let activeTouches = 0;
+
+        function clampTransform() {
+            const vw = window.innerWidth, vh = window.innerHeight;
+            const rw = imgLayoutWidth * imgScale, rh = imgLayoutHeight * imgScale;
+            if (rw <= vw) {
+                imgTx = (vw - rw) / 2 - pinchLayoutLeft;
+            } else {
+                const minTx = -pinchLayoutLeft - (rw - vw);
+                const maxTx = -pinchLayoutLeft;
+                imgTx = Math.max(minTx, Math.min(maxTx, imgTx));
+            }
+            if (rh <= vh) {
+                imgTy = (vh - rh) / 2 - pinchLayoutTop;
+            } else {
+                const minTy = -pinchLayoutTop - (rh - vh);
+                const maxTy = -pinchLayoutTop;
+                imgTy = Math.max(minTy, Math.min(maxTy, imgTy));
+            }
+        }
+
+        function updateImgTransform() {
+            if (imgScale > 1) clampTransform();
+            img.style.transform = "translate(" + imgTx + "px," + imgTy + "px) scale(" + imgScale + ")";
+        }
+
+        function resetImgTransform() {
+            imgScale = 1; imgTx = 0; imgTy = 0;
+            img.style.transform = "";
+        }
+
+        overlay._resetImgTransform = resetImgTransform;
+
+        overlay.addEventListener("touchstart", e => {
+            if (e.touches.length === 2) {
+                e.preventDefault();
+                const dx = e.touches[0].clientX - e.touches[1].clientX;
+                const dy = e.touches[0].clientY - e.touches[1].clientY;
+                pinchStartDist = Math.sqrt(dx * dx + dy * dy);
+                pinchStartScale = imgScale;
+                pinchStartTx = imgTx;
+                pinchStartTy = imgTy;
+                pinchMidX = (e.touches[0].clientX + e.touches[1].clientX) / 2;
+                pinchMidY = (e.touches[0].clientY + e.touches[1].clientY) / 2;
+                const rect = img.getBoundingClientRect();
+                pinchLayoutLeft = rect.left - imgTx;
+                pinchLayoutTop = rect.top - imgTy;
+                imgLayoutWidth = rect.width / imgScale;
+                imgLayoutHeight = rect.height / imgScale;
+                activeTouches = 2;
+            } else if (e.touches.length === 1 && imgScale > 1) {
+                panStartX = e.touches[0].clientX;
+                panStartY = e.touches[0].clientY;
+                panStartTx = imgTx;
+                panStartTy = imgTy;
+                activeTouches = 1;
+            }
+        }, { passive: false });
+
+        overlay.addEventListener("touchmove", e => {
+            if (e.touches.length === 2 && activeTouches === 2) {
+                e.preventDefault();
+                const dx = e.touches[0].clientX - e.touches[1].clientX;
+                const dy = e.touches[0].clientY - e.touches[1].clientY;
+                const dist = Math.sqrt(dx * dx + dy * dy);
+                const ratio = dist / pinchStartDist;
+                imgScale = Math.min(Math.max(pinchStartScale * ratio, 1), 5);
+                const scaleDelta = imgScale / pinchStartScale;
+                const curMidX = (e.touches[0].clientX + e.touches[1].clientX) / 2;
+                const curMidY = (e.touches[0].clientY + e.touches[1].clientY) / 2;
+                imgTx = curMidX - pinchLayoutLeft - (pinchMidX - pinchLayoutLeft - pinchStartTx) * scaleDelta;
+                imgTy = curMidY - pinchLayoutTop - (pinchMidY - pinchLayoutTop - pinchStartTy) * scaleDelta;
+                updateImgTransform();
+            } else if (e.touches.length === 1 && activeTouches === 1 && imgScale > 1) {
+                e.preventDefault();
+                const dx = e.touches[0].clientX - panStartX;
+                const dy = e.touches[0].clientY - panStartY;
+                imgTx = panStartTx + dx;
+                imgTy = panStartTy + dy;
+                updateImgTransform();
+            }
+        }, { passive: false });
+
+        overlay.addEventListener("touchend", e => {
+            if (e.touches.length === 0) {
+                activeTouches = 0;
+                if (imgScale <= 1.02) resetImgTransform();
+            } else if (e.touches.length === 1 && activeTouches === 2) {
+                panStartX = e.touches[0].clientX;
+                panStartY = e.touches[0].clientY;
+                panStartTx = imgTx;
+                panStartTy = imgTy;
+                activeTouches = 1;
+            }
+        });
 
         const closeBtn = document.createElement("div");
         closeBtn.innerHTML = svgClose;
@@ -892,7 +994,7 @@ video {
         imgOverlay = overlay;
 
         overlay.addEventListener("click", e => {
-            if (e.target === overlay) closeImageOverlay();
+            if (e.target === overlay && imgScale <= 1) closeImageOverlay();
         });
 
         notifyOverlayState();

@@ -11,7 +11,7 @@ object Logger {
 
     @JvmStatic
     fun e(message: String?, e: Throwable?) {
-        Log.e(TAG, message, e)
+        Log.e(TAG, message.orEmpty(), e)
     }
 
     @JvmStatic

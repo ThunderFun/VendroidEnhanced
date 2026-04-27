@@ -101,16 +101,21 @@ class VChromeClient(activity: MainActivity) : WebChromeClient() {
 
     override fun onHideCustomView() {
         if (customView == null) return
-        val activity = activityRef.get() ?: return
+        val activity = activityRef.get()
+        val localCustomView = customView
+        val localCallback = customViewCallback
+
+        customView = null
+        customViewCallback = null
+
+        if (activity == null) return
         fullscreenContainer.visibility = View.GONE
-        fullscreenContainer.removeView(customView)
+        fullscreenContainer.removeView(localCustomView)
         webview.visibility = View.VISIBLE
         val controller = getInsetsController(activity)
         controller.show(WindowInsetsCompat.Type.navigationBars())
         activity.window.statusBarColor = originalStatusBarColor
-        customViewCallback?.onCustomViewHidden()
-        customView = null
-        customViewCallback = null
+        localCallback?.onCustomViewHidden()
     }
 
     fun hideCustomView() {

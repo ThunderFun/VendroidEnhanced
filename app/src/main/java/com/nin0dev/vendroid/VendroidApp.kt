@@ -10,7 +10,8 @@ class VendroidApp : Application() {
         // This front-loads the ~200-500ms cost of spawning the WebView
         // process so that MainActivity's WebView creation is faster.
         try {
-            WebView(this)
+            val webView = WebView(this)
+            webView.destroy()
         } catch (_: Exception) {
             // Silently ignore — some ROMs or restricted environments may fail
         }

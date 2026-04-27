@@ -14,10 +14,12 @@ class RecoveryActivity : AppCompatActivity() {
         setContentView(R.layout.activity_recovery)
 
         findViewById<MaterialCardView>(R.id.start_normally).setOnClickListener {
+            it.isClickable = false
             finish()
             startActivity(Intent(this, MainActivity::class.java))
         }
         findViewById<MaterialCardView>(R.id.safe_mode).setOnClickListener {
+            it.isClickable = false
             val sPrefs = getSharedPreferences("settings", Context.MODE_PRIVATE)
             val e = sPrefs.edit()
             e.putBoolean("safeMode", true)
@@ -26,6 +28,7 @@ class RecoveryActivity : AppCompatActivity() {
             startActivity(Intent(this, MainActivity::class.java))
         }
         findViewById<MaterialCardView>(R.id.force_update).setOnClickListener {
+            it.isClickable = false
             val sPrefs = getSharedPreferences("settings", Context.MODE_PRIVATE)
             val e = sPrefs.edit()
             e.putInt("lastMajorUpdateThatUserHasUpdatedVencord", 0)

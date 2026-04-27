@@ -37,7 +37,7 @@ class VencordNative(private val activity: WeakReference<MainActivity>, wv: WebVi
     var overlayActive = false
         private set
 
-    private var originalStatusBarColor: Int = 0
+    private var originalStatusBarColor: Int? = null
 
     private val settingsPrefs: SharedPreferences? by lazy { activity.get()?.getSharedPreferences("settings", Context.MODE_PRIVATE) }
 
@@ -63,12 +63,14 @@ class VencordNative(private val activity: WeakReference<MainActivity>, wv: WebVi
         act.runOnUiThread {
             val controller = WindowInsetsControllerCompat(act.window, act.window.decorView)
             if (active) {
-                originalStatusBarColor = act.window.statusBarColor
+                if (originalStatusBarColor == null) {
+                    originalStatusBarColor = act.window.statusBarColor
+                }
                 act.window.statusBarColor = Color.BLACK
                 controller.systemBarsBehavior = WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
                 controller.hide(WindowInsetsCompat.Type.navigationBars())
             } else {
-                act.window.statusBarColor = originalStatusBarColor
+                act.window.statusBarColor = originalStatusBarColor ?: act.window.statusBarColor
                 controller.show(WindowInsetsCompat.Type.navigationBars())
             }
         }
@@ -91,16 +93,18 @@ class VencordNative(private val activity: WeakReference<MainActivity>, wv: WebVi
                 val act = activity.get() ?: return@execute
                 val sPrefs = settingsPrefs ?: return@execute
                 val vendroidFile = File(act.filesDir, "vencord.js")
+                val vendroidTmpFile = File(act.filesDir, "vencord.js.tmp")
                 val defaultUrl = if (
                     sPrefs.getString("clientMod", "vencord") == "equicord"
                 ) Constants.EQUICORD_BUNDLE_URL else Constants.JS_BUNDLE_URL
                 val vencordLocation = sPrefs.getString("vencordLocation", defaultUrl) ?: defaultUrl
                 conn = HttpClient.fetch(vencordLocation)
                 conn.inputStream.use { input ->
-                    FileOutputStream(vendroidFile).use { output ->
+                    FileOutputStream(vendroidTmpFile).use { output ->
                         input.copyTo(output)
                     }
                 }
+                vendroidTmpFile.renameTo(vendroidFile)
                 act.runOnUiThread {
                     act.showDiscordToast("Updated Vencord, restart to apply changes!", "SUCCESS")
                 }
@@ -133,7 +137,7 @@ class VencordNative(private val activity: WeakReference<MainActivity>, wv: WebVi
         return try {
             sPrefs.getBoolean(id, defaultValue)
         } catch (e: Exception) {
-            false
+            defaultValue
         }
     }
 
@@ -158,16 +162,17 @@ class VencordNative(private val activity: WeakReference<MainActivity>, wv: WebVi
     fun changeAppIcon(id: String) {
         val act = activity.get() ?: return
         if (id == currentIcon) return
+        if (id !in ICON_NAMES) return
         val pm = act.packageManager
         val pkg = act.applicationContext
         pm.setComponentEnabledSetting(
-            ComponentName(pkg, "com.nin0dev.vendroid.${currentIcon}MainActivity"),
-            PackageManager.COMPONENT_ENABLED_STATE_DISABLED,
+            ComponentName(pkg, "com.nin0dev.vendroid.${id}MainActivity"),
+            PackageManager.COMPONENT_ENABLED_STATE_ENABLED,
             PackageManager.DONT_KILL_APP
         )
         pm.setComponentEnabledSetting(
-            ComponentName(pkg, "com.nin0dev.vendroid.${id}MainActivity"),
-            PackageManager.COMPONENT_ENABLED_STATE_ENABLED,
+            ComponentName(pkg, "com.nin0dev.vendroid.${currentIcon}MainActivity"),
+            PackageManager.COMPONENT_ENABLED_STATE_DISABLED,
             PackageManager.DONT_KILL_APP
         )
         currentIcon = id

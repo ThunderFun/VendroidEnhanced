@@ -72,7 +72,14 @@ object HttpClient {
                 val initialSize = conn.contentLength.coerceAtLeast(8192)
                 val content = readAsText(conn.inputStream, initialSize)
                 val patched = applyPatches(content)
-                vendroidFile.writeText(patched)
+                val tmpFile = File(vendroidFile.parent, "${vendroidFile.name}.tmp")
+                try {
+                    tmpFile.writeText(patched)
+                    if (vendroidFile.exists()) vendroidFile.delete()
+                    if (!tmpFile.renameTo(vendroidFile)) throw IOException("Failed to rename ${tmpFile.name} to ${vendroidFile.name}")
+                } finally {
+                    tmpFile.delete()
+                }
                 e.putInt("lastMajorUpdateThatUserHasUpdatedVencord", BuildConfig.VERSION_CODE)
                 e.apply()
                 VencordRuntime = patched

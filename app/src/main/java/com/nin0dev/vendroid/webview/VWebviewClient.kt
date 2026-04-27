@@ -62,8 +62,9 @@ class VWebviewClient(
     override fun shouldInterceptRequest(view: WebView, req: WebResourceRequest): WebResourceResponse? {
         if (!shouldInterceptForCspStripping(req)) return null
         val isCss = req.url.path?.endsWith(".css") == true
+        var conn: HttpURLConnection? = null
         try {
-            val conn = URL(req.url.toString()).openConnection() as HttpURLConnection
+            conn = URL(req.url.toString()).openConnection() as HttpURLConnection
             conn.connectTimeout = 15000
             conn.readTimeout = 15000
             conn.requestMethod = req.method
@@ -85,6 +86,7 @@ class VWebviewClient(
             }
             return doFetch(req, conn)
         } catch (_: Exception) {
+            conn?.disconnect()
             return null
         }
     }
