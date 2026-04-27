@@ -868,17 +868,23 @@ video {
         return toFullResUrl(img.dataset.safeSrc || img.currentSrc || img.src);
     }
 
-    function showImageInOverlay(src) {
+    function showImageInOverlay(src, isVideo) {
         closeImageOverlay();
         src = toFullResUrl(src);
         const overlay = document.createElement("div");
-        overlay.style.cssText = "position:fixed;top:0;left:0;width:100vw;height:100vh;background:rgba(0,0,0,0.95);display:flex;align-items:center;justify-content:center;z-index:2147483646;outline:none;overflow:hidden;touch-action:none;";
+        overlay.style.cssText = "position:fixed;top:0;left:0;width:100vw;height:100vh;background:rgba(0,0,0,0.95);display:flex;align-items:center;justify-content:center;z-index:2147483646;outline:none;overflow:hidden;";
         overlay.setAttribute("tabindex", "-1");
         overlay.focus({ preventScroll: true });
 
-        const img = document.createElement("img");
+        const img = isVideo ? document.createElement("video") : document.createElement("img");
+        if (isVideo) {
+            img.autoplay = true;
+            img.muted = true;
+            img.loop = true;
+            img.playsInline = true;
+        }
         img.src = src;
-        img.style.cssText = "max-width:100vw;max-height:100vh;width:auto;height:auto;object-fit:contain;transform-origin:0 0;";
+        img.style.cssText = "max-width:100vw;max-height:100vh;width:auto;height:auto;object-fit:contain;transform-origin:0 0;touch-action:none;";
         img.setAttribute("tabindex", "-1");
         img.draggable = false;
 
@@ -1003,9 +1009,9 @@ video {
 
     function isLightboxDialog(dialog) {
         const text = (dialog.textContent || "").trim();
-        if (text.length > 100) return false;
-        const imgCount = dialog.querySelectorAll("img").length;
-        if (imgCount > 2) return false;
+        if (text.length > 200) return false;
+        const mediaCount = dialog.querySelectorAll("img").length + dialog.querySelectorAll("video").length;
+        if (mediaCount > 2) return false;
         return true;
     }
 
@@ -1034,29 +1040,47 @@ video {
             if (!isInApp()) return;
 
             const img = e.target.closest("img");
-            if (!img) return;
+            const video = !img ? e.target.closest("video") : null;
+            if (!img && !video) return;
 
-            if (img.closest('svg')) return;
+            const el = img || video;
 
-            if (img.closest('iframe, [data-hcaptcha-response], .hcaptcha, .captcha')) return;
+            if (el.closest('svg')) return;
 
-            if (img.closest('[class*="avatar"], [class*="Avatar"], [class*="pfp"], [class*="Pfp"]')) return;
+            if (el.closest('iframe, [data-hcaptcha-response], .hcaptcha, .captcha')) return;
 
-            if (img.closest('[class*="member"], [class*="Member"], [class*="userPopout"], [class*="UserPopout"]')) return;
+            if (el.closest('[class*="avatar"], [class*="Avatar"], [class*="pfp"], [class*="Pfp"]')) return;
 
-            if (img.closest('[class*="status"], [class*="pill"], [class*="roleIcon"], [class*="RoleIcon"]')) return;
+            if (el.closest('[class*="member"], [class*="Member"], [class*="userPopout"], [class*="UserPopout"]')) return;
 
-            if (!isDiscordHost(img.src || img.currentSrc || img.dataset?.safeSrc || "")) return;
+            if (el.closest('[class*="status"], [class*="pill"], [class*="roleIcon"], [class*="RoleIcon"]')) return;
 
-            const rect = img.getBoundingClientRect();
-            if (rect.width < 200 && rect.height < 200) return;
+            if (img) {
+                if (!isDiscordHost(img.src || img.currentSrc || img.dataset?.safeSrc || "")) return;
 
-            e.stopImmediatePropagation();
-            e.preventDefault();
+                const rect = img.getBoundingClientRect();
+                if (rect.width < 200 && rect.height < 200) return;
 
-            showImageInOverlay(getBestImageUrl(img));
+                e.stopImmediatePropagation();
+                e.preventDefault();
 
-            dismissDiscordModal();
+                showImageInOverlay(getBestImageUrl(img));
+
+                dismissDiscordModal();
+            } else if (video && video.muted && video.loop) {
+                const videoSrc = video.src || video.currentSrc || "";
+                if (!isDiscordHost(videoSrc)) return;
+
+                const rect = video.getBoundingClientRect();
+                if (rect.width < 200 && rect.height < 200) return;
+
+                e.stopImmediatePropagation();
+                e.preventDefault();
+
+                showImageInOverlay(videoSrc, true);
+
+                dismissDiscordModal();
+            }
         }, true);
     }
 
@@ -1082,6 +1106,21 @@ video {
                 if (rect.width < 50 && rect.height < 50) continue;
                 if (!imgOverlay) {
                     showImageInOverlay(getBestImageUrl(img));
+                    dialog.style.setProperty("display", "none", "important");
+                    try { ModalEscapeHandler.action(); } catch(e) {}
+                    delayedBlur();
+                }
+                break;
+            }
+            if (imgOverlay) return;
+            const videos = dialog.querySelectorAll("video");
+            for (const video of videos) {
+                if (video.width === 0 && video.height === 0) continue;
+                if (!video.muted || !video.loop) continue;
+                const videoSrc = video.src || video.currentSrc || "";
+                if (!isDiscordHost(videoSrc)) continue;
+                if (!imgOverlay) {
+                    showImageInOverlay(videoSrc, true);
                     dialog.style.setProperty("display", "none", "important");
                     try { ModalEscapeHandler.action(); } catch(e) {}
                     delayedBlur();

@@ -11,8 +11,6 @@ import android.webkit.JavascriptInterface
 import android.webkit.WebView
 import android.widget.LinearLayout
 import androidx.core.content.edit
-import androidx.core.view.WindowInsetsCompat
-import androidx.core.view.WindowInsetsControllerCompat
 import com.google.android.material.textfield.TextInputEditText
 import com.nin0dev.vendroid.MainActivity
 import com.nin0dev.vendroid.R
@@ -38,6 +36,7 @@ class VencordNative(private val activity: WeakReference<MainActivity>, wv: WebVi
         private set
 
     private var originalStatusBarColor: Int? = null
+    private var originalNavBarColor: Int? = null
 
     private val settingsPrefs: SharedPreferences? by lazy { activity.get()?.getSharedPreferences("settings", Context.MODE_PRIVATE) }
 
@@ -61,17 +60,18 @@ class VencordNative(private val activity: WeakReference<MainActivity>, wv: WebVi
         overlayActive = active
         val act = activity.get() ?: return
         act.runOnUiThread {
-            val controller = WindowInsetsControllerCompat(act.window, act.window.decorView)
             if (active) {
                 if (originalStatusBarColor == null) {
                     originalStatusBarColor = act.window.statusBarColor
                 }
+                if (originalNavBarColor == null) {
+                    originalNavBarColor = act.window.navigationBarColor
+                }
                 act.window.statusBarColor = Color.BLACK
-                controller.systemBarsBehavior = WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
-                controller.hide(WindowInsetsCompat.Type.navigationBars())
+                act.window.navigationBarColor = Color.BLACK
             } else {
                 act.window.statusBarColor = originalStatusBarColor ?: act.window.statusBarColor
-                controller.show(WindowInsetsCompat.Type.navigationBars())
+                act.window.navigationBarColor = originalNavBarColor ?: act.window.navigationBarColor
             }
         }
     }

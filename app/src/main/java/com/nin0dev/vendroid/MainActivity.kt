@@ -317,21 +317,37 @@ class MainActivity : Activity() {
         wvInitialized = true
     }
 
-    override fun onKeyDown(keyCode: Int, event: KeyEvent): Boolean {
-        if (keyCode == KeyEvent.KEYCODE_BACK && wv != null) {
+    @Suppress("DEPRECATION")
+    override fun onBackPressed() {
+        if (wv != null) {
             if (chromeClient.isFullscreen) {
                 chromeClient.hideCustomView()
                 wv!!.evaluateJavascript("VencordMobile.onBackPress()", null)
-                return true
+                return
             }
             if (::vencordNative.isInitialized && vencordNative.overlayActive) {
                 wv!!.evaluateJavascript("VencordMobile.onBackPress()", null)
-                return true
+                return
             }
-            runOnUiThread { wv!!.evaluateJavascript("VencordMobile.onBackPress()") { r: String -> if ("false" == r) finish() } }
+            wv!!.evaluateJavascript("VencordMobile.onBackPress()") { r: String -> if ("false" == r) @Suppress("DEPRECATION") super.onBackPressed() }
+            return
+        }
+        super.onBackPressed()
+    }
+
+    override fun onKeyDown(keyCode: Int, event: KeyEvent): Boolean {
+        if (keyCode == KeyEvent.KEYCODE_BACK) {
+            onBackPressed()
             return true
         }
         return super.onKeyDown(keyCode, event)
+    }
+
+    override fun onKeyUp(keyCode: Int, event: KeyEvent): Boolean {
+        if (keyCode == KeyEvent.KEYCODE_BACK) {
+            return true
+        }
+        return super.onKeyUp(keyCode, event)
     }
 
     override fun onActivityResult(requestCode: Int, resultCode: Int, intent: Intent?) {
