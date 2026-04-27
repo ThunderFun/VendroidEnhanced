@@ -254,8 +254,7 @@ class MainActivity : Activity() {
 
         s.cacheMode = android.webkit.WebSettings.LOAD_DEFAULT
         s.databaseEnabled = true
-        s.offscreenPreRaster = true
-        s.setRenderPriority(android.webkit.WebSettings.RenderPriority.HIGH)
+        s.offscreenPreRaster = false
         s.mediaPlaybackRequiresUserGesture = false
         s.mixedContentMode = android.webkit.WebSettings.MIXED_CONTENT_COMPATIBILITY_MODE
         s.setBuiltInZoomControls(false)
@@ -320,16 +319,13 @@ class MainActivity : Activity() {
     @Suppress("DEPRECATION")
     override fun onBackPressed() {
         if (wv != null) {
-            if (chromeClient.isFullscreen) {
+            val isFullscreen = chromeClient.isFullscreen
+            val isOverlayActive = ::vencordNative.isInitialized && vencordNative.overlayActive
+            if (isFullscreen) {
                 chromeClient.hideCustomView()
-                wv!!.evaluateJavascript("VencordMobile.onBackPress()", null)
-                return
             }
-            if (::vencordNative.isInitialized && vencordNative.overlayActive) {
-                wv!!.evaluateJavascript("VencordMobile.onBackPress()", null)
-                return
-            }
-            wv!!.evaluateJavascript("VencordMobile.onBackPress()") { r: String -> if ("false" == r) @Suppress("DEPRECATION") super.onBackPressed() }
+            val callback: android.webkit.ValueCallback<String>? = if (isFullscreen || isOverlayActive) null else android.webkit.ValueCallback { r: String -> if ("false" == r) @Suppress("DEPRECATION") super.onBackPressed() }
+            wv!!.evaluateJavascript("VencordMobile.onBackPress()", callback)
             return
         }
         super.onBackPressed()

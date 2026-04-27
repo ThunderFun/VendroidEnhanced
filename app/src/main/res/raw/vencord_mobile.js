@@ -336,20 +336,23 @@
         return false;
     }
 
+    let cachedFluxDispatcher = null;
+
     function findFluxDispatcher() {
+        if (cachedFluxDispatcher) return cachedFluxDispatcher;
         try {
             var fd = Vencord.Webpack.Common?.FluxDispatcher;
-            if (fd && typeof fd === "object" && fd.dispatch && fd.subscribe) return fd;
+            if (fd && typeof fd === "object" && fd.dispatch && fd.subscribe) { cachedFluxDispatcher = fd; return fd; }
         } catch(e) {}
         try {
             var fd2 = Vencord.Webpack.findByProps("dispatch", "subscribe");
-            if (fd2 && typeof fd2 === "object" && fd2.subscribe) return fd2;
+            if (fd2 && typeof fd2 === "object" && fd2.subscribe) { cachedFluxDispatcher = fd2; return fd2; }
         } catch(e) {}
         try {
             var fd3 = Vencord.Webpack.find(function(m) {
                 return typeof m === "object" && m !== null && m.dispatch && m.subscribe;
             });
-            if (fd3 && typeof fd3 === "object" && fd3.subscribe) return fd3;
+            if (fd3 && typeof fd3 === "object" && fd3.subscribe) { cachedFluxDispatcher = fd3; return fd3; }
         } catch(e) {}
         return null;
     }
@@ -1039,6 +1042,13 @@ video {
             if (imgOverlay) return;
             if (!isInApp()) return;
 
+            const target = e.target;
+            const tag = target.tagName;
+            if (tag !== 'IMG' && tag !== 'VIDEO' && tag !== 'SVG' &&
+                tag !== 'PICTURE' && tag !== 'IFRAME') {
+                if (!target.querySelector('img, video')) return;
+            }
+
             const img = e.target.closest("img");
             const video = !img ? e.target.closest("video") : null;
             if (!img && !video) return;
@@ -1091,13 +1101,18 @@ video {
         hookVideoFullscreen();
         hookImageClick();
 
+        let observerRafId = 0;
+        let lastNonLightboxDialog = null;
         const observer = new MutationObserver(() => {
+            cancelAnimationFrame(observerRafId);
+            observerRafId = requestAnimationFrame(() => {
             if (!isInApp()) return;
             const dialog = document.querySelector('div[role="dialog"]');
-            if (!dialog || dialog.style.display === "none") return;
+            if (!dialog || dialog.style.display === "none") { lastNonLightboxDialog = null; return; }
+            if (dialog === lastNonLightboxDialog) return;
             const dialogRect = dialog.getBoundingClientRect();
-            if (dialogRect.width > 0 && dialogRect.width < window.innerWidth * 0.9) return;
-            if (!isLightboxDialog(dialog)) return;
+            if (dialogRect.width > 0 && dialogRect.width < window.innerWidth * 0.9) { lastNonLightboxDialog = dialog; return; }
+            if (!isLightboxDialog(dialog)) { lastNonLightboxDialog = dialog; return; }
             const imgs = dialog.querySelectorAll("img");
             for (const img of imgs) {
                 if (img.width === 0 && img.height === 0) continue;
@@ -1127,8 +1142,9 @@ video {
                 }
                 break;
             }
+            });
         });
-        observer.observe(document.body, { childList: true, subtree: true, attributes: true });
+        observer.observe(document.body, { childList: true, subtree: true });
 
         document.addEventListener("keydown", e => {
             if (e.key === "Escape") {

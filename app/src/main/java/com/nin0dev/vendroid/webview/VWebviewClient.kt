@@ -37,16 +37,18 @@ class VWebviewClient(
     }
 
     override fun onPageStarted(view: WebView, url: String, favicon: Bitmap?) {
-        val runtime = HttpClient.VencordRuntime
-        val mobileRuntime = HttpClient.VencordMobileRuntime
-        if (runtime != null || mobileRuntime != null) {
-            val script = buildString {
-                runtime?.let { append(it).append(';') }
-                mobileRuntime?.let { append(it).append(';') }
+        view.evaluateJavascript("typeof Vencord!=='undefined'&&typeof VencordMobile!=='undefined'") { result ->
+            if (result?.trim() == "true") return@evaluateJavascript
+            val runtime = HttpClient.VencordRuntime
+            val mobileRuntime = HttpClient.VencordMobileRuntime
+            if (runtime != null || mobileRuntime != null) {
+                val script = buildString {
+                    runtime?.let { append(it).append(';') }
+                    mobileRuntime?.let { append(it).append(';') }
+                }
+                view.evaluateJavascript(script, null)
             }
-            view.evaluateJavascript(script, null)
         }
-        // VencordRuntime is kept alive for re-injection on subsequent navigations
     }
 
     override fun onPageFinished(view: WebView, url: String) {
