@@ -491,13 +491,12 @@
 
     window.VencordMobile = {
         onBackPress() {
-            // Re-sync from URL before doing anything. Discord is a SPA, so the URL
-            // changes via client-side routing long before our FluxDispatcher
-            // subscriptions in doInit() are live.
-            try {
-                var path = window.location.pathname;
-                isSidebarOpen = !/\/channels\/[^\/]+\/[^\/]+/.test(path);
-            } catch(e) {}
+            if (!initialized) {
+                try {
+                    var path = window.location.pathname;
+                    isSidebarOpen = !/\/channels\/[^\/]+\/[^\/]+/.test(path);
+                } catch(e) {}
+            }
 
             if (vfsState) {
                 exitVideoFullscreen();
