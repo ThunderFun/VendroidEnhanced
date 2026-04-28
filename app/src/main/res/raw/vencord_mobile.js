@@ -157,23 +157,35 @@
     console.log("[Vendroid] vencord_mobile.js loaded");
     console.log("[Vendroid] Early state: chunkArr=" + (window.webpackChunkdiscord_app ? "exists len=" + window.webpackChunkdiscord_app.length + " push=" + window.webpackChunkdiscord_app.push.toString().substring(0, 80) : "MISSING"));
 
-    let findLazy, ModalEscapeHandler;
-    try {
-        const wp = Vencord.Webpack;
-        findLazy = wp.findLazy;
-        console.log("[Vendroid] Webpack destructured OK");
-    } catch(e) {
-        console.error("[Vendroid] Webpack destructure FAILED: " + e.message);
+    function getModalEscapeHandler() {
+        try {
+            if (typeof Vencord !== "undefined" && Vencord.Webpack && typeof Vencord.Webpack.findLazy === "function") {
+                return Vencord.Webpack.findLazy(m => m.binds?.length === 1 && m.binds[0] === "esc");
+            }
+        } catch(e) {
+            console.error("[Vendroid] getModalEscapeHandler error: " + e.message);
+        }
+        return null;
     }
 
+    let ModalEscapeHandler = null;
     try {
-        ModalEscapeHandler = findLazy(m => m.binds?.length === 1 && m.binds[0] === "esc");
-        console.log("[Vendroid] ModalEscapeHandler found");
+        ModalEscapeHandler = getModalEscapeHandler();
+        if (ModalEscapeHandler) {
+            console.log("[Vendroid] ModalEscapeHandler found");
+        } else {
+            console.log("[Vendroid] ModalEscapeHandler not ready yet");
+        }
     } catch(e) {
         console.error("[Vendroid] ModalEscapeHandler FAILED: " + e.message);
     }
 
     let isSidebarOpen = false;
+    try {
+        var path = window.location.pathname;
+        // Sidebar is typically showing (channel/DM list) when not inside a specific channel view.
+        isSidebarOpen = !/^\/channels\/[^\/]+\/[^\/]+$/.test(path);
+    } catch(e) {}
     let initialized = false;
 
     function recoverPlugins() {
@@ -479,6 +491,14 @@
 
     window.VencordMobile = {
         onBackPress() {
+            // Re-sync from URL before doing anything. Discord is a SPA, so the URL
+            // changes via client-side routing long before our FluxDispatcher
+            // subscriptions in doInit() are live.
+            try {
+                var path = window.location.pathname;
+                isSidebarOpen = !/\/channels\/[^\/]+\/[^\/]+/.test(path);
+            } catch(e) {}
+
             if (vfsState) {
                 exitVideoFullscreen();
                 return true;
@@ -488,7 +508,14 @@
                 return true;
             }
 
-            if (ModalEscapeHandler.action() === false) return true;
+            var meh = getModalEscapeHandler();
+            if (meh && typeof meh.action === "function") {
+                try {
+                    if (meh.action() === false) return true;
+                } catch(e) {
+                    console.error("[Vendroid] ModalEscapeHandler action threw: " + e.message);
+                }
+            }
 
             const quickCssWin = window.__VENCORD_MONACO_WIN__?.deref();
             if (quickCssWin && !quickCssWin.closed) {
@@ -499,8 +526,20 @@
 
             if (!isSidebarOpen) {
                 var fd = findFluxDispatcher();
-                if (fd) fd.dispatch({ type: "MOBILE_WEB_SIDEBAR_OPEN" });
-                return true;
+                if (fd) {
+                    try {
+                        fd.dispatch({ type: "MOBILE_WEB_SIDEBAR_OPEN" });
+                        return true;
+                    } catch(e) {
+                        console.error("[Vendroid] FluxDispatcher dispatch threw: " + e.message);
+                    }
+                }
+                // FluxDispatcher not ready yet — use history.back as a temporary fallback
+                if (window.history.length > 1) {
+                    window.history.back();
+                    return true;
+                }
+                return false;
             }
 
             return false;
@@ -815,7 +854,7 @@ video {
     function closeImageOverlay() {
         if (!imgOverlay) return;
         if (imgOverlay._resetImgTransform) imgOverlay._resetImgTransform();
-        try { ModalEscapeHandler.action(); } catch(e) {}
+        try { var meh = getModalEscapeHandler(); if (meh && typeof meh.action === "function") meh.action(); } catch(e) {}
         imgOverlay.remove();
         imgOverlay = null;
         notifyOverlayState();
@@ -1024,7 +1063,7 @@ video {
             if (dialog) {
                 dialog.style.setProperty("display", "none", "important");
             }
-            try { ModalEscapeHandler.action(); } catch(e) {}
+            try { var meh = getModalEscapeHandler(); if (meh && typeof meh.action === "function") meh.action(); } catch(e) {}
             delayedBlur();
         });
     }
@@ -1101,7 +1140,10 @@ video {
         }, true);
     }
 
-    document.addEventListener("DOMContentLoaded", () => {
+    function initVendroidDom() {
+        if (window.__vendroidDomInitDone) return;
+        window.__vendroidDomInitDone = true;
+
         injectStyle("vendroid_image_overflow_fix", baseCss);
         injectStyle("vendroid_video_player", videoPlayerCss);
         injectStyle("vendroid_hide_clyde", "#app-mount>svg{display:none!important;}");
@@ -1137,7 +1179,7 @@ video {
                 if (!imgOverlay) {
                     showImageInOverlay(getBestImageUrl(img));
                     dialog.style.setProperty("display", "none", "important");
-                    try { ModalEscapeHandler.action(); } catch(e) {}
+                    try { var meh = getModalEscapeHandler(); if (meh && typeof meh.action === "function") meh.action(); } catch(e) {}
                     delayedBlur();
                 }
                 break;
@@ -1152,7 +1194,7 @@ video {
                 if (!imgOverlay) {
                     showImageInOverlay(videoSrc, true);
                     dialog.style.setProperty("display", "none", "important");
-                    try { ModalEscapeHandler.action(); } catch(e) {}
+                    try { var meh = getModalEscapeHandler(); if (meh && typeof meh.action === "function") meh.action(); } catch(e) {}
                     delayedBlur();
                 }
                 break;
@@ -1210,6 +1252,12 @@ video {
                     }
                 });
         });
-    }, { once: true });
+    }
+
+    if (document.readyState === "loading") {
+        document.addEventListener("DOMContentLoaded", initVendroidDom, { once: true });
+    } else {
+        initVendroidDom();
+    }
 
 })();

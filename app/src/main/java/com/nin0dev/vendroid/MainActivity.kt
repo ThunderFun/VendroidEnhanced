@@ -1,8 +1,9 @@
 package com.nin0dev.vendroid
 
 import android.annotation.SuppressLint
-import android.app.Activity
 import android.content.Context
+import androidx.appcompat.app.AppCompatActivity
+import androidx.core.view.WindowCompat
 import android.content.Intent
 import android.net.Uri
 import android.os.Build
@@ -12,7 +13,6 @@ import android.os.Handler
 import android.os.Looper
 import android.os.StrictMode
 import android.os.StrictMode.ThreadPolicy
-import android.view.KeyEvent
 import android.view.View
 import android.view.View.GONE
 import android.view.View.VISIBLE
@@ -40,7 +40,7 @@ import java.time.LocalDate
 import androidx.core.content.edit
 
 
-class MainActivity : Activity() {
+class MainActivity : AppCompatActivity() {
     private var wvInitialized = false
     private var wv: WebView? = null
     private lateinit var chromeClient: VChromeClient
@@ -240,6 +240,30 @@ class MainActivity : Activity() {
             )
         )
         setContentView(R.layout.activity_main)
+        WindowCompat.setDecorFitsSystemWindows(window, true)
+
+        onBackPressedDispatcher.addCallback(this, object : androidx.activity.OnBackPressedCallback(true) {
+            override fun handleOnBackPressed() {
+                if (wv != null) {
+                    val isFullscreen = chromeClient.isFullscreen
+                    if (isFullscreen) {
+                        chromeClient.hideCustomView()
+                        return
+                    }
+                    wv!!.evaluateJavascript("VencordMobile.onBackPress()") { r: String ->
+                        if ("false" == r) {
+                            isEnabled = false
+                            onBackPressedDispatcher.onBackPressed()
+                            isEnabled = true
+                        }
+                    }
+                    return
+                }
+                isEnabled = false
+                onBackPressedDispatcher.onBackPressed()
+                isEnabled = true
+            }
+        })
 
         quickCssLayout = findViewById(R.id.quickcss)
         loadingScreenLayout = findViewById(R.id.loading_screen)
@@ -262,6 +286,7 @@ class MainActivity : Activity() {
         s.allowFileAccess = true
 
         s.cacheMode = android.webkit.WebSettings.LOAD_DEFAULT
+        @Suppress("DEPRECATION")
         s.databaseEnabled = true
         // Pre-rasterize offscreen tiles so they're ready on scroll/touch —
         // eliminates the "paint on demand" jank that makes interactions feel slow.
@@ -353,36 +378,6 @@ class MainActivity : Activity() {
         wvInitialized = true
     }
 
-    @Suppress("DEPRECATION")
-    override fun onBackPressed() {
-        if (wv != null) {
-            val isFullscreen = chromeClient.isFullscreen
-            val isOverlayActive = ::vencordNative.isInitialized && vencordNative.overlayActive
-            if (isFullscreen) {
-                chromeClient.hideCustomView()
-            }
-            val callback: android.webkit.ValueCallback<String>? = if (isFullscreen || isOverlayActive) null else android.webkit.ValueCallback { r: String -> if ("false" == r) @Suppress("DEPRECATION") super.onBackPressed() }
-            wv!!.evaluateJavascript("VencordMobile.onBackPress()", callback)
-            return
-        }
-        super.onBackPressed()
-    }
-
-    override fun onKeyDown(keyCode: Int, event: KeyEvent): Boolean {
-        if (keyCode == KeyEvent.KEYCODE_BACK) {
-            onBackPressed()
-            return true
-        }
-        return super.onKeyDown(keyCode, event)
-    }
-
-    override fun onKeyUp(keyCode: Int, event: KeyEvent): Boolean {
-        if (keyCode == KeyEvent.KEYCODE_BACK) {
-            return true
-        }
-        return super.onKeyUp(keyCode, event)
-    }
-
     override fun onActivityResult(requestCode: Int, resultCode: Int, intent: Intent?) {
         super.onActivityResult(requestCode, resultCode, intent)
 
@@ -453,7 +448,7 @@ class MainActivity : Activity() {
     fun injectVencordIfReady() {
         val runtime = HttpClient.VencordRuntime
         val mobileRuntime = HttpClient.VencordMobileRuntime
-        if (wv != null && (runtime != null || mobileRuntime != null)) {
+        if (wv != null && runtime != null && mobileRuntime != null) {
             val script = buildString {
                 runtime?.let { append(it).append(';') }
                 mobileRuntime?.let { append(it).append(';') }

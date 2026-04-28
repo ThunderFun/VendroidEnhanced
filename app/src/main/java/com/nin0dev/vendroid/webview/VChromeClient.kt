@@ -3,6 +3,7 @@ package com.nin0dev.vendroid.webview
 import android.content.ActivityNotFoundException
 import android.graphics.Color
 import android.net.Uri
+import android.os.Build
 import android.view.View
 import android.webkit.ConsoleMessage
 import android.webkit.ConsoleMessage.MessageLevel
@@ -98,7 +99,11 @@ class VChromeClient(activity: MainActivity) : WebChromeClient() {
         val controller = getInsetsController(activity)
         controller.systemBarsBehavior = WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
         controller.hide(WindowInsetsCompat.Type.navigationBars())
+        @Suppress("DEPRECATION")
         originalStatusBarColor = activity.window.statusBarColor
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.VANILLA_ICE_CREAM) {
+            activity.window.isStatusBarContrastEnforced = false
+        }
         activity.window.statusBarColor = Color.BLACK
     }
 
@@ -120,6 +125,7 @@ class VChromeClient(activity: MainActivity) : WebChromeClient() {
         webview.visibility = View.VISIBLE
         val controller = getInsetsController(activity)
         controller.show(WindowInsetsCompat.Type.navigationBars())
+        @Suppress("DEPRECATION")
         activity.window.statusBarColor = originalStatusBarColor
         localCallback?.onCustomViewHidden()
     }

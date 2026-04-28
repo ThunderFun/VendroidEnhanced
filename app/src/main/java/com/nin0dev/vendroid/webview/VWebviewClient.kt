@@ -44,7 +44,7 @@ class VWebviewClient(
             if (result?.trim() == "true") return@evaluateJavascript
             val runtime = HttpClient.VencordRuntime
             val mobileRuntime = HttpClient.VencordMobileRuntime
-            if (runtime != null || mobileRuntime != null) {
+            if (runtime != null && mobileRuntime != null) {
                 val script = buildString {
                     runtime?.let { append(it).append(';') }
                     mobileRuntime?.let { append(it).append(';') }

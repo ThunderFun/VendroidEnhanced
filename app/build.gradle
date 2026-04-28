@@ -1,16 +1,15 @@
 plugins {
     id 'com.android.application'
-    id 'org.jetbrains.kotlin.android'
 }
 
 android {
     namespace 'com.nin0dev.vendroid'
-    compileSdk 34
+    compileSdk 35
 
     defaultConfig {
         applicationId "com.nin0dev.vendroid"
         minSdk 26
-        targetSdk 34
+        targetSdk 35
         versionCode 15
         versionName "1.10.2"
     }
@@ -41,9 +40,6 @@ android {
     compileOptions {
         sourceCompatibility JavaVersion.VERSION_21
         targetCompatibility JavaVersion.VERSION_21
-    }
-    kotlinOptions {
-        jvmTarget = "21"
     }
 }
 

@@ -5,6 +5,7 @@ import android.content.Context
 import android.content.SharedPreferences
 import android.content.pm.PackageManager
 import android.graphics.Color
+import android.os.Build
 import android.view.View.GONE
 import android.view.View.VISIBLE
 import android.webkit.JavascriptInterface
@@ -60,12 +61,17 @@ class VencordNative(private val activity: WeakReference<MainActivity>, wv: WebVi
         overlayActive = active
         val act = activity.get() ?: return
         act.runOnUiThread {
+            @Suppress("DEPRECATION")
             if (active) {
                 if (originalStatusBarColor == null) {
                     originalStatusBarColor = act.window.statusBarColor
                 }
                 if (originalNavBarColor == null) {
                     originalNavBarColor = act.window.navigationBarColor
+                }
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.VANILLA_ICE_CREAM) {
+                    act.window.isStatusBarContrastEnforced = false
+                    act.window.isNavigationBarContrastEnforced = false
                 }
                 act.window.statusBarColor = Color.BLACK
                 act.window.navigationBarColor = Color.BLACK
