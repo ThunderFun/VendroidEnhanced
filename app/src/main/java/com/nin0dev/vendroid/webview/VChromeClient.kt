@@ -89,6 +89,9 @@ class VChromeClient(activity: MainActivity) : WebChromeClient() {
         customViewCallback = callback
         val activity = activityRef.get() ?: return
         ensureViewsInitialized(activity)
+        // Hardware layer on the fullscreen view lets the compositor overlay
+        // the video surface directly without extra composition passes.
+        view.setLayerType(View.LAYER_TYPE_HARDWARE, null)
         fullscreenContainer.addView(view)
         fullscreenContainer.visibility = View.VISIBLE
         webview.visibility = View.GONE
@@ -110,6 +113,9 @@ class VChromeClient(activity: MainActivity) : WebChromeClient() {
 
         if (activity == null) return
         fullscreenContainer.visibility = View.GONE
+        // Restore to default layer type — the view is being removed, so
+        // the GPU texture it held can be released.
+        localCustomView?.setLayerType(View.LAYER_TYPE_NONE, null)
         fullscreenContainer.removeView(localCustomView)
         webview.visibility = View.VISIBLE
         val controller = getInsetsController(activity)

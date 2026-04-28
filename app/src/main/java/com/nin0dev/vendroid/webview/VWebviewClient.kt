@@ -36,7 +36,10 @@ class VWebviewClient(
         return true
     }
 
+    private val disableHighlightCss = "(function(){var s=document.createElement('style');s.textContent='*,*::before,*::after{-webkit-tap-highlight-color:transparent!important;outline:none!important}';(document.head||document.documentElement).appendChild(s)})()"
+
     override fun onPageStarted(view: WebView, url: String, favicon: Bitmap?) {
+        view.evaluateJavascript(disableHighlightCss, null)
         view.evaluateJavascript("typeof Vencord!=='undefined'&&typeof VencordMobile!=='undefined'") { result ->
             if (result?.trim() == "true") return@evaluateJavascript
             val runtime = HttpClient.VencordRuntime
@@ -53,6 +56,7 @@ class VWebviewClient(
 
     override fun onPageFinished(view: WebView, url: String) {
         super.onPageFinished(view, url)
+        view.evaluateJavascript(disableHighlightCss, null)
 
         val activity = activityRef.get()
         if (activity != null && !activity.isFinishing && !activity.isDestroyed) {
@@ -64,21 +68,25 @@ class VWebviewClient(
     override fun shouldInterceptRequest(view: WebView, req: WebResourceRequest): WebResourceResponse? {
         if (!shouldInterceptForCspStripping(req)) return null
         val isCss = req.url.path?.endsWith(".css") == true
+        // Only force no-cache on Vencord/Equicord theme CSS — Discord's own CSS
+        // should use normal browser caching to avoid unnecessary network round-trips
+        // that block rendering and make interactions feel sluggish.
+        val isThemeCss = isCss && isVencordCssUrl(req.url.toString())
         var conn: HttpURLConnection? = null
         try {
             conn = URL(req.url.toString()).openConnection() as HttpURLConnection
             conn.connectTimeout = 15000
             conn.readTimeout = 15000
             conn.requestMethod = req.method
-            // For CSS requests: disable all caching to ensure fresh theme content
-            if (isCss) {
+            if (isThemeCss) {
                 conn.useCaches = false
                 conn.setRequestProperty("Cache-Control", "no-cache")
                 conn.setRequestProperty("Pragma", "no-cache")
             }
             for ((key, value) in req.requestHeaders) {
-                // Strip conditional headers for CSS to prevent 304 Not Modified responses
-                if (isCss && (key.equals("If-None-Match", ignoreCase = true) ||
+                // Strip conditional headers for theme CSS only — prevents stale
+                // theme caches while letting Discord CSS use normal 304 responses.
+                if (isThemeCss && (key.equals("If-None-Match", ignoreCase = true) ||
                             key.equals("If-Modified-Since", ignoreCase = true) ||
                             key.equals("If-Unmodified-Since", ignoreCase = true) ||
                             key.equals("If-Match", ignoreCase = true))) {
@@ -91,6 +99,11 @@ class VWebviewClient(
             conn?.disconnect()
             return null
         }
+    }
+
+    /** Only Vencord/Equicord theme CSS needs to bypass cache — not Discord's own CSS. */
+    private fun isVencordCssUrl(url: String): Boolean {
+        return url.contains("github") && (url.contains("vencord") || url.contains("equicord") || url.contains("vendroid"))
     }
 
     private fun shouldInterceptForCspStripping(req: WebResourceRequest): Boolean {

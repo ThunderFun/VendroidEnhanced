@@ -1038,14 +1038,21 @@ video {
     }
 
     function hookImageClick() {
+        // Use a lightweight gate: tag-check the event target *before* any
+        // DOM queries (closest, querySelector). This avoids the cost of
+        // tree-walking on every single click that isn't on media.
         document.addEventListener("click", (e) => {
             if (imgOverlay) return;
             if (!isInApp()) return;
 
             const target = e.target;
             const tag = target.tagName;
+            // Fast reject: skip immediately if the target isn't a media element
+            // and doesn't contain one (rare — only wrapper divs).
             if (tag !== 'IMG' && tag !== 'VIDEO' && tag !== 'SVG' &&
                 tag !== 'PICTURE' && tag !== 'IFRAME') {
+                // childElementCount check is cheaper than querySelector for the common case
+                if (!target.childElementCount) return;
                 if (!target.querySelector('img, video')) return;
             }
 
@@ -1103,7 +1110,15 @@ video {
 
         let observerRafId = 0;
         let lastNonLightboxDialog = null;
+        let lastObserverRun = 0;
+        // Throttle MutationObserver to at most once per animation frame AND
+        // at most once per 100ms — prevents it from firing on every single
+        // DOM mutation during rapid scrolling or typing.
+        const OBSERVER_MIN_INTERVAL = 100;
         const observer = new MutationObserver(() => {
+            const now = Date.now();
+            if (now - lastObserverRun < OBSERVER_MIN_INTERVAL) return;
+            lastObserverRun = now;
             cancelAnimationFrame(observerRafId);
             observerRafId = requestAnimationFrame(() => {
             if (!isInApp()) return;

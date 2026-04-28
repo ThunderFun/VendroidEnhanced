@@ -5,6 +5,7 @@ import android.app.Activity
 import android.content.Context
 import android.content.Intent
 import android.net.Uri
+import android.os.Build
 import android.os.Bundle
 import java.io.File
 import android.os.Handler
@@ -184,6 +185,9 @@ class MainActivity : Activity() {
         loadingAnimStartTime = System.currentTimeMillis()
 
         dots.forEach { dot ->
+            // Hardware layer caches each dot as a GPU texture — the scale/alpha
+            // animation then becomes a pure GPU transform with zero draw calls.
+            dot.setLayerType(View.LAYER_TYPE_HARDWARE, null)
             dot.scaleX = 0.4f
             dot.scaleY = 0.4f
             dot.alpha = 0.3f
@@ -221,6 +225,11 @@ class MainActivity : Activity() {
         migrateSettings()
         DynamicColors.applyToActivitiesIfAvailable(application)
 
+        // Tell SurfaceFlinger the window content is fully opaque — skips
+        // per-frame alpha compositing on the entire surface, freeing GPU
+        // bandwidth for actual rendering work.
+        window.setFormat(android.graphics.PixelFormat.OPAQUE)
+
         val sPrefs = getSharedPreferences("settings", Context.MODE_PRIVATE)
         val editor = sPrefs.edit()
 
@@ -254,10 +263,38 @@ class MainActivity : Activity() {
 
         s.cacheMode = android.webkit.WebSettings.LOAD_DEFAULT
         s.databaseEnabled = true
-        s.offscreenPreRaster = false
+        // Pre-rasterize offscreen tiles so they're ready on scroll/touch —
+        // eliminates the "paint on demand" jank that makes interactions feel slow.
+        s.offscreenPreRaster = true
         s.mediaPlaybackRequiresUserGesture = false
         s.mixedContentMode = android.webkit.WebSettings.MIXED_CONTENT_COMPATIBILITY_MODE
         s.setBuiltInZoomControls(false)
+        // Use the wide viewport and overview mode so the page scales correctly
+        // without extra re-layouts from viewport mismatch.
+        s.setUseWideViewPort(true)
+        s.setLoadWithOverviewMode(true)
+        // Pin text zoom to 100% — device-level font scaling can cause reflows
+        // and layout thrash on every touch that triggers a relayout.
+        s.textZoom = 100
+
+        // Hardware layer enables GPU-accelerated compositing, reducing the
+        // time between a touch event and the resulting visual feedback.
+        wv!!.setLayerType(View.LAYER_TYPE_HARDWARE, null)
+        wv!!.isScrollContainer = true
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            wv!!.defaultFocusHighlightEnabled = false
+        }
+
+        // Keep the Chromium renderer at IMPORTANT priority and never waive it
+        // when the WebView is not visible. This prevents the OS from killing
+        // or throttling the renderer process, keeping touch response fast.
+        wv!!.setRendererPriorityPolicy(WebView.RENDERER_PRIORITY_IMPORTANT, false)
+
+        // Disable Safe Browsing via the AndroidX WebKit compat API — the
+        // static WebView method was removed from the public SDK.
+        if (androidx.webkit.WebViewFeature.isFeatureSupported(androidx.webkit.WebViewFeature.SAFE_BROWSING_ENABLE)) {
+            androidx.webkit.WebSettingsCompat.setSafeBrowsingEnabled(s, false)
+        }
 
         android.webkit.CookieManager.getInstance().setAcceptThirdPartyCookies(wv!!, true)
 
