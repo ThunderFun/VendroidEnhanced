@@ -1210,9 +1210,7 @@ video {
         }, true);
 
         cssUrls.forEach((url) => {
-            const now = Date.now();
-            const bustUrl = url + (url.includes("?") ? "&" : "?") + "_t=" + now;
-            fetch(bustUrl)
+            fetch(url)
                 .then(r => r.text())
                 .then(css => {
                     if (url.includes("moreFixes")) css = patchMoreFixesCss(css);

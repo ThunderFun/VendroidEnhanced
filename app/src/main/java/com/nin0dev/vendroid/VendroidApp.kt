@@ -3,6 +3,7 @@ package com.nin0dev.vendroid
 import android.app.Application
 import android.os.Build
 import android.webkit.WebView
+import java.io.File
 
 class VendroidApp : Application() {
     override fun onCreate() {
@@ -27,6 +28,21 @@ class VendroidApp : Application() {
                 prewarmedWebView = WebView(this)
             } catch (_: Exception) {
                 // Silently ignore — some ROMs or restricted environments may fail
+            }
+
+            // Install HTTP response cache for HttpURLConnection-based fetches
+            // (Vencord bundle download, shouldInterceptRequest CSS fetches).
+            // Enables 304 Not Modified responses and avoids re-downloading
+            // unchanged resources. The class is @hide before API 33 so we
+            // use reflection.
+            try {
+                val httpCacheDir = File(cacheDir, "http_cache")
+                httpCacheDir.mkdirs()
+                val cls = Class.forName("android.net.http.HttpResponseCache")
+                cls.getMethod("install", File::class.java, Long::class.javaPrimitiveType)
+                    .invoke(null, httpCacheDir, 10L * 1024 * 1024)
+            } catch (_: Exception) {
+                // Hidden API unavailable — continue without HTTP caching
             }
         }
     }

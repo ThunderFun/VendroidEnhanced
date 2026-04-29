@@ -67,8 +67,7 @@ class VencordNative(private val activity: WeakReference<MainActivity>, wv: WebVi
 
     private fun isKeyAllowedForWrite(id: String): Boolean {
         if (id == "vencordLocation") return false
-        if (id.startsWith("css_cache_")) return false
-        if (id.startsWith("Vencord-") || id.startsWith("vendroid_") || id.startsWith("Vencord_")) return true
+        if (id.startsWith("Vencord-") || id.startsWith("vendroid_") || id.startsWith("Vencord_") || id.startsWith("css_cache_")) return true
         if (com.nin0dev.vendroid.BuildConfig.DEBUG) w("Blocked write for disallowed key: $id")
         return false
     }

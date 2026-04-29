@@ -115,12 +115,14 @@ class VWebviewClient(
     /** Only Vencord/Equicord theme CSS needs to bypass cache — not Discord's own CSS. */
     private fun isVencordCssUrl(uri: Uri): Boolean {
         val host = uri.host ?: return false
-        val isGithub = host == "github.com" || host == "raw.githubusercontent.com" || host.endsWith("github.io")
-        if (!isGithub) return false
-        // Case-insensitive match — GitHub URLs may contain "Vencord" with capital V.
+        if (!isForgeHost(host)) return false
         val urlLower = uri.toString().lowercase()
         return urlLower.contains("vencord") || urlLower.contains("equicord") || urlLower.contains("vendroid")
     }
+
+    private fun isForgeHost(host: String): Boolean =
+        host == "github.com" || host == "raw.githubusercontent.com" || host.endsWith("github.io")
+                || host == "codeberg.org" || host.endsWith("codeberg.page")
 
     private fun shouldInterceptForCspStripping(req: WebResourceRequest): Boolean {
         val scheme = req.url.scheme ?: return false
@@ -128,9 +130,15 @@ class VWebviewClient(
 
         val host = req.url.host ?: return false
 
-        // Intercept .css requests to fix Content-Type (e.g., GitHub raw serves CSS
-        // as text/plain). CSP headers are only stripped for Discord domains in doFetch().
-        if (req.url.path?.endsWith(".css") == true) return true
+        // Only intercept CSS that needs header modifications — forge-served CSS
+        // (Content-Type fixing, theme no-cache policy). Let Discord's own CSS and
+        // all other CSS go through Chromium's built-in disk cache, which avoids
+        // re-downloading unchanged resources on every page load.
+        if (req.url.path?.endsWith(".css") == true) {
+            val host = req.url.host ?: return false
+            if (isForgeHost(host)) return true
+            return false
+        }
 
         if (req.isForMainFrame) {
             val isDiscord = isDiscordDomain(host)
