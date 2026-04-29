@@ -6,6 +6,7 @@ import android.widget.Toast
 import com.nin0dev.vendroid.BuildConfig
 import com.nin0dev.vendroid.R
 import com.nin0dev.vendroid.utils.Constants
+import java.io.ByteArrayOutputStream
 import java.io.File
 import java.io.IOException
 import java.io.InputStream
@@ -15,15 +16,31 @@ import java.util.Locale
 
 object HttpClient {
     @Volatile
-    @JvmField
     var VencordRuntime: String? = null
+        private set
     @Volatile
-    @JvmField
     var VencordMobileRuntime: String? = null
+        private set
+
+    @JvmStatic
+    fun setVencordRuntime(value: String?) { VencordRuntime = value }
+
+    @JvmStatic
+    fun setVencordMobileRuntime(value: String?) { VencordMobileRuntime = value }
 
     private val vencordRuntimePatches = listOf(
         "chat input type must be set" to "chat input type must be set__VENDROID_DISABLED"
     )
+
+    // Pre-built regex for single-pass patching — avoids N full-copy allocations
+    // on the ~1MB Vencord bundle.
+    private val patchRegex: Regex by lazy {
+        vencordRuntimePatches.map { Regex.escape(it.first) }
+            .joinToString("|").toRegex()
+    }
+    private val patchReplaceMap: Map<String, String> by lazy {
+        vencordRuntimePatches.toMap()
+    }
 
     @JvmStatic
     fun clearInjectedBundles() {
@@ -52,11 +69,13 @@ object HttpClient {
                 if(BuildConfig.DEBUG) activity.runOnUiThread { Toast.makeText(activity, "Just updated app version, redownloading Vencord", Toast.LENGTH_LONG).show() }
                 vendroidFile.delete()
                 VencordRuntime = null
+                sPrefs.edit().remove("vencordEtag").apply()
             }
             if ((vencordLocation != Constants.JS_BUNDLE_URL && vencordLocation != Constants.EQUICORD_BUNDLE_URL) || BuildConfig.DEBUG) {
                 activity.runOnUiThread { Toast.makeText(activity, "Debugging app or Vencord, bundle will be redownloaded. Avoid using on limited networks", Toast.LENGTH_LONG).show() }
                 vendroidFile.delete()
                 VencordRuntime = null
+                sPrefs.edit().remove("vencordEtag").apply()
             }
         }
 
@@ -67,8 +86,22 @@ object HttpClient {
         }
         else {
             val e = sPrefs.edit()
+            val storedEtag = sPrefs.getString("vencordEtag", null)
             val conn = fetch(vencordLocation)
             try {
+                // Send conditional request — if the server supports ETags,
+                // a 304 Not Modified avoids re-downloading the ~1MB bundle.
+                if (storedEtag != null) {
+                    conn.setRequestProperty("If-None-Match", storedEtag)
+                }
+
+                val responseCode = conn.getResponseCode()
+                if (responseCode == HttpURLConnection.HTTP_NOT_MODIFIED) {
+                    // Bundle unchanged — close the connection and rely on
+                    // the cached file (which should exist if we have an ETag).
+                    return
+                }
+
                 val initialSize = conn.contentLength.coerceAtLeast(8192)
                 val content = readAsText(conn.inputStream, initialSize)
                 val patched = applyPatches(content)
@@ -80,10 +113,19 @@ object HttpClient {
                 } finally {
                     tmpFile.delete()
                 }
+
+                // Store the ETag for future conditional requests.
+                val responseEtag = conn.getHeaderField("ETag")
+                if (responseEtag != null) {
+                    e.putString("vencordEtag", responseEtag)
+                }
                 e.putInt("lastMajorUpdateThatUserHasUpdatedVencord", BuildConfig.VERSION_CODE)
                 e.apply()
                 VencordRuntime = patched
             } finally {
+                // Close the stream instead of disconnect() to allow HTTP
+                // keep-alive / connection reuse for subsequent requests.
+                try { conn.inputStream.close() } catch (_: IOException) {}
                 conn.disconnect()
             }
         }
@@ -94,50 +136,50 @@ object HttpClient {
 
     @JvmStatic
     fun applyPatches(content: String): String {
-        var result = content
-        for ((search, replace) in vencordRuntimePatches) {
-            result = result.replace(search, replace)
+        if (vencordRuntimePatches.isEmpty()) return content
+        // Single-pass replacement — avoids creating N intermediate 1MB strings
+        // when there are N patches (each .replace() allocates a full copy).
+        return patchRegex.replace(content) { match ->
+            patchReplaceMap[match.value] ?: match.value
         }
-        return result
     }
 
     @Throws(IOException::class)
     fun fetch(url: String): HttpURLConnection {
+        if (!url.startsWith("https://")) {
+            throw IllegalArgumentException("Non-HTTPS URL rejected: ${url.substringBefore("://")}://")
+        }
         val conn = URL(url).openConnection() as HttpURLConnection
         conn.connectTimeout = 15000
         conn.readTimeout = 15000
         if (conn.getResponseCode() >= 300) {
-            throw HttpException(conn)
+            val ex = HttpException(conn)
+            conn.disconnect()
+            throw ex
         }
         return conn
     }
 
     @Throws(IOException::class)
     fun readAsText(`is`: InputStream, initialSize: Int = 8192): String {
-        return `is`.bufferedReader(Charsets.UTF_8).use { it.readText() }
+        // Use pre-sized ByteArrayOutputStream to avoid ~17 StringBuilder
+        // resizes when reading a ~1MB response.
+        val bos = ByteArrayOutputStream(initialSize.coerceAtLeast(8192))
+        `is`.use { it.copyTo(bos, 8192) }
+        return bos.toString("UTF-8")
     }
 
-    class HttpException(private val conn: HttpURLConnection) : IOException() {
-        override var message: String? = null
-            get() {
-                if (field == null) {
-                    try {
-                        conn.errorStream.use { es ->
-                            field = String.format(
-                                    Locale.ENGLISH,
-                                    "%d: %s (%s)\n%s",
-                                    conn.getResponseCode(),
-                                    conn.getResponseMessage(),
-                                    conn.url.toString(),
-                                    readAsText(es)
-                            )
-                        }
-                    } catch (ex: IOException) {
-                        field = "Error while building message lmao. Url is " + conn.url.toString()
-                    }
-                }
-                return field
-            }
-            private set
+    class HttpException(conn: HttpURLConnection) : IOException() {
+        override val message: String? = try {
+            String.format(
+                    Locale.ENGLISH,
+                    "HTTP %d: %s (%s)",
+                    conn.getResponseCode(),
+                    conn.getResponseMessage(),
+                    conn.url.host
+            )
+        } catch (_: IOException) {
+            "HTTP error for host: " + (conn.url.host ?: "unknown")
+        }
     }
 }

@@ -5,6 +5,7 @@ import android.content.ActivityNotFoundException
 import android.content.Context
 import android.content.Intent
 import android.graphics.Bitmap
+import android.net.Uri
 import android.os.Build
 import android.webkit.WebResourceRequest
 import android.webkit.WebResourceResponse
@@ -24,19 +25,24 @@ class VWebviewClient(
 
     override fun shouldOverrideUrlLoading(view: WebView, request: WebResourceRequest): Boolean {
         val url = request.url
-        if ("discord.com" == url.authority || "about:blank" == url.toString()) {
+        val host = url.host
+        val isDiscordDomain = host != null && isDiscordDomain(host)
+        if (isDiscordDomain || url.scheme == "about") {
             return false
         }
-        val intent = Intent(Intent.ACTION_VIEW, url)
-        try {
-            view.context.startActivity(intent)
-        } catch (_: ActivityNotFoundException) {
-            Toast.makeText(appContext, "No app found to open this link", Toast.LENGTH_SHORT).show()
+        val scheme = url.scheme
+        if (scheme == "http" || scheme == "https") {
+            val intent = Intent(Intent.ACTION_VIEW, url)
+            try {
+                view.context.startActivity(intent)
+            } catch (_: ActivityNotFoundException) {
+                Toast.makeText(appContext, "No app found to open this link", Toast.LENGTH_SHORT).show()
+            }
         }
         return true
     }
 
-    private val disableHighlightCss = "(function(){var s=document.createElement('style');s.textContent='*,*::before,*::after{-webkit-tap-highlight-color:transparent!important;outline:none!important}';(document.head||document.documentElement).appendChild(s)})()"
+    private val disableHighlightCss = "(function(){if(document.getElementById('vendroid-disable-highlight'))return;var s=document.createElement('style');s.id='vendroid-disable-highlight';s.textContent='*,*::before,*::after{-webkit-tap-highlight-color:transparent!important;outline:none!important}*:focus,*:focus-visible,*:focus-within{box-shadow:none!important;outline:none!important}';var t=document.head||document.documentElement;if(t)t.appendChild(s)})()"
 
     override fun onPageStarted(view: WebView, url: String, favicon: Bitmap?) {
         view.evaluateJavascript(disableHighlightCss, null)
@@ -45,9 +51,14 @@ class VWebviewClient(
             val runtime = HttpClient.VencordRuntime
             val mobileRuntime = HttpClient.VencordMobileRuntime
             if (runtime != null && mobileRuntime != null) {
+                // Must NOT wrap in an IIFE — Vencord's bundle uses top-level
+                // var/let/const declarations that need global scope to be
+                // visible to Discord's code.
                 val script = buildString {
-                    runtime?.let { append(it).append(';') }
-                    mobileRuntime?.let { append(it).append(';') }
+                    append(runtime)
+                    append(';')
+                    append(mobileRuntime)
+                    append(';')
                 }
                 view.evaluateJavascript(script, null)
             }
@@ -56,6 +67,9 @@ class VWebviewClient(
 
     override fun onPageFinished(view: WebView, url: String) {
         super.onPageFinished(view, url)
+        // Re-inject after the page (and Discord's CSS) has fully loaded so our
+        // !important rules are present late in the stylesheet cascade and can't
+        // be overridden by subsequently loaded theme CSS.
         view.evaluateJavascript(disableHighlightCss, null)
 
         val activity = activityRef.get()
@@ -67,14 +81,15 @@ class VWebviewClient(
     @RequiresApi(Build.VERSION_CODES.N)
     override fun shouldInterceptRequest(view: WebView, req: WebResourceRequest): WebResourceResponse? {
         if (!shouldInterceptForCspStripping(req)) return null
+        val urlString = req.url.toString() // cache once — Uri.toString() allocates each call
         val isCss = req.url.path?.endsWith(".css") == true
         // Only force no-cache on Vencord/Equicord theme CSS — Discord's own CSS
         // should use normal browser caching to avoid unnecessary network round-trips
         // that block rendering and make interactions feel sluggish.
-        val isThemeCss = isCss && isVencordCssUrl(req.url.toString())
+        val isThemeCss = isCss && isVencordCssUrl(req.url)
         var conn: HttpURLConnection? = null
         try {
-            conn = URL(req.url.toString()).openConnection() as HttpURLConnection
+            conn = URL(urlString).openConnection() as HttpURLConnection
             conn.connectTimeout = 15000
             conn.readTimeout = 15000
             conn.requestMethod = req.method
@@ -84,17 +99,13 @@ class VWebviewClient(
                 conn.setRequestProperty("Pragma", "no-cache")
             }
             for ((key, value) in req.requestHeaders) {
+                val lowerKey = key.lowercase()
                 // Strip conditional headers for theme CSS only — prevents stale
                 // theme caches while letting Discord CSS use normal 304 responses.
-                if (isThemeCss && (key.equals("If-None-Match", ignoreCase = true) ||
-                            key.equals("If-Modified-Since", ignoreCase = true) ||
-                            key.equals("If-Unmodified-Since", ignoreCase = true) ||
-                            key.equals("If-Match", ignoreCase = true))) {
-                    continue
-                }
+                if (isThemeCss && lowerKey in STRIPPED_CONDITIONAL_HEADERS) continue
                 conn.setRequestProperty(key, value)
             }
-            return doFetch(req, conn)
+            return doFetch(req, conn, isCss)
         } catch (_: Exception) {
             conn?.disconnect()
             return null
@@ -102,8 +113,13 @@ class VWebviewClient(
     }
 
     /** Only Vencord/Equicord theme CSS needs to bypass cache — not Discord's own CSS. */
-    private fun isVencordCssUrl(url: String): Boolean {
-        return url.contains("github") && (url.contains("vencord") || url.contains("equicord") || url.contains("vendroid"))
+    private fun isVencordCssUrl(uri: Uri): Boolean {
+        val host = uri.host ?: return false
+        val isGithub = host == "github.com" || host == "raw.githubusercontent.com" || host.endsWith("github.io")
+        if (!isGithub) return false
+        // Case-insensitive match — GitHub URLs may contain "Vencord" with capital V.
+        val urlLower = uri.toString().lowercase()
+        return urlLower.contains("vencord") || urlLower.contains("equicord") || urlLower.contains("vendroid")
     }
 
     private fun shouldInterceptForCspStripping(req: WebResourceRequest): Boolean {
@@ -112,14 +128,13 @@ class VWebviewClient(
 
         val host = req.url.host ?: return false
 
-        // Intercept ALL .css requests to fix Content-Type (e.g., GitHub raw serves CSS as text/plain).
-        // CSP headers are only stripped for Discord domains in doFetch().
+        // Intercept .css requests to fix Content-Type (e.g., GitHub raw serves CSS
+        // as text/plain). CSP headers are only stripped for Discord domains in doFetch().
         if (req.url.path?.endsWith(".css") == true) return true
 
         if (req.isForMainFrame) {
-            val isDiscordDomain = host == "discord.com" || host.endsWith(".discord.com") ||
-                    host == "discordapp.com" || host.endsWith(".discordapp.com")
-            if (isDiscordDomain) {
+            val isDiscord = isDiscordDomain(host)
+            if (isDiscord) {
                 val path = req.url.path ?: return true
                 val lastSegment = path.substringAfterLast('/')
                 val dot = lastSegment.lastIndexOf('.')
@@ -134,30 +149,32 @@ class VWebviewClient(
     }
 
     @RequiresApi(Build.VERSION_CODES.N)
-    private fun doFetch(req: WebResourceRequest, conn: HttpURLConnection): WebResourceResponse {
+    private fun doFetch(req: WebResourceRequest, conn: HttpURLConnection, isCss: Boolean): WebResourceResponse {
         val host = req.url.host ?: ""
-        val isDiscordDomain = host == "discord.com" || host.endsWith(".discord.com") ||
-                host == "discordapp.com" || host.endsWith(".discordapp.com")
+        val isDiscordDomain = isDiscordDomain(host)
 
-        val modifiedHeaders = HashMap<String, String>()
-        var i = 0
+        val modifiedHeaders = HashMap<String, String>(conn.headerFields?.size ?: 16)
+        var i = 1
         while (true) {
             val key = conn.getHeaderFieldKey(i) ?: break
             val value = conn.getHeaderField(i) ?: break
             i++
+            val lowerKey = key.lowercase()
             // Only strip CSP headers for Discord domains — other domains don't need CSP stripping
-            if (isDiscordDomain) {
-                if (key.equals("Content-Security-Policy", ignoreCase = true)) continue
-                if (key.equals("Content-Security-Policy-Report-Only", ignoreCase = true)) continue
-            }
+            if (isDiscordDomain && lowerKey == "content-security-policy") continue
+            if (isDiscordDomain && lowerKey == "content-security-policy-report-only") continue
             modifiedHeaders[key] = value
         }
-        if (req.url.path?.endsWith(".css") == true) modifiedHeaders["Content-Type"] = "text/css"
+        if (isCss) modifiedHeaders["Content-Type"] = "text/css"
         val contentType = modifiedHeaders.getOrDefault("Content-Type", "application/octet-stream")
         val statusCode = conn.responseCode
         val reasonPhrase = conn.responseMessage.takeIf { it.isNotEmpty() } ?: "OK"
         return WebResourceResponse(contentType, "utf-8", statusCode, reasonPhrase, modifiedHeaders, conn.inputStream)
     }
+
+    private fun isDiscordDomain(host: String): Boolean =
+        host == "discord.com" || host.endsWith(".discord.com") ||
+                host == "discordapp.com" || host.endsWith(".discordapp.com")
 
     companion object {
         private val NON_HTML_EXTENSIONS = setOf(
@@ -165,6 +182,10 @@ class VWebviewClient(
             "woff", "woff2", "ttf", "eot", "otf",
             "mp3", "mp4", "webm", "ogg", "wav",
             "map", "json", "xml", "wasm", "zip", "gz"
+        )
+
+        private val STRIPPED_CONDITIONAL_HEADERS = setOf(
+            "if-none-match", "if-modified-since", "if-unmodified-since", "if-match"
         )
     }
 }

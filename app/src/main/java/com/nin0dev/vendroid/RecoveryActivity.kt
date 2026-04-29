@@ -15,8 +15,8 @@ class RecoveryActivity : AppCompatActivity() {
 
         findViewById<MaterialCardView>(R.id.start_normally).setOnClickListener {
             it.isClickable = false
-            finish()
             startActivity(Intent(this, MainActivity::class.java))
+            finish()
         }
         findViewById<MaterialCardView>(R.id.safe_mode).setOnClickListener {
             it.isClickable = false
@@ -24,8 +24,8 @@ class RecoveryActivity : AppCompatActivity() {
             val e = sPrefs.edit()
             e.putBoolean("safeMode", true)
             e.apply()
-            finish()
             startActivity(Intent(this, MainActivity::class.java))
+            finish()
         }
         findViewById<MaterialCardView>(R.id.force_update).setOnClickListener {
             it.isClickable = false
@@ -33,12 +33,13 @@ class RecoveryActivity : AppCompatActivity() {
             val e = sPrefs.edit()
             e.putInt("lastMajorUpdateThatUserHasUpdatedVencord", 0)
             e.apply()
-            finish()
             startActivity(Intent(this, MainActivity::class.java))
+            finish()
         }
 
     }
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
+        setIntent(intent)
     }
 }

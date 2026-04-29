@@ -11,8 +11,6 @@ import android.os.Bundle
 import java.io.File
 import android.os.Handler
 import android.os.Looper
-import android.os.StrictMode
-import android.os.StrictMode.ThreadPolicy
 import android.view.View
 import android.view.View.GONE
 import android.view.View.VISIBLE
@@ -42,6 +40,7 @@ import androidx.core.content.edit
 
 class MainActivity : AppCompatActivity() {
     private var wvInitialized = false
+    private var prewarmUsed = false
     private var wv: WebView? = null
     private lateinit var chromeClient: VChromeClient
     private lateinit var vencordNative: VencordNative
@@ -103,9 +102,9 @@ class MainActivity : AppCompatActivity() {
     }
 
     fun checkUpdates(ignoreSetting: Boolean = false) {
-        val sPrefs = getSharedPreferences("settings", Context.MODE_PRIVATE)
-        if (!sPrefs.getBoolean("checkVDEUpdates", true) && !sPrefs.getBoolean("checkAnnouncements", true) && !ignoreSetting) return
+        return // Server ping disabled
 
+        val sPrefs = getSharedPreferences("settings", Context.MODE_PRIVATE)
         val today = LocalDate.now()
         val i = "${today.dayOfYear}${today.year}"
         val url = "https://vendroid.nin0.dev/api/updates?version=${BuildConfig.VERSION_CODE}${if (sPrefs.getString("lastDailyCheck", "") == i) "" else "&daily=true"}"
@@ -114,8 +113,12 @@ class MainActivity : AppCompatActivity() {
         fetchExecutor.execute {
             try {
                 val conn = HttpClient.fetch(url)
-                val response = HttpClient.readAsText(conn.inputStream, conn.contentLength.coerceAtLeast(8192))
-                conn.disconnect()
+                val response: String
+                try {
+                    response = HttpClient.readAsText(conn.inputStream, conn.contentLength.coerceAtLeast(8192))
+                } finally {
+                    conn.disconnect()
+                }
                 val updateData = gson.fromJson<UpdateData>(response, UpdateData::class.java) ?: return@execute
 
                 runOnUiThread {
@@ -166,10 +169,9 @@ class MainActivity : AppCompatActivity() {
         loadingScreenDismissed = true
         loadingAnimationRunnable?.let { mainHandler.removeCallbacks(it) }
         loadingAnimationRunnable = null
-        val loadingScreen = findViewById<LinearLayout>(R.id.loading_screen)
-        loadingScreen.animate()?.alpha(0f)?.setDuration(500)?.withEndAction {
-            loadingScreen.visibility = GONE
-            loadingScreen.alpha = 1f
+        loadingScreenLayout.animate()?.alpha(0f)?.setDuration(500)?.withEndAction {
+            loadingScreenLayout.visibility = GONE
+            loadingScreenLayout.alpha = 1f
         }?.start()
     }
 
@@ -233,12 +235,7 @@ class MainActivity : AppCompatActivity() {
         val sPrefs = getSharedPreferences("settings", Context.MODE_PRIVATE)
         val editor = sPrefs.edit()
 
-        WebView.setWebContentsDebuggingEnabled(
-            BuildConfig.DEBUG || sPrefs.getBoolean(
-                "allowRemoteDebugging",
-                false
-            )
-        )
+        WebView.setWebContentsDebuggingEnabled(BuildConfig.DEBUG)
         setContentView(R.layout.activity_main)
         WindowCompat.setDecorFitsSystemWindows(window, true)
 
@@ -268,22 +265,44 @@ class MainActivity : AppCompatActivity() {
         quickCssLayout = findViewById(R.id.quickcss)
         loadingScreenLayout = findViewById(R.id.loading_screen)
 
-        wv = findViewById(R.id.webview)!!
+        // Use the pre-warmed WebView from VendroidApp if available — it already
+        // has the Chromium renderer process initialized, eliminating ~200-500ms
+        // of cold-start latency. Otherwise fall back to the layout-inflated one.
+        val prewarmed = VendroidApp.prewarmedWebView
+        if (prewarmed != null) {
+            val xmlWv = findViewById<WebView>(R.id.webview)
+            val parent = xmlWv?.parent as? android.view.ViewGroup
+            val params = xmlWv?.layoutParams
+            if (parent != null && params != null) {
+                parent.removeView(xmlWv)
+                prewarmed.id = R.id.webview
+                prewarmUsed = true
+                // The pre-warmed WebView has no layout params yet — carry over
+                // the same width/height/background/layerType from the XML definition.
+                prewarmed.setBackgroundColor(android.graphics.Color.parseColor("#121214"))
+                prewarmed.setLayerType(View.LAYER_TYPE_HARDWARE, null)
+                parent.addView(prewarmed, parent.indexOfChild(xmlWv).coerceAtLeast(0), params)
+            }
+            VendroidApp.prewarmedWebView = null
+            wv = prewarmed
+        } else {
+            wv = findViewById(R.id.webview)!!
+        }
 
         chromeClient = VChromeClient(this)
         val webViewClient = VWebviewClient(this)
         wv!!.setWebViewClient(webViewClient)
         wv!!.setWebChromeClient(chromeClient)
         setupQuickCss()
-        explodeAndroid()
         if (sPrefs.getBoolean("desktopMode", false)) {
             wv!!.settings.userAgentString =
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
         }
-        val s = wv?.getSettings()!!
+        val s = wv!!.settings
         s.javaScriptEnabled = true
         s.domStorageEnabled = true
-        s.allowFileAccess = true
+        s.allowFileAccess = false
+        s.allowContentAccess = false
 
         s.cacheMode = android.webkit.WebSettings.LOAD_DEFAULT
         @Suppress("DEPRECATION")
@@ -292,7 +311,7 @@ class MainActivity : AppCompatActivity() {
         // eliminates the "paint on demand" jank that makes interactions feel slow.
         s.offscreenPreRaster = true
         s.mediaPlaybackRequiresUserGesture = false
-        s.mixedContentMode = android.webkit.WebSettings.MIXED_CONTENT_COMPATIBILITY_MODE
+        s.mixedContentMode = android.webkit.WebSettings.MIXED_CONTENT_NEVER_ALLOW
         s.setBuiltInZoomControls(false)
         // Use the wide viewport and overview mode so the page scales correctly
         // without extra re-layouts from viewport mismatch.
@@ -315,8 +334,7 @@ class MainActivity : AppCompatActivity() {
         // or throttling the renderer process, keeping touch response fast.
         wv!!.setRendererPriorityPolicy(WebView.RENDERER_PRIORITY_IMPORTANT, false)
 
-        // Disable Safe Browsing via the AndroidX WebKit compat API — the
-        // static WebView method was removed from the public SDK.
+        // Disable Safe Browsing
         if (androidx.webkit.WebViewFeature.isFeatureSupported(androidx.webkit.WebViewFeature.SAFE_BROWSING_ENABLE)) {
             androidx.webkit.WebSettingsCompat.setSafeBrowsingEnabled(s, false)
         }
@@ -326,21 +344,23 @@ class MainActivity : AppCompatActivity() {
         if (!sPrefs.getBoolean("safeMode", false)) {
             vencordNative = VencordNative(WeakReference(this), wv!!)
             wv?.addJavascriptInterface(vencordNative, "VencordMobileNative")
+            // These reads must be synchronous — onPageStarted fires as soon as
+            // the WebView begins navigating, and Vencord must be injected then.
+            // Internal storage reads are <50ms; APK resource reads are even faster
+            // (memory-mapped). The heavy work (network fetch) stays async.
             if (HttpClient.VencordMobileRuntime == null) {
                 resources.openRawResource(R.raw.vencord_mobile).use { `is` ->
-                    HttpClient.VencordMobileRuntime = HttpClient.readAsText(`is`)
+                    HttpClient.setVencordMobileRuntime(HttpClient.readAsText(`is`))
                 }
             }
-            // Synchronously pre-load cached vencord.js so it's ready when
-            // onPageStarted fires. File read from internal storage is <50ms.
-            // The background fetchVencord() will still check version/debug
-            // and re-download if needed.
-            if (HttpClient.VencordRuntime == null) {
-                val vendroidFile = File(filesDir, "vencord.js")
-                if (vendroidFile.exists()) {
-                    try {
-                        HttpClient.VencordRuntime = HttpClient.applyPatches(vendroidFile.readText())
-                    } catch (_: Exception) {}
+            synchronized(vencordRuntimeLock) {
+                if (HttpClient.VencordRuntime == null) {
+                    val vendroidFile = File(filesDir, "vencord.js")
+                    if (vendroidFile.exists()) {
+                        try {
+                            HttpClient.setVencordRuntime(HttpClient.applyPatches(vendroidFile.readText()))
+                        } catch (_: Exception) {}
+                    }
                 }
             }
             fetchExecutor.execute {
@@ -398,12 +418,17 @@ class MainActivity : AppCompatActivity() {
 
     private fun handleUrl(url: Uri?) {
         if (url != null) {
-            if (url.authority != "discord.com" && url.authority != "ptb.discord.com" && url.authority != "canary.discord.com") return
+            val host = url.host
+            if (host != "discord.com" && host != "ptb.discord.com" && host != "canary.discord.com"
+                && host != "discordapp.com" && host != "ptb.discordapp.com" && host != "canary.discordapp.com") return
+            val escapedPath = (url.path ?: "")
+                .replace("\\", "\\\\")
+                .replace("\"", "\\\"")
             if (!wvInitialized) {
                 wv!!.loadUrl(url.toString())
             } else {
                 wv!!.evaluateJavascript(
-                    "Vencord.Webpack.Common.NavigationRouter.transitionTo(\"${url.path}\")",
+                    "Vencord.Webpack.Common.NavigationRouter.transitionTo(\"$escapedPath\")",
                     null
                 )
             }
@@ -412,8 +437,9 @@ class MainActivity : AppCompatActivity() {
 
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
-        val data = intent.data
-        data?.let { handleUrl(it) }
+        if (intent.action == Intent.ACTION_VIEW) {
+            intent.data?.let { handleUrl(it) }
+        }
     }
 
     override fun onPause() {
@@ -437,17 +463,23 @@ class MainActivity : AppCompatActivity() {
         wv?.onPause()
         wv?.pauseTimers()
         wv?.stopLoading()
-        (wv?.parent as? android.view.ViewGroup)?.removeView(wv)
-        wv?.destroy()
+        if (!prewarmUsed) {
+            (wv?.parent as? android.view.ViewGroup)?.removeView(wv)
+            wv?.destroy()
+        }
         wv = null
         if (::vencordNative.isInitialized) vencordNative.shutdown()
-        fetchExecutor.shutdown()
+        fetchExecutor.shutdownNow()
         super.onDestroy()
     }
 
     fun injectVencordIfReady() {
-        val runtime = HttpClient.VencordRuntime
-        val mobileRuntime = HttpClient.VencordMobileRuntime
+        val runtime: String?
+        val mobileRuntime: String?
+        synchronized(vencordRuntimeLock) {
+            runtime = HttpClient.VencordRuntime
+            mobileRuntime = HttpClient.VencordMobileRuntime
+        }
         if (wv != null && runtime != null && mobileRuntime != null) {
             val script = buildString {
                 runtime?.let { append(it).append(';') }
@@ -458,9 +490,16 @@ class MainActivity : AppCompatActivity() {
     }
 
     fun showDiscordToast(message: String, type: String) {
+        val allowedTypes = setOf("SUCCESS", "ERROR", "INFO", "WARN")
+        val safeType = if (type in allowedTypes) type else "INFO"
+        val escapedMessage = message
+            .replace("\\", "\\\\")
+            .replace("\"", "\\\"")
+            .replace("\n", "\\n")
+            .replace("\r", "\\r")
         wv?.post(Runnable {
             wv?.evaluateJavascript(
-                "toasts=Vencord.Webpack.Common.Toasts; toasts.show({id: toasts.genId(), message: \"$message\", type: toasts.Type.$type, options: {position: toasts.Position.BOTTOM,}})",
+                "toasts=Vencord.Webpack.Common.Toasts; toasts.show({id: toasts.genId(), message: \"$escapedMessage\", type: toasts.Type.$safeType, options: {position: toasts.Position.BOTTOM,}})",
                 null
             )
         })
@@ -469,12 +508,6 @@ class MainActivity : AppCompatActivity() {
     companion object {
         const val FILECHOOSER_RESULTCODE = 8485
         private val gson = Gson()
-    }
-
-    private fun explodeAndroid() {
-        StrictMode.setThreadPolicy(
-            ThreadPolicy.Builder()
-                .build()
-        )
+        private val vencordRuntimeLock = Any()
     }
 }

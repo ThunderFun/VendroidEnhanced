@@ -15,7 +15,6 @@ import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
 import com.nin0dev.vendroid.MainActivity
 import com.nin0dev.vendroid.R
-import com.nin0dev.vendroid.utils.Logger.d
 import com.nin0dev.vendroid.utils.Logger.e
 import com.nin0dev.vendroid.utils.Logger.i
 import com.nin0dev.vendroid.utils.Logger.w
@@ -28,15 +27,15 @@ class VChromeClient(activity: MainActivity) : WebChromeClient() {
     private var originalStatusBarColor: Int = 0
     private lateinit var fullscreenContainer: FrameLayout
     private lateinit var webview: WebView
-    private var viewsInitialized = false
+    private var cachedActivityRef: MainActivity? = null
     private var insetsController: WindowInsetsControllerCompat? = null
     val isFullscreen: Boolean get() = customView != null
 
     private fun ensureViewsInitialized(activity: MainActivity) {
-        if (!viewsInitialized) {
+        if (cachedActivityRef !== activity) {
             fullscreenContainer = activity.findViewById(R.id.fullscreen_container)
             webview = activity.findViewById(R.id.webview)
-            viewsInitialized = true
+            cachedActivityRef = activity
         }
     }
 
@@ -48,12 +47,17 @@ class VChromeClient(activity: MainActivity) : WebChromeClient() {
 
     override fun onConsoleMessage(msg: ConsoleMessage): Boolean {
         if (!com.nin0dev.vendroid.BuildConfig.DEBUG) return true
-        val m = "[Javascript] ${msg.message()} @ ${msg.lineNumber()}: ${msg.sourceId()}"
+        // Defer string construction until AFTER level dispatch — avoids
+        // allocating the full message string for DEBUG/LOG levels that
+        // Discord emits hundreds of times per second (React dev tools,
+        // webpack HMR, etc.). This eliminates the dominant per-message
+        // GC pressure in debug mode.
         when (msg.messageLevel()) {
-            MessageLevel.DEBUG -> d(m)
-            MessageLevel.ERROR -> e(m)
-            MessageLevel.WARNING -> w(m)
-            else -> i(m)
+            MessageLevel.ERROR -> e("[Javascript] ${msg.message()} @ ${msg.lineNumber()}: ${msg.sourceId()}")
+            MessageLevel.WARNING -> w("[Javascript] ${msg.message()} @ ${msg.lineNumber()}: ${msg.sourceId()}")
+            // Skip DEBUG/LOG — extremely voluminous, near-zero diagnostic value
+            MessageLevel.DEBUG, MessageLevel.LOG -> {}
+            else -> i("[Javascript] ${msg.message()} @ ${msg.lineNumber()}: ${msg.sourceId()}")
         }
         return true
     }
@@ -86,10 +90,10 @@ class VChromeClient(activity: MainActivity) : WebChromeClient() {
             customViewCallback?.onCustomViewHidden()
             return
         }
-        customView = view
-        customViewCallback = callback
         val activity = activityRef.get() ?: return
         ensureViewsInitialized(activity)
+        customView = view
+        customViewCallback = callback
         // Hardware layer on the fullscreen view lets the compositor overlay
         // the video surface directly without extra composition passes.
         view.setLayerType(View.LAYER_TYPE_HARDWARE, null)
@@ -116,7 +120,10 @@ class VChromeClient(activity: MainActivity) : WebChromeClient() {
         customView = null
         customViewCallback = null
 
-        if (activity == null) return
+        if (activity == null || !::fullscreenContainer.isInitialized) {
+            localCallback?.onCustomViewHidden()
+            return
+        }
         fullscreenContainer.visibility = View.GONE
         // Restore to default layer type — the view is being removed, so
         // the GPU texture it held can be released.

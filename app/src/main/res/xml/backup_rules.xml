@@ -6,8 +6,8 @@
    See https://developer.android.com/about/versions/12/backup-restore
 -->
 <full-backup-content>
-    <!--
-   <include domain="sharedpref" path="."/>
-   <exclude domain="sharedpref" path="device.xml"/>
--->
+    <exclude domain="sharedpref" path="settings.xml" />
+    <exclude domain="sharedpref" path="announcements.xml" />
+    <exclude domain="file" path="vencord.js" />
+    <exclude domain="file" path="vencord-mobile.js" />
 </full-backup-content>

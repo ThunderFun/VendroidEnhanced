@@ -1209,46 +1209,22 @@ video {
             }
         }, true);
 
-        cssUrls.forEach((url, idx) => {
-            const cacheKey = "vendroid_css_" + url;
-            const tsKey = cacheKey + "_ts";
+        cssUrls.forEach((url) => {
             const now = Date.now();
-            const CACHE_TTL = 6 * 60 * 60 * 1000; // 6 hours (only used to decide if cache is shown immediately)
-
-            let cached;
-            try { cached = localStorage.getItem(cacheKey); } catch(e) {}
-            let cacheTs = 0;
-            try { cacheTs = parseInt(localStorage.getItem(tsKey)) || 0; } catch(e) {}
-            const isStale = (now - cacheTs) > CACHE_TTL;
-
-            // Always inject cached CSS immediately for fast startup (if available)
-            if (cached) {
-                if (url.includes("moreFixes")) cached = patchMoreFixesCss(cached);
-                injectStyle(url, cached);
-            }
-
-            // Always fetch from network (stale-while-revalidate pattern)
-            // Add cache-busting query param to bypass all HTTP/CDN/DNS caches
             const bustUrl = url + (url.includes("?") ? "&" : "?") + "_t=" + now;
             fetch(bustUrl)
                 .then(r => r.text())
                 .then(css => {
                     if (url.includes("moreFixes")) css = patchMoreFixesCss(css);
-                    try { localStorage.setItem(cacheKey, css); } catch(e) {}
-                    try { localStorage.setItem(tsKey, String(now)); } catch(e) {}
-                    const existing = document.querySelector(`style[data-cache-url="${url}"]`);
-                    if (existing) { existing.textContent = css; }
-                    else { injectStyle(url, css); }
+                    injectStyle(url, css);
                 })
                 .catch(() => {
-                    if (!cached) {
-                        const link = Object.assign(document.createElement("link"), {
-                            rel: "stylesheet",
-                            type: "text/css",
-                            href: url
-                        });
-                        document.documentElement.appendChild(link);
-                    }
+                    const link = Object.assign(document.createElement("link"), {
+                        rel: "stylesheet",
+                        type: "text/css",
+                        href: url
+                    });
+                    document.documentElement.appendChild(link);
                 });
         });
     }
