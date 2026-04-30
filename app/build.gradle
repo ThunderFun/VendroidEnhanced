@@ -2,6 +2,12 @@ plugins {
     id 'com.android.application'
 }
 
+def keystoreProperties = new Properties()
+def keystorePropertiesFile = rootProject.file("local.properties")
+if (keystorePropertiesFile.exists()) {
+    keystoreProperties.load(new FileInputStream(keystorePropertiesFile))
+}
+
 android {
     namespace 'com.nin0dev.vendroid'
     compileSdk 35
@@ -22,6 +28,15 @@ android {
         shaders = false
     }
 
+    signingConfigs {
+        release {
+            storeFile file(keystoreProperties['storeFile'] ?: 'release.keystore.jks')
+            storePassword keystoreProperties['storePassword'] ?: ''
+            keyAlias keystoreProperties['keyAlias'] ?: ''
+            keyPassword keystoreProperties['keyPassword'] ?: ''
+        }
+    }
+
     buildTypes {
         debug {
             applicationIdSuffix ".debug"
@@ -38,6 +53,7 @@ android {
         release {
             minifyEnabled true
             shrinkResources true
+            signingConfig signingConfigs.release
             proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
         }
     }

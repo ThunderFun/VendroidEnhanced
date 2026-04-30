@@ -23,6 +23,7 @@ import java.io.File
 import java.io.FileOutputStream
 import java.lang.ref.WeakReference
 import java.net.HttpURLConnection
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.Executors
 
 class VencordNative(private val activity: WeakReference<MainActivity>, wv: WebView) {
@@ -51,11 +52,13 @@ class VencordNative(private val activity: WeakReference<MainActivity>, wv: WebVi
 
     private val executor = Executors.newSingleThreadExecutor()
 
+    private val iconLock = Any()
+
     // Per-key rate limiter — prevents rapid re-writes to the same key while
     // allowing independent keys to be written in parallel. Uses System.nanoTime()
     // (monotonic hardware counter) instead of currentTimeMillis() (wall clock
     // that can jump on clock adjustments, breaking the rate limiter).
-    private val lastWriteTime = HashMap<String, Long>()
+    private val lastWriteTime = ConcurrentHashMap<String, Long>()
 
     private fun rateLimitWrite(id: String): Boolean {
         val now = System.nanoTime()
@@ -196,22 +199,25 @@ class VencordNative(private val activity: WeakReference<MainActivity>, wv: WebVi
 
     @JavascriptInterface
     fun changeAppIcon(id: String) {
-        val act = activity.get() ?: return
-        if (id == currentIcon) return
-        if (id !in ICON_NAMES) return
-        val pm = act.packageManager
-        val pkg = act.applicationContext
-        pm.setComponentEnabledSetting(
-            ComponentName(pkg, "com.nin0dev.vendroid.${id}MainActivity"),
-            PackageManager.COMPONENT_ENABLED_STATE_ENABLED,
-            PackageManager.DONT_KILL_APP
-        )
-        pm.setComponentEnabledSetting(
-            ComponentName(pkg, "com.nin0dev.vendroid.${currentIcon}MainActivity"),
-            PackageManager.COMPONENT_ENABLED_STATE_DISABLED,
-            PackageManager.DONT_KILL_APP
-        )
-        currentIcon = id
+        synchronized(iconLock) {
+            if (id == currentIcon) return
+            if (id !in ICON_NAMES) return
+            val act = activity.get() ?: return
+            val oldIcon = currentIcon
+            currentIcon = id
+            val pm = act.packageManager
+            val pkg = act.applicationContext
+            pm.setComponentEnabledSetting(
+                ComponentName(pkg, "com.nin0dev.vendroid.${id}MainActivity"),
+                PackageManager.COMPONENT_ENABLED_STATE_ENABLED,
+                PackageManager.DONT_KILL_APP
+            )
+            pm.setComponentEnabledSetting(
+                ComponentName(pkg, "com.nin0dev.vendroid.${oldIcon}MainActivity"),
+                PackageManager.COMPONENT_ENABLED_STATE_DISABLED,
+                PackageManager.DONT_KILL_APP
+            )
+        }
     }
 
     @JavascriptInterface

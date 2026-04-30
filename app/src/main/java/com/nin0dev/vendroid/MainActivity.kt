@@ -24,6 +24,7 @@ import com.google.android.material.color.DynamicColors
 import com.google.android.material.dialog.MaterialAlertDialogBuilder
 import com.google.android.material.textfield.TextInputEditText
 import com.google.gson.Gson
+import com.nin0dev.vendroid.utils.Constants
 import com.nin0dev.vendroid.utils.Logger.e
 import com.nin0dev.vendroid.utils.UpdateData
 import com.nin0dev.vendroid.webview.HttpClient
@@ -36,6 +37,8 @@ import java.lang.ref.WeakReference
 import java.util.concurrent.Executors
 import java.time.LocalDate
 import androidx.core.content.edit
+import androidx.activity.result.ActivityResultLauncher
+import androidx.activity.result.contract.ActivityResultContracts
 
 
 class MainActivity : AppCompatActivity() {
@@ -47,6 +50,20 @@ class MainActivity : AppCompatActivity() {
 
     @JvmField
     var filePathCallback: ValueCallback<Array<Uri>>? = null
+
+    val fileChooserLauncher: ActivityResultLauncher<Intent> = registerForActivityResult(
+        ActivityResultContracts.StartActivityForResult()
+    ) { result ->
+        val callback = filePathCallback
+        filePathCallback = null
+        if (callback == null) return@registerForActivityResult
+        if (result.data == null) {
+            callback.onReceiveValue(null)
+            return@registerForActivityResult
+        }
+        val resultArray = WebChromeClient.FileChooserParams.parseResult(result.resultCode, result.data!!)
+        callback.onReceiveValue(resultArray)
+    }
 
     private var loadingScreenDismissed = false
     private var loadingAnimationRunnable: Runnable? = null
@@ -381,8 +398,17 @@ class MainActivity : AppCompatActivity() {
             val data = intent.data
             if (data != null) handleUrl(intent.data)
         } else {
-            // All branches currently resolve to the same URL; map kept for future branch support
-            wv!!.loadUrl("https://discord.com/app")
+            val lastUrl = sPrefs.getString("lastUrl", null)
+            if (lastUrl != null) {
+                val host = Uri.parse(lastUrl).host
+                if (host != null && Constants.isDiscordDomain(host)) {
+                    wv!!.loadUrl(lastUrl)
+                } else {
+                    wv!!.loadUrl("https://discord.com/app")
+                }
+            } else {
+                wv!!.loadUrl("https://discord.com/app")
+            }
         }
 
         mainHandler.postDelayed({ checkUpdates() }, 3000)
@@ -398,24 +424,6 @@ class MainActivity : AppCompatActivity() {
         wvInitialized = true
     }
 
-    override fun onActivityResult(requestCode: Int, resultCode: Int, intent: Intent?) {
-        super.onActivityResult(requestCode, resultCode, intent)
-
-        if (requestCode == FILECHOOSER_RESULTCODE) {
-            val callback = filePathCallback
-            filePathCallback = null
-
-            if (callback == null) return
-
-            if (intent == null) {
-                callback.onReceiveValue(null)
-                return
-            }
-            val result = WebChromeClient.FileChooserParams.parseResult(resultCode, intent)
-            callback.onReceiveValue(result)
-        }
-    }
-
     private fun handleUrl(url: Uri?) {
         if (url != null) {
             val host = url.host
@@ -424,8 +432,8 @@ class MainActivity : AppCompatActivity() {
             val escapedPath = (url.path ?: "")
                 .replace("\\", "\\\\")
                 .replace("\"", "\\\"")
-            if (!wvInitialized) {
-                wv!!.loadUrl(url.toString())
+            if (!wvInitialized || wv == null) {
+                wv?.loadUrl(url.toString())
             } else {
                 wv!!.evaluateJavascript(
                     "Vencord.Webpack.Common.NavigationRouter.transitionTo(\"$escapedPath\")",
@@ -443,6 +451,13 @@ class MainActivity : AppCompatActivity() {
     }
 
     override fun onPause() {
+        wv?.url?.let { url ->
+            val host = Uri.parse(url).host
+            if (host != null && Constants.isDiscordDomain(host)) {
+                getSharedPreferences("settings", Context.MODE_PRIVATE)
+                    .edit { putString("lastUrl", url) }
+            }
+        }
         wv?.onPause()
         wv?.pauseTimers()
         super.onPause()
@@ -463,6 +478,7 @@ class MainActivity : AppCompatActivity() {
         wv?.onPause()
         wv?.pauseTimers()
         wv?.stopLoading()
+        wvInitialized = false
         if (!prewarmUsed) {
             (wv?.parent as? android.view.ViewGroup)?.removeView(wv)
             wv?.destroy()
@@ -506,7 +522,6 @@ class MainActivity : AppCompatActivity() {
     }
 
     companion object {
-        const val FILECHOOSER_RESULTCODE = 8485
         private val gson = Gson()
         private val vencordRuntimeLock = Any()
     }

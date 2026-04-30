@@ -87,19 +87,31 @@ object HttpClient {
         else {
             val e = sPrefs.edit()
             val storedEtag = sPrefs.getString("vencordEtag", null)
-            val conn = fetch(vencordLocation)
+            var conn: HttpURLConnection? = null
             try {
-                // Send conditional request — if the server supports ETags,
-                // a 304 Not Modified avoids re-downloading the ~1MB bundle.
+                conn = URL(vencordLocation).openConnection() as HttpURLConnection
+                conn.connectTimeout = 15000
+                conn.readTimeout = 15000
                 if (storedEtag != null) {
                     conn.setRequestProperty("If-None-Match", storedEtag)
                 }
 
-                val responseCode = conn.getResponseCode()
+                var responseCode = conn.getResponseCode()
+
                 if (responseCode == HttpURLConnection.HTTP_NOT_MODIFIED) {
-                    // Bundle unchanged — close the connection and rely on
-                    // the cached file (which should exist if we have an ETag).
-                    return
+                    if (vendroidFile.exists()) {
+                        VencordRuntime = applyPatches(vendroidFile.readText())
+                        return
+                    }
+                    conn.disconnect()
+                    conn = URL(vencordLocation).openConnection() as HttpURLConnection
+                    conn.connectTimeout = 15000
+                    conn.readTimeout = 15000
+                    responseCode = conn.getResponseCode()
+                }
+
+                if (responseCode >= 300) {
+                    throw IOException("HTTP $responseCode fetching Vencord bundle from $vencordLocation")
                 }
 
                 val initialSize = conn.contentLength.coerceAtLeast(8192)
@@ -114,7 +126,6 @@ object HttpClient {
                     tmpFile.delete()
                 }
 
-                // Store the ETag for future conditional requests.
                 val responseEtag = conn.getHeaderField("ETag")
                 if (responseEtag != null) {
                     e.putString("vencordEtag", responseEtag)
@@ -123,10 +134,8 @@ object HttpClient {
                 e.apply()
                 VencordRuntime = patched
             } finally {
-                // Close the stream instead of disconnect() to allow HTTP
-                // keep-alive / connection reuse for subsequent requests.
-                try { conn.inputStream.close() } catch (_: IOException) {}
-                conn.disconnect()
+                try { conn?.inputStream?.close() } catch (_: IOException) {}
+                conn?.disconnect()
             }
         }
         activity.runOnUiThread {

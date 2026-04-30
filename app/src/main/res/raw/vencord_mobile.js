@@ -566,22 +566,23 @@
             "width: 100vw !important"
         );
         const marker = 'div[role="dialog"]';
-        let searchFrom = 0;
+        const segments = [];
+        let pos = 0;
         while (true) {
-            const idx = css.indexOf(marker, searchFrom);
-            if (idx === -1) break;
+            const idx = css.indexOf(marker, pos);
+            if (idx === -1) { segments.push(css.substring(pos)); break; }
+            segments.push(css.substring(pos, idx));
             const braceStart = css.indexOf('{', idx + marker.length);
-            if (braceStart === -1) { searchFrom = idx + marker.length; continue; }
+            if (braceStart === -1) { pos = idx + marker.length; continue; }
             let depth = 0, i = braceStart;
             while (i < css.length) {
                 if (css[i] === '{') depth++;
                 else if (css[i] === '}') { depth--; if (depth === 0) break; }
                 i++;
             }
-            css = css.substring(0, idx) + css.substring(i + 1);
-            searchFrom = idx;
+            pos = i + 1;
         }
-        return css;
+        return segments.join('');
     }
 
     const baseCss = `
@@ -595,7 +596,7 @@ video {
     height: auto !important;
     object-fit: contain !important;
 }
-[class*="imageWrapper"]:has(video) {
+[class*="imageWrapper"]:has(>video) {
     height: fit-content !important;
 }
 [class*="embedMedia"] img, [class*="embedImage"] img {
@@ -875,7 +876,7 @@ video {
     }
 
     function isDiscordHost(urlStr) {
-        try { const h = new URL(urlStr).host; return h.endsWith(".discordapp.com") || h.endsWith(".discordapp.net"); } catch(e) { return false; }
+        try { const h = new URL(urlStr).host; return h.endsWith(".discordapp.com") || h.endsWith(".discordapp.net") || h.endsWith(".discord.com") || h.endsWith(".discord.net"); } catch(e) { return false; }
     }
 
     function findProxyUrl(img) {
@@ -885,13 +886,24 @@ video {
             while (fiber) {
                 const p = fiber.memoizedProps || fiber.pendingProps;
                 if (p) {
-                    if (p.proxyURL) return p.proxyURL;
-                    if (p.proxy_url) return p.proxy_url;
+                    if (typeof p.proxyURL === 'string' && p.proxyURL.startsWith('http')) return p.proxyURL;
+                    if (typeof p.proxy_url === 'string' && p.proxy_url.startsWith('http')) return p.proxy_url;
                 }
                 fiber = fiber.return;
             }
         }
         return null;
+    }
+
+    function getBestVideoUrl(video) {
+        const proxy = findProxyUrl(video);
+        if (proxy) return toFullResUrl(proxy);
+        if (video.dataset.safeSrc && isDiscordHost(video.dataset.safeSrc)) return toFullResUrl(video.dataset.safeSrc);
+        if (video.currentSrc && isDiscordHost(video.currentSrc)) return toFullResUrl(video.currentSrc);
+        if (video.src && isDiscordHost(video.src)) return toFullResUrl(video.src);
+        const source = video.querySelector("source");
+        if (source && source.src && isDiscordHost(source.src)) return toFullResUrl(source.src);
+        return toFullResUrl(video.dataset.safeSrc || video.currentSrc || video.src || (source && source.src) || "");
     }
 
     function getBestImageUrl(img) {
@@ -928,6 +940,24 @@ video {
         img.style.cssText = "max-width:100vw;max-height:100vh;width:auto;height:auto;object-fit:contain;transform-origin:0 0;touch-action:none;";
         img.setAttribute("tabindex", "-1");
         img.draggable = false;
+
+        function onMediaReady() {
+            const vw = window.innerWidth, vh = window.innerHeight;
+            const nw = isVideo ? img.videoWidth : img.naturalWidth;
+            const nh = isVideo ? img.videoHeight : img.naturalHeight;
+            if (nw > 0 && nh > 0 && (nw < vw || nh < vh)) {
+                const scale = Math.min(vw / nw, vh / nh);
+                img.style.width = Math.round(nw * scale) + "px";
+                img.style.height = Math.round(nh * scale) + "px";
+            }
+        }
+        if (isVideo) {
+            img.onloadedmetadata = onMediaReady;
+            img.onerror = function() { closeImageOverlay(); };
+        } else {
+            img.onload = onMediaReady;
+            img.onerror = function() { closeImageOverlay(); };
+        }
 
         let imgScale = 1, imgTx = 0, imgTy = 0;
         let pinchStartDist = 0, pinchStartScale = 1, pinchStartTx = 0, pinchStartTy = 0, pinchMidX = 0, pinchMidY = 0;
@@ -1040,6 +1070,12 @@ video {
         document.body.appendChild(overlay);
         imgOverlay = overlay;
 
+        if (isVideo) {
+            if (img.readyState >= 1 && img.videoWidth > 0) onMediaReady();
+        } else {
+            if (img.complete && img.naturalWidth > 0) onMediaReady();
+        }
+
         overlay.addEventListener("click", e => {
             if (e.target === overlay && imgScale <= 1) closeImageOverlay();
         });
@@ -1050,21 +1086,43 @@ video {
 
     function isLightboxDialog(dialog) {
         const text = (dialog.textContent || "").trim();
-        if (text.length > 200) return false;
-        const mediaCount = dialog.querySelectorAll("img").length + dialog.querySelectorAll("video").length;
-        if (mediaCount > 2) return false;
+        if (text.length > 500) return false;
+
+        const buttons = dialog.querySelectorAll('button, [role="button"]');
+        let actionButtonCount = 0;
+        for (const btn of buttons) {
+            if ((btn.textContent || "").trim().length > 0) actionButtonCount++;
+        }
+        if (actionButtonCount >= 2) return false;
+
+        const mediaCount = dialog.querySelectorAll("img, video").length;
+        if (mediaCount < 1) return false;
         return true;
     }
 
     function dismissDiscordModal() {
-        requestAnimationFrame(() => {
+        function tryDismiss() {
             const dialog = document.querySelector('div[role="dialog"]');
-            if (dialog) {
+            if (dialog && isLightboxDialog(dialog)) {
                 dialog.style.setProperty("display", "none", "important");
             }
             try { var meh = getModalEscapeHandler(); if (meh && typeof meh.action === "function") meh.action(); } catch(e) {}
             delayedBlur();
-        });
+        }
+        tryDismiss();
+        requestAnimationFrame(tryDismiss);
+        setTimeout(tryDismiss, 50);
+        setTimeout(tryDismiss, 150);
+        setTimeout(tryDismiss, 300);
+    }
+
+    function isGifVideo(el) {
+        if (el.tagName !== 'VIDEO') return false;
+        if (el.controls) return false;
+        if (el.getAttribute("aria-label") === "GIF") return true;
+        if (el.poster || el.hasAttribute('poster')) return false;
+        if (el.readyState >= 1 && el.duration > 60) return false;
+        return true;
     }
 
     function isInApp() {
@@ -1075,87 +1133,206 @@ video {
         }
     }
 
+    let pendingImageClickTarget = null;
+    let pendingImageStartX = 0, pendingImageStartY = 0;
+    let pendingImageMaxDistSq = 0;
+    let lastImagePointerDownTime = 0;
+
+    function isAttachmentImage(el) {
+        if (el.closest('svg')) return false;
+        if (el.closest('iframe, [data-hcaptcha-response], .hcaptcha, .captcha')) return false;
+        if (el.closest('[class*="avatar"], [class*="Avatar"], [class*="pfp"], [class*="Pfp"]')) return false;
+        if (el.closest('[class*="member"], [class*="Member"], [class*="userPopout"], [class*="UserPopout"]')) return false;
+        if (el.closest('[class*="status"], [class*="pill"], [class*="roleIcon"], [class*="RoleIcon"]')) return false;
+        return true;
+    }
+
+    function findImageFromTarget(target) {
+        if (target.tagName === 'IMG') return target;
+        if (target.tagName === 'VIDEO') return target;
+        let node = target;
+        for (let i = 0; i < 6 && node; i++) {
+            if (node.tagName === 'IMG') return node;
+            if (node.tagName === 'VIDEO') return node;
+            if (node.querySelector) {
+                const img = node.querySelector('img');
+                if (img) return img;
+                const video = node.querySelector('video');
+                if (video) return video;
+            }
+            node = node.parentElement;
+        }
+        return null;
+    }
+
     function hookImageClick() {
-        // Use a lightweight gate: tag-check the event target *before* any
-        // DOM queries (closest, querySelector). This avoids the cost of
-        // tree-walking on every single click that isn't on media.
-        document.addEventListener("click", (e) => {
+        function onPointerDown(x, y, target) {
             if (imgOverlay) return;
             if (!isInApp()) return;
+            pendingImageClickTarget = null;
+            pendingImageStartX = x;
+            pendingImageStartY = y;
+            pendingImageMaxDistSq = 0;
 
-            const target = e.target;
-            const tag = target.tagName;
-            // Fast reject: skip immediately if the target isn't a media element
-            // and doesn't contain one (rare — only wrapper divs).
-            if (tag !== 'IMG' && tag !== 'VIDEO' && tag !== 'SVG' &&
-                tag !== 'PICTURE' && tag !== 'IFRAME') {
-                // childElementCount check is cheaper than querySelector for the common case
-                if (!target.childElementCount) return;
-                if (!target.querySelector('img, video')) return;
+            const el = findImageFromTarget(target);
+            if (!el) return;
+            if (!isAttachmentImage(el)) return;
+
+            if (el.tagName === 'IMG') {
+                if (!isDiscordHost(el.src || el.currentSrc || el.dataset?.safeSrc || "")) return;
+                const rect = el.getBoundingClientRect();
+                if (rect.width < 50 && rect.height < 50 && !el.srcset) return;
+                pendingImageClickTarget = el;
+                lastImagePointerDownTime = Date.now();
+            } else if (isGifVideo(el)) {
+                if (!isDiscordHost(el.src || el.currentSrc || el.dataset?.safeSrc || "")) return;
+                const rect = el.getBoundingClientRect();
+                if (rect.width < 50 && rect.height < 50) return;
+                pendingImageClickTarget = el;
+                lastImagePointerDownTime = Date.now();
             }
+        }
 
-            const img = e.target.closest("img");
-            const video = !img ? e.target.closest("video") : null;
-            if (!img && !video) return;
+        function onPointerMove(x, y) {
+            if (!pendingImageClickTarget) return;
+            const dx = x - pendingImageStartX;
+            const dy = y - pendingImageStartY;
+            const distSq = dx * dx + dy * dy;
+            if (distSq > pendingImageMaxDistSq) pendingImageMaxDistSq = distSq;
+        }
 
-            const el = img || video;
+        function onPointerUp(e, x, y) {
+            if (!pendingImageClickTarget) return;
+            const el = pendingImageClickTarget;
+            pendingImageClickTarget = null;
+            if (imgOverlay) return;
+            if (pendingImageMaxDistSq > 2500) return;
 
-            if (el.closest('svg')) return;
-
-            if (el.closest('iframe, [data-hcaptcha-response], .hcaptcha, .captcha')) return;
-
-            if (el.closest('[class*="avatar"], [class*="Avatar"], [class*="pfp"], [class*="Pfp"]')) return;
-
-            if (el.closest('[class*="member"], [class*="Member"], [class*="userPopout"], [class*="UserPopout"]')) return;
-
-            if (el.closest('[class*="status"], [class*="pill"], [class*="roleIcon"], [class*="RoleIcon"]')) return;
-
-            if (img) {
-                if (!isDiscordHost(img.src || img.currentSrc || img.dataset?.safeSrc || "")) return;
-
-                const rect = img.getBoundingClientRect();
-                if (rect.width < 200 && rect.height < 200) return;
+            if (isGifVideo(el)) {
+                const videoSrc = getBestVideoUrl(el);
+                if (!videoSrc) return;
 
                 e.stopImmediatePropagation();
-                e.preventDefault();
-
-                showImageInOverlay(getBestImageUrl(img));
-
-                dismissDiscordModal();
-            } else if (video && video.muted && video.loop) {
-                const videoSrc = video.src || video.currentSrc || "";
-                if (!isDiscordHost(videoSrc)) return;
-
-                const rect = video.getBoundingClientRect();
-                if (rect.width < 200 && rect.height < 200) return;
-
-                e.stopImmediatePropagation();
+                e.stopPropagation();
                 e.preventDefault();
 
                 showImageInOverlay(videoSrc, true);
+                dismissDiscordModal();
+            }
+        }
 
+        window.addEventListener("pointerdown", (e) => {
+            onPointerDown(e.clientX, e.clientY, e.target);
+        }, true);
+
+        window.addEventListener("pointermove", (e) => {
+            onPointerMove(e.clientX, e.clientY);
+        }, true);
+
+        window.addEventListener("pointercancel", () => {
+            pendingImageClickTarget = null;
+        }, true);
+
+        window.addEventListener("pointerup", (e) => {
+            onPointerUp(e, e.clientX, e.clientY);
+        }, true);
+
+        // Backup touch handlers for browsers where pointer events are unreliable.
+        window.addEventListener("touchstart", (e) => {
+            if (e.touches.length !== 1) return;
+            onPointerDown(e.touches[0].clientX, e.touches[0].clientY, e.target);
+        }, { passive: true, capture: true });
+
+        window.addEventListener("touchmove", (e) => {
+            if (e.touches.length !== 1) return;
+            onPointerMove(e.touches[0].clientX, e.touches[0].clientY);
+        }, { passive: true, capture: true });
+
+        window.addEventListener("touchend", (e) => {
+            if (e.changedTouches.length !== 1) return;
+            onPointerUp(e, e.changedTouches[0].clientX, e.changedTouches[0].clientY);
+        }, { passive: false, capture: true });
+
+        window.addEventListener("click", (e) => {
+            if (!isInApp()) return;
+
+            if (imgOverlay && imgOverlay.contains(e.target)) return;
+
+            let el = null;
+            if (pendingImageClickTarget && pendingImageMaxDistSq <= 2500) {
+                el = pendingImageClickTarget;
+            }
+            pendingImageClickTarget = null;
+            if (!el) {
+                el = findImageFromTarget(e.target);
+            }
+            if (!el) return;
+            if (!isAttachmentImage(el)) return;
+
+            if (imgOverlay) {
+                e.stopImmediatePropagation();
+                e.preventDefault();
+                return;
+            }
+
+            if (el.tagName === 'IMG') {
+                if (!isDiscordHost(el.src || el.currentSrc || el.dataset?.safeSrc || "")) return;
+                const rect = el.getBoundingClientRect();
+                if (rect.width < 50 && rect.height < 50 && !el.srcset) return;
+
+                e.stopImmediatePropagation();
+                e.preventDefault();
+
+                showImageInOverlay(getBestImageUrl(el));
+                dismissDiscordModal();
+            } else if (isGifVideo(el)) {
+                if (!isDiscordHost(el.src || el.currentSrc || el.dataset?.safeSrc || "")) return;
+                const rect = el.getBoundingClientRect();
+                if (rect.width < 50 && rect.height < 50) return;
+
+                e.stopImmediatePropagation();
+                e.preventDefault();
+
+                showImageInOverlay(getBestVideoUrl(el), true);
                 dismissDiscordModal();
             }
         }, true);
+
     }
 
     function initVendroidDom() {
         if (window.__vendroidDomInitDone) return;
         window.__vendroidDomInitDone = true;
 
-        injectStyle("vendroid_image_overflow_fix", baseCss);
-        injectStyle("vendroid_video_player", videoPlayerCss);
-        injectStyle("vendroid_hide_clyde", "#app-mount>svg{display:none!important;}");
+        injectStyle("vendroid_static", baseCss + "\n" + videoPlayerCss);
         hookVideoFullscreen();
         hookImageClick();
 
+        function forcePlayGifVideos() {
+            document.querySelectorAll("video").forEach(v => {
+                if (!isGifVideo(v)) return;
+                v.setAttribute("playsinline", "");
+                v.setAttribute("autoplay", "");
+                if (v.paused && v.readyState >= 1) {
+                    v.play().catch(() => {});
+                }
+            });
+        }
+        forcePlayGifVideos();
+        document.addEventListener("loadeddata", e => {
+            if (e.target.tagName === "VIDEO" && isGifVideo(e.target) && e.target.paused) {
+                e.target.play().catch(() => {});
+            }
+        }, true);
+
         let observerRafId = 0;
         let lastNonLightboxDialog = null;
+        let lastNonLightboxDialogHash = "";
         let lastObserverRun = 0;
         // Throttle MutationObserver to at most once per animation frame AND
-        // at most once per 100ms — prevents it from firing on every single
+        // at most once per 30ms — prevents it from firing on every single
         // DOM mutation during rapid scrolling or typing.
-        const OBSERVER_MIN_INTERVAL = 100;
+        const OBSERVER_MIN_INTERVAL = 30;
         const observer = new MutationObserver(() => {
             const now = Date.now();
             if (now - lastObserverRun < OBSERVER_MIN_INTERVAL) return;
@@ -1163,12 +1340,14 @@ video {
             cancelAnimationFrame(observerRafId);
             observerRafId = requestAnimationFrame(() => {
             if (!isInApp()) return;
+            forcePlayGifVideos();
             const dialog = document.querySelector('div[role="dialog"]');
-            if (!dialog || dialog.style.display === "none") { lastNonLightboxDialog = null; return; }
-            if (dialog === lastNonLightboxDialog) return;
+            if (!dialog || dialog.style.display === "none") { lastNonLightboxDialog = null; lastNonLightboxDialogHash = ""; return; }
+            const dialogHash = dialog.innerHTML.length + "-" + dialog.querySelectorAll("img, video").length;
+            if (dialog === lastNonLightboxDialog && dialogHash === lastNonLightboxDialogHash) return;
             const dialogRect = dialog.getBoundingClientRect();
-            if (dialogRect.width > 0 && dialogRect.width < window.innerWidth * 0.9) { lastNonLightboxDialog = dialog; return; }
-            if (!isLightboxDialog(dialog)) { lastNonLightboxDialog = dialog; return; }
+            if (dialogRect.width > 0 && dialogRect.width < window.innerWidth * 0.5) { lastNonLightboxDialog = dialog; lastNonLightboxDialogHash = dialogHash; return; }
+            if (!isLightboxDialog(dialog)) { lastNonLightboxDialog = dialog; lastNonLightboxDialogHash = dialogHash; return; }
             const imgs = dialog.querySelectorAll("img");
             for (const img of imgs) {
                 if (img.width === 0 && img.height === 0) continue;
@@ -1186,10 +1365,13 @@ video {
             if (imgOverlay) return;
             const videos = dialog.querySelectorAll("video");
             for (const video of videos) {
-                if (video.width === 0 && video.height === 0) continue;
-                if (!video.muted || !video.loop) continue;
-                const videoSrc = video.src || video.currentSrc || "";
-                if (!isDiscordHost(videoSrc)) continue;
+                const vRect = video.getBoundingClientRect();
+                if (vRect.width === 0 && vRect.height === 0) continue;
+                if (vRect.width < 50 && vRect.height < 50) continue;
+                if (!isGifVideo(video)) continue;
+                if (!isDiscordHost(video.src || video.currentSrc || video.dataset?.safeSrc || "")) continue;
+                const videoSrc = getBestVideoUrl(video);
+                if (!videoSrc) continue;
                 if (!imgOverlay) {
                     showImageInOverlay(videoSrc, true);
                     dialog.style.setProperty("display", "none", "important");
@@ -1209,15 +1391,23 @@ video {
             }
         }, true);
 
-        cssUrls.forEach((url) => {
+        var fetchedCssCount = 0;
+        var fetchedCssBuffer = [];
+        function flushFetchedCss() {
+            if (fetchedCssCount < cssUrls.length) return;
+            injectStyle("vendroid_fetched", fetchedCssBuffer.join("\n"));
+        }
+        cssUrls.forEach((url, idx) => {
             fetch(url)
                 .then(r => r.text())
                 .then(css => {
                     if (url.includes("moreFixes")) css = patchMoreFixesCss(css);
-                    injectStyle(url, css);
+                    fetchedCssBuffer[idx] = css;
+                    fetchedCssCount++;
+                    flushFetchedCss();
                 })
                 .catch(() => {
-                    const link = Object.assign(document.createElement("link"), {
+                    var link = Object.assign(document.createElement("link"), {
                         rel: "stylesheet",
                         type: "text/css",
                         href: url

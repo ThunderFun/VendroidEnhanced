@@ -1,6 +1,7 @@
 package com.nin0dev.vendroid.webview
 
 import android.content.ActivityNotFoundException
+import android.graphics.Bitmap
 import android.graphics.Color
 import android.net.Uri
 import android.os.Build
@@ -45,6 +46,12 @@ class VChromeClient(activity: MainActivity) : WebChromeClient() {
         }
     }
 
+    private val transparentPoster: Bitmap by lazy {
+        Bitmap.createBitmap(1, 1, Bitmap.Config.ARGB_8888).also { it.eraseColor(0) }
+    }
+
+    override fun getDefaultVideoPoster(): Bitmap? = transparentPoster
+
     override fun onConsoleMessage(msg: ConsoleMessage): Boolean {
         if (!com.nin0dev.vendroid.BuildConfig.DEBUG) return true
         // Defer string construction until AFTER level dispatch — avoids
@@ -76,7 +83,7 @@ class VChromeClient(activity: MainActivity) : WebChromeClient() {
 
         return try {
             val intent = fileChooserParams.createIntent()
-            activity.startActivityForResult(intent, MainActivity.FILECHOOSER_RESULTCODE)
+            activity.fileChooserLauncher.launch(intent)
             true
         } catch (e: ActivityNotFoundException) {
             activity.filePathCallback = null
