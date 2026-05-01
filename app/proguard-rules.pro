@@ -1,5 +1,20 @@
 # Keep annotations for reflection
 -keepattributes *Annotation*
+-keepattributes RuntimeVisibleAnnotations
+
+# WebView JS bridge — VencordNative must keep its class name, method names,
+# and parameter types exactly as-is because JavaScript calls them by name
+# via VencordMobileNative.getString(...) etc.  The default
+# proguard-android-optimize.txt keeps @JavascriptInterface methods,
+# but aggressive R8 settings (-repackageclasses, -allowaccessmodification)
+# can still break the bridge if the class itself is obfuscated or merged.
+-keep @interface android.webkit.JavascriptInterface
+-keepclassmembers class com.nin0dev.vendroid.webview.VencordNative {
+    @android.webkit.JavascriptInterface <methods>;
+}
+# Also keep the class from being renamed/merged so the runtime type
+# matches what addJavascriptInterface() registered.
+-keep class com.nin0dev.vendroid.webview.VencordNative { *; }
 
 # Gson — only keep the core Gson class + TypeToken (for reflection).
 # Let R8 shrink all unused Gson adapters/internals. Only serialized
@@ -13,8 +28,6 @@
 # Keep the app's own serialized model classes (used by Gson reflection)
 -keep class com.nin0dev.vendroid.utils.UpdateData { *; }
 
-# Volley is NOT used in this project — remove dead keep rules.
-# (Removed: -keep class com.android.volley.** { *; })
 
 # Suppress warnings for javax.annotation (not on Android)
 -dontwarn javax.annotation.**

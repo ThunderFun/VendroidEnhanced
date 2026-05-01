@@ -45,6 +45,14 @@ class MainActivity : AppCompatActivity() {
     private var wvInitialized = false
     private var prewarmUsed = false
     private var wv: WebView? = null
+
+    /** Cached URL for bridge-thread safety.  Updated on the UI thread in
+     *  WebViewClient callbacks and onPause.  Bridge methods read this
+     *  instead of calling wv.url directly. */
+    @Volatile
+    var currentUrlForBridge: String? = null
+    @Volatile
+    var missedInjection = false
     private lateinit var chromeClient: VChromeClient
     private lateinit var vencordNative: VencordNative
 
@@ -365,8 +373,11 @@ class MainActivity : AppCompatActivity() {
             }
             synchronized(vencordRuntimeLock) {
                 if (HttpClient.VencordRuntime == null) {
+                    val needsRedownload = sPrefs.getInt("lastMajorUpdateThatUserHasUpdatedVencord", 0) < BuildConfig.VERSION_CODE
                     val vendroidFile = File(filesDir, "vencord.js")
-                    if (vendroidFile.exists()) {
+                    if (needsRedownload) {
+                        vendroidFile.delete()
+                    } else if (vendroidFile.exists()) {
                         try {
                             HttpClient.setVencordRuntime(HttpClient.applyPatches(vendroidFile.readText()))
                         } catch (_: Exception) {}
@@ -387,22 +398,31 @@ class MainActivity : AppCompatActivity() {
         }
 
         val intent = intent
-        if (intent.action == Intent.ACTION_VIEW) {
+        val initialUrl: String = if (intent.action == Intent.ACTION_VIEW) {
             val data = intent.data
-            if (data != null) handleUrl(intent.data)
+            if (data != null) {
+                handleUrl(intent.data)
+                data.toString()
+            } else {
+                "https://discord.com/app"
+            }
         } else {
             val lastUrl = sPrefs.getString("lastUrl", null)
             if (lastUrl != null) {
                 val host = Uri.parse(lastUrl).host
                 if (host != null && Constants.isDiscordDomain(host)) {
                     wv!!.loadUrl(lastUrl)
+                    lastUrl
                 } else {
                     wv!!.loadUrl("https://discord.com/app")
+                    "https://discord.com/app"
                 }
             } else {
                 wv!!.loadUrl("https://discord.com/app")
+                "https://discord.com/app"
             }
         }
+        currentUrlForBridge = initialUrl
 
         mainHandler.postDelayed({ checkUpdates() }, 3000)
         startLoadingAnimation()
@@ -443,6 +463,7 @@ class MainActivity : AppCompatActivity() {
 
     override fun onPause() {
         wv?.url?.let { url ->
+            currentUrlForBridge = url
             val host = Uri.parse(url).host
             if (host != null && Constants.isDiscordDomain(host)) {
                 getSharedPreferences("settings", Context.MODE_PRIVATE)
@@ -488,6 +509,14 @@ class MainActivity : AppCompatActivity() {
             mobileRuntime = HttpClient.VencordMobileRuntime
         }
         if (wv != null && runtime != null && mobileRuntime != null) {
+            if (missedInjection) {
+                missedInjection = false
+                val url = currentUrlForBridge
+                if (url != null && Constants.isDiscordDomain(Uri.parse(url).host ?: "")) {
+                    wv?.reload()
+                    return
+                }
+            }
             val script = buildString {
                 runtime?.let { append(it).append(';') }
                 mobileRuntime?.let { append(it).append(';') }

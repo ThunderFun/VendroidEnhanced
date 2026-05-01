@@ -66,6 +66,8 @@ class VWebviewClient(
     private val disableHighlightCss = "(function(){if(document.getElementById('vendroid-disable-highlight'))return;var s=document.createElement('style');s.id='vendroid-disable-highlight';s.textContent='*,*::before,*::after{-webkit-tap-highlight-color:transparent!important;outline:none!important}';var t=document.head||document.documentElement;if(t)t.appendChild(s)})()"
 
     override fun onPageStarted(view: WebView, url: String, favicon: Bitmap?) {
+        val activity = activityRef.get()
+        (activity as? com.nin0dev.vendroid.MainActivity)?.currentUrlForBridge = url
         view.evaluateJavascript("typeof Vencord!=='undefined'&&typeof VencordMobile!=='undefined'") { result ->
             if (result?.trim() == "true") return@evaluateJavascript
             val runtime = HttpClient.VencordRuntime
@@ -78,15 +80,18 @@ class VWebviewClient(
                     append(';')
                 }
                 view.evaluateJavascript(script, null)
+            } else {
+                (activityRef.get() as? com.nin0dev.vendroid.MainActivity)?.missedInjection = true
             }
         }
     }
 
     override fun onPageFinished(view: WebView, url: String) {
         super.onPageFinished(view, url)
+        val activity = activityRef.get()
+        (activity as? com.nin0dev.vendroid.MainActivity)?.currentUrlForBridge = url
         view.evaluateJavascript(disableHighlightCss, null)
 
-        val activity = activityRef.get()
         if (activity != null && !activity.isFinishing && !activity.isDestroyed) {
             (activity as? com.nin0dev.vendroid.MainActivity)?.scheduleLoadingScreenDismiss(500)
         }

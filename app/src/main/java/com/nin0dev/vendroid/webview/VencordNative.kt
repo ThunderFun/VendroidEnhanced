@@ -13,6 +13,7 @@ import android.view.View.VISIBLE
 import android.webkit.JavascriptInterface
 import android.webkit.WebView
 import android.widget.LinearLayout
+import android.widget.Toast
 import androidx.core.content.edit
 import com.google.android.material.textfield.TextInputEditText
 import com.nin0dev.vendroid.MainActivity
@@ -35,6 +36,39 @@ class VencordNative(private val activity: WeakReference<MainActivity>, wv: WebVi
         private val ICON_NAMES = setOf("Main", "Jolly", "Discord", "Retro", "TS12")
         @Volatile
         private var currentIcon: String = "Main"
+        private val iconLock = Any()
+
+        private fun resolveCurrentIcon(activity: MainActivity?): String {
+            val act = activity ?: return "Main"
+            val pm = act.packageManager
+            val pkg = act.applicationContext
+            for (name in ICON_NAMES) {
+                val state = pm.getComponentEnabledSetting(
+                    ComponentName(pkg, "com.nin0dev.vendroid.${name}MainActivity")
+                )
+                if (state == PackageManager.COMPONENT_ENABLED_STATE_ENABLED) {
+                    return name
+                }
+                // Main is enabled by default in the manifest; if it was never
+                // explicitly toggled getComponentEnabledSetting returns DEFAULT.
+                if (state == PackageManager.COMPONENT_ENABLED_STATE_DEFAULT && name == "Main") {
+                    return "Main"
+                }
+            }
+            return "Main"
+        }
+
+        fun initCurrentIcon(activity: MainActivity?) {
+            synchronized(iconLock) {
+                if (currentIcon == "Main") {
+                    currentIcon = resolveCurrentIcon(activity)
+                }
+            }
+        }
+    }
+
+    init {
+        initCurrentIcon(activity.get())
     }
 
     @Volatile
@@ -53,8 +87,6 @@ class VencordNative(private val activity: WeakReference<MainActivity>, wv: WebVi
         ?.getSharedPreferences("settings", Context.MODE_PRIVATE)
 
     private val executor = Executors.newSingleThreadExecutor()
-
-    private val iconLock = Any()
 
     private var cssCacheEvictionCounter = 0
 
@@ -91,6 +123,7 @@ class VencordNative(private val activity: WeakReference<MainActivity>, wv: WebVi
 
     private fun isKeyAllowedForWrite(id: String): Boolean {
         if (id == "vencordLocation") return false
+        if (id == "clientMod") return true
         if (id.startsWith("Vencord-") || id.startsWith("vendroid_") || id.startsWith("Vencord_") || id.startsWith("css_cache_")) return true
         if (com.nin0dev.vendroid.BuildConfig.DEBUG) w("Blocked write for disallowed key: $id")
         return false
@@ -98,14 +131,14 @@ class VencordNative(private val activity: WeakReference<MainActivity>, wv: WebVi
 
     private fun isKeyAllowedForRead(id: String): Boolean {
         if (id == "vencordLocation") return false
+        if (id == "clientMod") return true
         if (id.startsWith("Vencord-") || id.startsWith("vendroid_") || id.startsWith("Vencord_") || id.startsWith("css_cache_")) return true
         if (com.nin0dev.vendroid.BuildConfig.DEBUG) w("Blocked read for disallowed key: $id")
         return false
     }
 
     private fun isOnDiscordDomain(): Boolean {
-        val wv = wvRef.get() ?: return false
-        val url = wv.url ?: return false
+        val url = activity.get()?.currentUrlForBridge ?: return false
         val host = Uri.parse(url).host ?: return false
         return Constants.isDiscordDomain(host)
     }
@@ -190,123 +223,181 @@ class VencordNative(private val activity: WeakReference<MainActivity>, wv: WebVi
     }
 
     @JavascriptInterface
-    fun getString(id: String, defaultValue: String): String {
-        if (!isOnDiscordDomain()) return defaultValue
-        if (!isKeyAllowedForRead(id)) return defaultValue
-        val sPrefs = settingsPrefs ?: return defaultValue
+    fun getString(id: String?, defaultValue: String?): String {
+        val safeId = id ?: return defaultValue ?: ""
+        val safeDefault = defaultValue ?: ""
         return try {
-            sPrefs.getString(id, defaultValue) ?: defaultValue
-        } catch (e: Exception) {
+            if (!isOnDiscordDomain()) return safeDefault
+            if (!isKeyAllowedForRead(safeId)) return safeDefault
+            val sPrefs = settingsPrefs ?: return safeDefault
+            try {
+                sPrefs.getString(safeId, safeDefault) ?: safeDefault
+            } catch (_: ClassCastException) {
+                sPrefs.edit().remove(safeId).apply()
+                safeDefault
+            }
+        } catch (_: Throwable) {
+            safeDefault
+        }
+    }
+
+    @JavascriptInterface
+    fun getBool(id: String?, defaultValue: Boolean): Boolean {
+        val safeId = id ?: return defaultValue
+        return try {
+            if (!isOnDiscordDomain()) return defaultValue
+            if (!isKeyAllowedForRead(safeId)) return defaultValue
+            val sPrefs = settingsPrefs ?: return defaultValue
+            try {
+                sPrefs.getBoolean(safeId, defaultValue)
+            } catch (_: ClassCastException) {
+                sPrefs.edit().remove(safeId).apply()
+                defaultValue
+            }
+        } catch (_: Throwable) {
             defaultValue
         }
     }
 
     @JavascriptInterface
-    fun getBool(id: String, defaultValue: Boolean): Boolean {
-        if (!isOnDiscordDomain()) return defaultValue
-        if (!isKeyAllowedForRead(id)) return defaultValue
-        val sPrefs = settingsPrefs ?: return defaultValue
-        return try {
-            sPrefs.getBoolean(id, defaultValue)
-        } catch (e: Exception) {
-            defaultValue
+    fun setString(id: String?, value: String?) {
+        val safeId = id ?: return
+        val safeValue = value ?: return
+        try {
+            if (!isOnDiscordDomain()) return
+            if (!rateLimitWrite(safeId)) return
+            if (!isKeyAllowedForWrite(safeId)) return
+            val sPrefs = settingsPrefs ?: return
+            sPrefs.edit {
+                if (safeId.startsWith("css_cache_")) putLong("${safeId}_ts", System.currentTimeMillis())
+                if (safeId == "clientMod") putInt("lastMajorUpdateThatUserHasUpdatedVencord", 0)
+                putString(safeId, safeValue)
+            }
+        } catch (_: Throwable) {}
+    }
+
+    @JavascriptInterface
+    fun setBool(id: String?, value: Boolean) {
+        val safeId = id ?: return
+        try {
+            if (!isOnDiscordDomain()) return
+            if (!rateLimitWrite(safeId)) return
+            if (!isKeyAllowedForWrite(safeId)) return
+            val sPrefs = settingsPrefs ?: return
+            sPrefs.edit {
+                putBoolean(safeId, value)
+            }
+        } catch (_: Throwable) {}
+    }
+
+    @JavascriptInterface
+    fun changeAppIcon(id: String?) {
+        val rawId = id ?: run {
+            val a = activity.get()
+            a?.runOnUiThread { Toast.makeText(a, "Icon change: null id", Toast.LENGTH_SHORT).show() }
+            return
+        }
+        val safeId = ICON_NAMES.find { it.equals(rawId, ignoreCase = true) }
+        if (safeId == null) {
+            val a = activity.get()
+            a?.runOnUiThread { Toast.makeText(a, "Icon change: unknown id '$rawId'", Toast.LENGTH_SHORT).show() }
+            return
+        }
+        try {
+            if (!isOnDiscordDomain()) {
+                val a = activity.get()
+                a?.runOnUiThread { Toast.makeText(a, "Icon change: not on Discord domain", Toast.LENGTH_SHORT).show() }
+                return
+            }
+            synchronized(iconLock) {
+                if (safeId == currentIcon) {
+                    val a = activity.get()
+                    a?.runOnUiThread { Toast.makeText(a, "Icon '$safeId' is already active", Toast.LENGTH_SHORT).show() }
+                    return
+                }
+                val act = activity.get() ?: return
+                val oldIcon = currentIcon
+                currentIcon = safeId
+                val pm = act.packageManager
+                val pkg = act.applicationContext
+                pm.setComponentEnabledSetting(
+                    ComponentName(pkg, "com.nin0dev.vendroid.${safeId}MainActivity"),
+                    PackageManager.COMPONENT_ENABLED_STATE_ENABLED,
+                    PackageManager.DONT_KILL_APP
+                )
+                pm.setComponentEnabledSetting(
+                    ComponentName(pkg, "com.nin0dev.vendroid.${oldIcon}MainActivity"),
+                    PackageManager.COMPONENT_ENABLED_STATE_DISABLED,
+                    PackageManager.DONT_KILL_APP
+                )
+                act.runOnUiThread {
+                    Toast.makeText(act, "Icon changed to $safeId. Restart launcher if it doesn't update.", Toast.LENGTH_LONG).show()
+                }
+            }
+        } catch (t: Throwable) {
+            e("changeAppIcon failed for id=$safeId", t)
+            val a = activity.get()
+            a?.runOnUiThread { Toast.makeText(a, "Icon change failed: ${t.message}", Toast.LENGTH_LONG).show() }
         }
     }
 
     @JavascriptInterface
-    fun setString(id: String, value: String) {
-        if (!isOnDiscordDomain()) return
-        if (!rateLimitWrite(id)) return
-        if (!isKeyAllowedForWrite(id)) return
-        val sPrefs = settingsPrefs ?: return
-        sPrefs.edit {
-            if (id.startsWith("css_cache_")) putLong("${id}_ts", System.currentTimeMillis())
-            if (id == "clientMod") putInt("lastMajorUpdateThatUserHasUpdatedVencord", 0)
-            putString(id, value)
-        }
-    }
-
-    @JavascriptInterface
-    fun setBool(id: String, value: Boolean) {
-        if (!isOnDiscordDomain()) return
-        if (!rateLimitWrite(id)) return
-        if (!isKeyAllowedForWrite(id)) return
-        val sPrefs = settingsPrefs ?: return
-        sPrefs.edit {
-            putBoolean(id, value)
-        }
-    }
-
-    @JavascriptInterface
-    fun changeAppIcon(id: String) {
-        if (!isOnDiscordDomain()) return
-        synchronized(iconLock) {
-            if (id == currentIcon) return
-            if (id !in ICON_NAMES) return
+    fun openQuickCss(quickCss: String?) {
+        try {
+            if (!isOnDiscordDomain()) return
             val act = activity.get() ?: return
-            val oldIcon = currentIcon
-            currentIcon = id
-            val pm = act.packageManager
-            val pkg = act.applicationContext
-            pm.setComponentEnabledSetting(
-                ComponentName(pkg, "com.nin0dev.vendroid.${id}MainActivity"),
-                PackageManager.COMPONENT_ENABLED_STATE_ENABLED,
-                PackageManager.DONT_KILL_APP
-            )
-            pm.setComponentEnabledSetting(
-                ComponentName(pkg, "com.nin0dev.vendroid.${oldIcon}MainActivity"),
-                PackageManager.COMPONENT_ENABLED_STATE_DISABLED,
-                PackageManager.DONT_KILL_APP
-            )
-        }
+            val safeQuickCss = quickCss ?: ""
+            if (safeQuickCss.isNotEmpty()) {
+                act.runOnUiThread {
+                    AlertDialog.Builder(act)
+                        .setTitle("External CSS")
+                        .setMessage("A plugin wants to open the QuickCSS editor with custom content. Apply?")
+                        .setPositiveButton("Apply") { _, _ ->
+                            val quickCssView = act.findViewById<LinearLayout>(R.id.quickcss)
+                            val loadingView = act.findViewById<LinearLayout>(R.id.loading_screen)
+                            val wvView = act.findViewById<WebView>(R.id.webview)
+                            val cssEdit = act.findViewById<TextInputEditText>(R.id.css)
+                            quickCssView.visibility = VISIBLE
+                            loadingView.visibility = GONE
+                            wvView.visibility = GONE
+                            cssEdit.setText(safeQuickCss)
+                        }
+                        .setNegativeButton("Cancel", null)
+                        .show()
+                }
+            } else {
+                act.runOnUiThread {
+                    val quickCssView = act.findViewById<LinearLayout>(R.id.quickcss)
+                    val loadingView = act.findViewById<LinearLayout>(R.id.loading_screen)
+                    val wvView = act.findViewById<WebView>(R.id.webview)
+                    quickCssView.visibility = VISIBLE
+                    loadingView.visibility = GONE
+                    wvView.visibility = GONE
+                }
+            }
+        } catch (_: Throwable) {}
     }
 
     @JavascriptInterface
-    fun openQuickCss(quickCss: String) {
-        if (!isOnDiscordDomain()) return
-        val act = activity.get() ?: return
-        if (quickCss.isNotEmpty()) {
-            act.runOnUiThread {
-                AlertDialog.Builder(act)
-                    .setTitle("External CSS")
-                    .setMessage("A plugin wants to open the QuickCSS editor with custom content. Apply?")
-                    .setPositiveButton("Apply") { _, _ ->
-                        val quickCssView = act.findViewById<LinearLayout>(R.id.quickcss)
-                        val loadingView = act.findViewById<LinearLayout>(R.id.loading_screen)
-                        val wvView = act.findViewById<WebView>(R.id.webview)
-                        val cssEdit = act.findViewById<TextInputEditText>(R.id.css)
-                        quickCssView.visibility = VISIBLE
-                        loadingView.visibility = GONE
-                        wvView.visibility = GONE
-                        cssEdit.setText(quickCss)
-                    }
-                    .setNegativeButton("Cancel", null)
-                    .show()
+    fun getCssCache(cacheKey: String?): String? {
+        val safeKey = cacheKey ?: return null
+        try {
+            if (!isOnDiscordDomain()) return null
+            if (!safeKey.startsWith("css_cache_")) return null
+            if (++cssCacheEvictionCounter % 50 == 0) {
+                executor.execute { evictStaleCssCache() }
             }
-        } else {
-            act.runOnUiThread {
-                val quickCssView = act.findViewById<LinearLayout>(R.id.quickcss)
-                val loadingView = act.findViewById<LinearLayout>(R.id.loading_screen)
-                val wvView = act.findViewById<WebView>(R.id.webview)
-                quickCssView.visibility = VISIBLE
-                loadingView.visibility = GONE
-                wvView.visibility = GONE
+            val sPrefs = settingsPrefs ?: return null
+            return try {
+                sPrefs.getString(safeKey, null)
+            } catch (_: ClassCastException) {
+                sPrefs.edit().remove(safeKey).apply()
+                null
+            } catch (_: Throwable) {
+                null
             }
-        }
-    }
-
-    @JavascriptInterface
-    fun getCssCache(cacheKey: String): String? {
-        if (!isOnDiscordDomain()) return null
-        if (!cacheKey.startsWith("css_cache_")) return null
-        if (++cssCacheEvictionCounter % 50 == 0) {
-            executor.execute { evictStaleCssCache() }
-        }
-        val sPrefs = settingsPrefs ?: return null
-        return try {
-            sPrefs.getString(cacheKey, null)
-        } catch (e: Exception) {
-            null
+        } catch (_: Throwable) {
+            return null
         }
     }
 
