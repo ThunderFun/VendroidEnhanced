@@ -81,14 +81,7 @@ class MainActivity : AppCompatActivity() {
 
         saveButton.setOnClickListener {
             wv!!.evaluateJavascript(
-                "VencordNative.quickCss.set(\"${
-                    cssEditText.text
-                        .toString()
-                        .replace("\\", "\\\\")
-                        .replace("\"", "\\\"")
-                        .replace("\n", "\\n")
-                        .replace("\r", "\\r")
-                }\")", null
+                "VencordNative.quickCss.set(${gson.toJson(cssEditText.text.toString())})", null
             )
             showDiscordToast("Saved QuickCSS", "SUCCESS")
             quickCssLayout.visibility = GONE
@@ -356,7 +349,7 @@ class MainActivity : AppCompatActivity() {
             androidx.webkit.WebSettingsCompat.setSafeBrowsingEnabled(s, false)
         }
 
-        android.webkit.CookieManager.getInstance().setAcceptThirdPartyCookies(wv!!, true)
+        android.webkit.CookieManager.getInstance().setAcceptThirdPartyCookies(wv!!, false)
 
         if (!sPrefs.getBoolean("safeMode", false)) {
             vencordNative = VencordNative(WeakReference(this), wv!!)
@@ -429,14 +422,12 @@ class MainActivity : AppCompatActivity() {
             val host = url.host
             if (host != "discord.com" && host != "ptb.discord.com" && host != "canary.discord.com"
                 && host != "discordapp.com" && host != "ptb.discordapp.com" && host != "canary.discordapp.com") return
-            val escapedPath = (url.path ?: "")
-                .replace("\\", "\\\\")
-                .replace("\"", "\\\"")
+            val path = url.path ?: ""
             if (!wvInitialized || wv == null) {
                 wv?.loadUrl(url.toString())
             } else {
                 wv!!.evaluateJavascript(
-                    "Vencord.Webpack.Common.NavigationRouter.transitionTo(\"$escapedPath\")",
+                    "Vencord.Webpack.Common.NavigationRouter.transitionTo(${gson.toJson(path)})",
                     null
                 )
             }
@@ -508,14 +499,9 @@ class MainActivity : AppCompatActivity() {
     fun showDiscordToast(message: String, type: String) {
         val allowedTypes = setOf("SUCCESS", "ERROR", "INFO", "WARN")
         val safeType = if (type in allowedTypes) type else "INFO"
-        val escapedMessage = message
-            .replace("\\", "\\\\")
-            .replace("\"", "\\\"")
-            .replace("\n", "\\n")
-            .replace("\r", "\\r")
         wv?.post(Runnable {
             wv?.evaluateJavascript(
-                "toasts=Vencord.Webpack.Common.Toasts; toasts.show({id: toasts.genId(), message: \"$escapedMessage\", type: toasts.Type.$safeType, options: {position: toasts.Position.BOTTOM,}})",
+                "toasts=Vencord.Webpack.Common.Toasts; toasts.show({id: toasts.genId(), message: ${gson.toJson(message)}, type: toasts.Type.$safeType, options: {position: toasts.Position.BOTTOM,}})",
                 null
             )
         })

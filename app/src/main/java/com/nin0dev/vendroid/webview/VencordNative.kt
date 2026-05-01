@@ -6,6 +6,7 @@ import android.content.Context
 import android.content.SharedPreferences
 import android.content.pm.PackageManager
 import android.graphics.Color
+import android.net.Uri
 import android.os.Build
 import android.view.View.GONE
 import android.view.View.VISIBLE
@@ -30,6 +31,7 @@ class VencordNative(private val activity: WeakReference<MainActivity>, wv: WebVi
     private val wvRef: WeakReference<WebView> = WeakReference(wv)
 
     companion object {
+        private const val CSS_CACHE_TTL_MS = 7 * 24 * 60 * 60 * 1000L
         private val ICON_NAMES = setOf("Main", "Jolly", "Discord", "Retro", "TS12")
         @Volatile
         private var currentIcon: String = "Main"
@@ -53,6 +55,25 @@ class VencordNative(private val activity: WeakReference<MainActivity>, wv: WebVi
     private val executor = Executors.newSingleThreadExecutor()
 
     private val iconLock = Any()
+
+    private var cssCacheEvictionCounter = 0
+
+    private fun evictStaleCssCache() {
+        val sPrefs = settingsPrefs ?: return
+        val now = System.currentTimeMillis()
+        val editor = sPrefs.edit()
+        var evicted = false
+        for (key in sPrefs.all.keys) {
+            if (!key.startsWith("css_cache_") || key.endsWith("_ts")) continue
+            val ts = sPrefs.getLong("${key}_ts", 0)
+            if (now - ts > CSS_CACHE_TTL_MS) {
+                editor.remove(key)
+                editor.remove("${key}_ts")
+                evicted = true
+            }
+        }
+        if (evicted) editor.apply()
+    }
 
     // Per-key rate limiter — prevents rapid re-writes to the same key while
     // allowing independent keys to be written in parallel. Uses System.nanoTime()
@@ -82,12 +103,20 @@ class VencordNative(private val activity: WeakReference<MainActivity>, wv: WebVi
         return false
     }
 
+    private fun isOnDiscordDomain(): Boolean {
+        val wv = wvRef.get() ?: return false
+        val url = wv.url ?: return false
+        val host = Uri.parse(url).host ?: return false
+        return Constants.isDiscordDomain(host)
+    }
+
     fun shutdown() {
         executor.shutdown()
     }
 
     @JavascriptInterface
     fun setOverlayActive(active: Boolean) {
+        if (!isOnDiscordDomain()) return
         overlayActive = active
         val act = activity.get() ?: return
         act.runOnUiThread {
@@ -114,6 +143,7 @@ class VencordNative(private val activity: WeakReference<MainActivity>, wv: WebVi
 
     @JavascriptInterface
     fun goBack() {
+        if (!isOnDiscordDomain()) return
         activity.get()?.runOnUiThread {
             val wv = wvRef.get() ?: return@runOnUiThread
             if (wv.canGoBack()) wv.goBack() else
@@ -135,6 +165,11 @@ class VencordNative(private val activity: WeakReference<MainActivity>, wv: WebVi
                     sPrefs.getString("clientMod", "vencord") == "equicord"
                 ) Constants.EQUICORD_BUNDLE_URL else Constants.JS_BUNDLE_URL
                 val vencordLocation = sPrefs.getString("vencordLocation", defaultUrl) ?: defaultUrl
+                val vencordHost = Uri.parse(vencordLocation).host
+                if (vencordHost != null && !Constants.isAllowedVencordHost(vencordHost)) {
+                    activity.get()?.let { e("Vencord location host '$vencordHost' is not in allowed list") }
+                    return@execute
+                }
                 conn = HttpClient.fetch(vencordLocation)
                 val content = HttpClient.readAsText(conn.inputStream)
                 val patched = HttpClient.applyPatches(content)
@@ -156,6 +191,7 @@ class VencordNative(private val activity: WeakReference<MainActivity>, wv: WebVi
 
     @JavascriptInterface
     fun getString(id: String, defaultValue: String): String {
+        if (!isOnDiscordDomain()) return defaultValue
         if (!isKeyAllowedForRead(id)) return defaultValue
         val sPrefs = settingsPrefs ?: return defaultValue
         return try {
@@ -167,6 +203,7 @@ class VencordNative(private val activity: WeakReference<MainActivity>, wv: WebVi
 
     @JavascriptInterface
     fun getBool(id: String, defaultValue: Boolean): Boolean {
+        if (!isOnDiscordDomain()) return defaultValue
         if (!isKeyAllowedForRead(id)) return defaultValue
         val sPrefs = settingsPrefs ?: return defaultValue
         return try {
@@ -178,10 +215,12 @@ class VencordNative(private val activity: WeakReference<MainActivity>, wv: WebVi
 
     @JavascriptInterface
     fun setString(id: String, value: String) {
+        if (!isOnDiscordDomain()) return
         if (!rateLimitWrite(id)) return
         if (!isKeyAllowedForWrite(id)) return
         val sPrefs = settingsPrefs ?: return
         sPrefs.edit {
+            if (id.startsWith("css_cache_")) putLong("${id}_ts", System.currentTimeMillis())
             if (id == "clientMod") putInt("lastMajorUpdateThatUserHasUpdatedVencord", 0)
             putString(id, value)
         }
@@ -189,6 +228,7 @@ class VencordNative(private val activity: WeakReference<MainActivity>, wv: WebVi
 
     @JavascriptInterface
     fun setBool(id: String, value: Boolean) {
+        if (!isOnDiscordDomain()) return
         if (!rateLimitWrite(id)) return
         if (!isKeyAllowedForWrite(id)) return
         val sPrefs = settingsPrefs ?: return
@@ -199,6 +239,7 @@ class VencordNative(private val activity: WeakReference<MainActivity>, wv: WebVi
 
     @JavascriptInterface
     fun changeAppIcon(id: String) {
+        if (!isOnDiscordDomain()) return
         synchronized(iconLock) {
             if (id == currentIcon) return
             if (id !in ICON_NAMES) return
@@ -222,6 +263,7 @@ class VencordNative(private val activity: WeakReference<MainActivity>, wv: WebVi
 
     @JavascriptInterface
     fun openQuickCss(quickCss: String) {
+        if (!isOnDiscordDomain()) return
         val act = activity.get() ?: return
         if (quickCss.isNotEmpty()) {
             act.runOnUiThread {
@@ -255,7 +297,11 @@ class VencordNative(private val activity: WeakReference<MainActivity>, wv: WebVi
 
     @JavascriptInterface
     fun getCssCache(cacheKey: String): String? {
+        if (!isOnDiscordDomain()) return null
         if (!cacheKey.startsWith("css_cache_")) return null
+        if (++cssCacheEvictionCounter % 50 == 0) {
+            executor.execute { evictStaleCssCache() }
+        }
         val sPrefs = settingsPrefs ?: return null
         return try {
             sPrefs.getString(cacheKey, null)
@@ -266,6 +312,7 @@ class VencordNative(private val activity: WeakReference<MainActivity>, wv: WebVi
 
     @JavascriptInterface
     fun dismissLoadingScreen() {
+        if (!isOnDiscordDomain()) return
         val act = activity.get() ?: return
         act.runOnUiThread {
             act.dismissLoadingScreen()

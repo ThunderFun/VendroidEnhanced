@@ -2,6 +2,7 @@ package com.nin0dev.vendroid.webview
 
 import android.app.Activity
 import android.content.Context
+import android.net.Uri
 import android.widget.Toast
 import com.nin0dev.vendroid.BuildConfig
 import com.nin0dev.vendroid.R
@@ -56,6 +57,10 @@ object HttpClient {
         val sPrefs = activity.getSharedPreferences("settings", Context.MODE_PRIVATE)
         val bundleURLToUse = if(sPrefs.getString("clientMod", "vencord") == "equicord") Constants.EQUICORD_BUNDLE_URL else Constants.JS_BUNDLE_URL
         val vencordLocation = sPrefs.getString("vencordLocation", bundleURLToUse) ?: bundleURLToUse
+        val vencordHost = Uri.parse(vencordLocation).host
+        if (vencordHost != null && !Constants.isAllowedVencordHost(vencordHost)) {
+            throw IOException("Vencord location host '$vencordHost' is not in allowed list")
+        }
         val vendroidFile = File(activity.filesDir, "vencord.js")
 
         // Version / debug checks must run BEFORE the early-return so that
@@ -81,8 +86,7 @@ object HttpClient {
 
         if (VencordRuntime != null) return
         if (vendroidFile.exists()) {
-            val content = vendroidFile.readText()
-            VencordRuntime = applyPatches(content)
+            VencordRuntime = vendroidFile.readText()
         }
         else {
             val e = sPrefs.edit()
@@ -100,7 +104,7 @@ object HttpClient {
 
                 if (responseCode == HttpURLConnection.HTTP_NOT_MODIFIED) {
                     if (vendroidFile.exists()) {
-                        VencordRuntime = applyPatches(vendroidFile.readText())
+                        VencordRuntime = vendroidFile.readText()
                         return
                     }
                     conn.disconnect()

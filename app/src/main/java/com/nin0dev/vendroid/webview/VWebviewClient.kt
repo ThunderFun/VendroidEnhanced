@@ -7,6 +7,7 @@ import android.content.Intent
 import android.graphics.Bitmap
 import android.net.Uri
 import android.os.Build
+import android.util.LruCache
 import android.webkit.WebResourceRequest
 import android.webkit.WebResourceResponse
 import android.webkit.WebView
@@ -24,6 +25,24 @@ class VWebviewClient(
 ) : WebViewClient() {
     private val appContext: Context = context.applicationContext
     private val activityRef: WeakReference<Activity> = if (context is Activity) WeakReference(context) else WeakReference(null)
+
+    private class CachedResponse(
+        val statusCode: Int,
+        val reasonPhrase: String,
+        val headers: Map<String, String>,
+        val body: ByteArray,
+        val fetchedAt: Long = System.currentTimeMillis()
+    )
+
+    private enum class CacheTarget { THEME_CSS, MAIN_FRAME }
+
+    private val themeCssCache = object : LruCache<String, CachedResponse>(512 * 1024) {
+        override fun sizeOf(key: String, value: CachedResponse): Int = value.body.size
+    }
+
+    private val mainFrameCache = object : LruCache<String, CachedResponse>(512 * 1024) {
+        override fun sizeOf(key: String, value: CachedResponse): Int = value.body.size
+    }
 
     override fun shouldOverrideUrlLoading(view: WebView, request: WebResourceRequest): Boolean {
         val url = request.url
@@ -52,9 +71,6 @@ class VWebviewClient(
             val runtime = HttpClient.VencordRuntime
             val mobileRuntime = HttpClient.VencordMobileRuntime
             if (runtime != null && mobileRuntime != null) {
-                // Must NOT wrap in an IIFE — Vencord's bundle uses top-level
-                // var/let/const declarations that need global scope to be
-                // visible to Discord's code.
                 val script = buildString {
                     append(runtime)
                     append(';')
@@ -68,11 +84,6 @@ class VWebviewClient(
 
     override fun onPageFinished(view: WebView, url: String) {
         super.onPageFinished(view, url)
-        // Inject after the page (and Discord's CSS) has fully loaded so our
-        // !important rules are present late in the stylesheet cascade and can't
-        // be overridden by subsequently loaded theme CSS. Only inject once here
-        // instead of both onPageStarted+onPageFinished to avoid double style
-        // recalculation.
         view.evaluateJavascript(disableHighlightCss, null)
 
         val activity = activityRef.get()
@@ -84,12 +95,30 @@ class VWebviewClient(
     @RequiresApi(Build.VERSION_CODES.N)
     override fun shouldInterceptRequest(view: WebView, req: WebResourceRequest): WebResourceResponse? {
         if (!shouldInterceptForCspStripping(req)) return null
-        val urlString = req.url.toString() // cache once — Uri.toString() allocates each call
+        val urlString = req.url.toString()
         val isCss = req.url.path?.endsWith(".css") == true
-        // Only force no-cache on Vencord/Equicord theme CSS — Discord's own CSS
-        // should use normal browser caching to avoid unnecessary network round-trips
-        // that block rendering and make interactions feel sluggish.
         val isThemeCss = isCss && isVencordCssUrl(req.url)
+        val isMainFrame = req.isForMainFrame
+
+        if (isThemeCss) {
+            themeCssCache[urlString]?.let { cached ->
+                if (System.currentTimeMillis() - cached.fetchedAt < THEME_CSS_TTL_MS) {
+                    return WebResourceResponse("text/css", "utf-8", cached.statusCode, cached.reasonPhrase, cached.headers, ByteArrayInputStream(cached.body))
+                }
+                themeCssCache.remove(urlString)
+            }
+        }
+
+        if (isMainFrame) {
+            mainFrameCache[urlString]?.let { cached ->
+                if (System.currentTimeMillis() - cached.fetchedAt < MAIN_FRAME_TTL_MS) {
+                    val ct = cached.headers.getOrDefault("Content-Type", "text/html")
+                    return WebResourceResponse(ct, "utf-8", cached.statusCode, cached.reasonPhrase, cached.headers, ByteArrayInputStream(cached.body))
+                }
+                mainFrameCache.remove(urlString)
+            }
+        }
+
         var conn: HttpURLConnection? = null
         try {
             conn = URL(urlString).openConnection() as HttpURLConnection
@@ -103,19 +132,19 @@ class VWebviewClient(
             }
             for ((key, value) in req.requestHeaders) {
                 val lowerKey = key.lowercase()
-                // Strip conditional headers for theme CSS only — prevents stale
-                // theme caches while letting Discord CSS use normal 304 responses.
                 if (isThemeCss && lowerKey in STRIPPED_CONDITIONAL_HEADERS) continue
                 conn.setRequestProperty(key, value)
             }
-            return doFetch(req, conn, isCss)
+            val cacheTarget = if (isThemeCss) CacheTarget.THEME_CSS else if (isMainFrame) CacheTarget.MAIN_FRAME else null
+            val response = doFetch(req, conn, isCss, cacheTarget, urlString)
+            conn.disconnect()
+            return response
         } catch (_: Exception) {
             conn?.disconnect()
             return null
         }
     }
 
-    /** Only Vencord/Equicord theme CSS needs to bypass cache — not Discord's own CSS. */
     private fun isVencordCssUrl(uri: Uri): Boolean {
         val host = uri.host ?: return false
         if (!isForgeHost(host)) return false
@@ -123,15 +152,17 @@ class VWebviewClient(
         return urlLower.contains("vencord") || urlLower.contains("equicord") || urlLower.contains("vendroid")
     }
 
+    private val FORGE_HOSTS_EXACT = hashSetOf(
+        "github.com", "raw.githubusercontent.com", "codeberg.org"
+    )
+
     private fun isForgeHost(host: String): Boolean =
-        host == "github.com" || host == "raw.githubusercontent.com" || host.endsWith("github.io")
-                || host == "codeberg.org" || host.endsWith("codeberg.page")
+        host in FORGE_HOSTS_EXACT || host.endsWith("github.io") || host.endsWith("codeberg.page")
 
     private fun shouldInterceptForCspStripping(req: WebResourceRequest): Boolean {
         val scheme = req.url.scheme ?: return false
         if (scheme != "http" && scheme != "https") return false
 
-        // Intercept forge-served CSS for Content-Type fixing and theme no-cache policy.
         if (req.url.path?.endsWith(".css") == true) {
             val host = req.url.host ?: return false
             if (isForgeHost(host)) return true
@@ -145,8 +176,26 @@ class VWebviewClient(
         return false
     }
 
+    private fun stripVencordIncompatibleCsp(cspValue: String): String {
+        return cspValue.split(";")
+            .map { it.trim() }
+            .filter { it.isNotEmpty() }
+            .filterNot { directive ->
+                val directiveName = directive.substringBefore(" ").lowercase()
+                directiveName in VENCORD_INCOMPATIBLE_CSP_DIRECTIVES
+            }
+            .joinToString("; ")
+            .ifEmpty { "frame-ancestors 'none'; base-uri 'none'; object-src 'none'" }
+    }
+
     @RequiresApi(Build.VERSION_CODES.N)
-    private fun doFetch(req: WebResourceRequest, conn: HttpURLConnection, isCss: Boolean): WebResourceResponse {
+    private fun doFetch(
+        req: WebResourceRequest,
+        conn: HttpURLConnection,
+        isCss: Boolean,
+        cacheTarget: CacheTarget? = null,
+        urlString: String = ""
+    ): WebResourceResponse {
         val host = req.url.host ?: ""
         val isDiscordDomain = Constants.isDiscordDomain(host)
 
@@ -159,24 +208,46 @@ class VWebviewClient(
             val value = conn.getHeaderField(i) ?: break
             i++
             val lowerKey = key.lowercase()
-            if (isDiscordDomain && lowerKey == "content-security-policy") continue
+            if (isDiscordDomain && lowerKey == "content-security-policy") {
+                val stripped = stripVencordIncompatibleCsp(value)
+                if (stripped.isNotEmpty()) modifiedHeaders[key] = stripped
+                continue
+            }
             if (isDiscordDomain && lowerKey == "content-security-policy-report-only") continue
             modifiedHeaders[key] = value
         }
         if (isCss) modifiedHeaders["Content-Type"] = "text/css"
         val contentType = modifiedHeaders.getOrDefault("Content-Type", "application/octet-stream")
         val reasonPhrase = conn.responseMessage.takeIf { it.isNotEmpty() } ?: "OK"
-        val stream = if (statusCode >= 400) {
-            try { conn.errorStream } catch (_: Exception) { null } ?: ByteArrayInputStream(ByteArray(0))
+
+        val bodyBytes = if (statusCode >= 400) {
+            try { conn.errorStream?.use { it.readBytes() } } catch (_: Exception) { null } ?: ByteArray(0)
         } else {
-            conn.inputStream
+            conn.inputStream.use { it.readBytes() }
         }
-        return WebResourceResponse(contentType, "utf-8", statusCode, reasonPhrase, modifiedHeaders, stream)
+
+        if (statusCode in 200..299 && cacheTarget != null) {
+            val entry = CachedResponse(statusCode, reasonPhrase, modifiedHeaders, bodyBytes)
+            when (cacheTarget) {
+                CacheTarget.THEME_CSS -> themeCssCache.put(urlString, entry)
+                CacheTarget.MAIN_FRAME -> mainFrameCache.put(urlString, entry)
+            }
+        }
+
+        return WebResourceResponse(contentType, "utf-8", statusCode, reasonPhrase, modifiedHeaders, ByteArrayInputStream(bodyBytes))
     }
 
     companion object {
+        private const val THEME_CSS_TTL_MS = 60_000L
+        private const val MAIN_FRAME_TTL_MS = 30_000L
         private val STRIPPED_CONDITIONAL_HEADERS = setOf(
             "if-none-match", "if-modified-since", "if-unmodified-since", "if-match"
+        )
+        private val VENCORD_INCOMPATIBLE_CSP_DIRECTIVES = hashSetOf(
+            "default-src", "script-src", "script-src-elem", "script-src-attr",
+            "style-src", "style-src-elem", "style-src-attr",
+            "connect-src", "img-src", "font-src", "media-src",
+            "worker-src", "manifest-src", "child-src"
         )
     }
 }
