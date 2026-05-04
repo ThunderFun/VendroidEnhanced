@@ -292,6 +292,7 @@ class MainActivity : AppCompatActivity() {
             val parent = xmlWv?.parent as? android.view.ViewGroup
             val params = xmlWv?.layoutParams
             if (parent != null && params != null) {
+                val index = parent.indexOfChild(xmlWv)
                 parent.removeView(xmlWv)
                 prewarmed.id = R.id.webview
                 prewarmUsed = true
@@ -299,7 +300,7 @@ class MainActivity : AppCompatActivity() {
                 // the same width/height/background/layerType from the XML definition.
                 prewarmed.setBackgroundColor(android.graphics.Color.parseColor("#121214"))
                 prewarmed.setLayerType(View.LAYER_TYPE_HARDWARE, null)
-                parent.addView(prewarmed, parent.indexOfChild(xmlWv).coerceAtLeast(0), params)
+                parent.addView(prewarmed, index, params)
             }
             VendroidApp.prewarmedWebView = null
             wv = prewarmed
@@ -491,10 +492,8 @@ class MainActivity : AppCompatActivity() {
         wv?.pauseTimers()
         wv?.stopLoading()
         wvInitialized = false
-        if (!prewarmUsed) {
-            (wv?.parent as? android.view.ViewGroup)?.removeView(wv)
-            wv?.destroy()
-        }
+        (wv?.parent as? android.view.ViewGroup)?.removeView(wv)
+        wv?.destroy()
         wv = null
         if (::vencordNative.isInitialized) vencordNative.shutdown()
         fetchExecutor.shutdownNow()

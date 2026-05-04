@@ -184,6 +184,7 @@ class VencordNative(private val activity: WeakReference<MainActivity>, wv: WebVi
         }
     }
 
+    @JavascriptInterface
     fun updateVencord() {
         if (!rateLimitWrite("updateVencord")) return
         executor.execute {
@@ -213,8 +214,8 @@ class VencordNative(private val activity: WeakReference<MainActivity>, wv: WebVi
                 act.runOnUiThread {
                     act.showDiscordToast("Updated Vencord, restart to apply changes!", "SUCCESS")
                 }
-            } catch (e: Exception) {
-                activity.get()?.let { e("Failed to update Vencord", e) }
+            } catch (ex: Exception) {
+                activity.get()?.let { e("Failed to update Vencord", ex) }
             } finally {
                 vendroidTmpFile?.delete()
                 conn?.disconnect()

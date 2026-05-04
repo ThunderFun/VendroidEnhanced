@@ -162,7 +162,7 @@ class VWebviewClient(
     )
 
     private fun isForgeHost(host: String): Boolean =
-        host in FORGE_HOSTS_EXACT || host.endsWith("github.io") || host.endsWith("codeberg.page")
+        host in FORGE_HOSTS_EXACT || host.endsWith(".github.io") || host.endsWith(".codeberg.page")
 
     private fun shouldInterceptForCspStripping(req: WebResourceRequest): Boolean {
         val scheme = req.url.scheme ?: return false

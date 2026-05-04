@@ -124,7 +124,6 @@ object HttpClient {
                 val tmpFile = File(vendroidFile.parent, "${vendroidFile.name}.tmp")
                 try {
                     tmpFile.writeText(patched)
-                    if (vendroidFile.exists()) vendroidFile.delete()
                     if (!tmpFile.renameTo(vendroidFile)) throw IOException("Failed to rename ${tmpFile.name} to ${vendroidFile.name}")
                 } finally {
                     tmpFile.delete()

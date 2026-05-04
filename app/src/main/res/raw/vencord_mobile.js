@@ -479,6 +479,7 @@
 
     let vfsState = null;
     let imgOverlay = null;
+    let imgOverlayOpenTime = 0;
 
     function notifyOverlayState() {
         try { VencordMobileNative.setOverlayActive(!!(vfsState || imgOverlay)); } catch(e) {}
@@ -673,6 +674,7 @@ video {
     function exitVideoFullscreen() {
         if (!vfsState) return;
         const { video, overlay, originalParent, originalNextSibling, originalStyles, hadControls } = vfsState;
+        video.pause();
         if (originalNextSibling && originalNextSibling.parentNode === originalParent) {
             originalParent.insertBefore(video, originalNextSibling);
         } else {
@@ -700,7 +702,7 @@ video {
         video.setAttribute("style", "max-width:100vw;max-height:calc(100vh - 110px);width:auto;height:auto;object-fit:contain;display:block;margin:0 auto;");
 
         const overlay = document.createElement("div");
-        overlay.style.cssText = "position:fixed;top:0;left:0;width:100vw;height:100vh;background:#000;z-index:2147483647;display:flex;flex-direction:column;justify-content:center;align-items:center;outline:none;-webkit-tap-highlight-color:transparent;";
+        overlay.style.cssText = "position:fixed;top:0;left:0;width:100vw;height:100vh;background:#000;z-index:2147483647;display:flex;flex-direction:column;justify-content:center;align-items:center;outline:none;-webkit-tap-highlight-color:transparent;touch-action:none;";
 
         const controlsBg = document.createElement("div");
         controlsBg.style.cssText = "position:absolute;bottom:40px;left:0;width:100%;height:80px;background:linear-gradient(transparent,rgba(0,0,0,0.9));pointer-events:none;transition:opacity 0.3s;";
@@ -807,6 +809,17 @@ video {
         overlay.appendChild(controls);
         document.body.appendChild(overlay);
 
+        // Start playback if video is not already playing (e.g. opened from poster state)
+        if (video.paused) {
+            video.play().catch(() => {
+                // Unmuted autoplay may be blocked; if so retry muted
+                if (!video.muted) {
+                    video.muted = true;
+                    video.play().catch(() => {});
+                }
+            });
+        }
+
         vfsState = { video, overlay, controlsBg, controls, originalParent, originalNextSibling, originalStyles, hadControls };
         updatePlayBtn();
         showControls();
@@ -864,7 +877,9 @@ video {
     function toFullResUrl(src) {
         try {
             const url = new URL(src);
-            if (url.host.endsWith(".discordapp.com") || url.host.endsWith(".discordapp.net")) {
+            const host = url.host;
+            if (host.endsWith(".discordapp.com") || host.endsWith(".discordapp.net") ||
+                host.endsWith(".discord.com") || host.endsWith(".discord.net")) {
                 url.searchParams.delete("width");
                 url.searchParams.delete("height");
                 url.searchParams.delete("size");
@@ -875,50 +890,89 @@ video {
         }
     }
 
-    function isDiscordHost(urlStr) {
-        try { const h = new URL(urlStr).host; return h.endsWith(".discordapp.com") || h.endsWith(".discordapp.net") || h.endsWith(".discord.com") || h.endsWith(".discord.net"); } catch(e) { return false; }
-    }
-
-    function findProxyUrl(img) {
-        for (const key of Object.keys(img)) {
+    function findReactUrl(el, propNames) {
+        for (const key of Object.keys(el)) {
             if (!key.startsWith("__reactFiber$") && !key.startsWith("__reactInternalInstance$")) continue;
-            let fiber = img[key];
-            while (fiber) {
+            let fiber = el[key];
+            let depth = 0;
+            while (fiber && depth < 5) {
                 const p = fiber.memoizedProps || fiber.pendingProps;
                 if (p) {
-                    if (typeof p.proxyURL === 'string' && p.proxyURL.startsWith('http')) return p.proxyURL;
-                    if (typeof p.proxy_url === 'string' && p.proxy_url.startsWith('http')) return p.proxy_url;
+                    for (const name of propNames) {
+                        const val = p[name];
+                        if (typeof val === "string" && (val.startsWith("http") || val.startsWith("blob:"))) return val;
+                    }
                 }
                 fiber = fiber.return;
+                depth++;
             }
         }
         return null;
     }
 
+    function findProxyUrl(img) {
+        return findReactUrl(img, ["proxyURL", "proxy_url"]);
+    }
+
+    function findVideoUrl(video) {
+        return findReactUrl(video, ["src", "url", "proxyURL", "proxy_url", "original", "uri", "source"]);
+    }
+
+    function looksLikeVideoUrl(urlStr) {
+        if (typeof urlStr !== "string" || urlStr.length === 0) return false;
+        const lower = urlStr.toLowerCase();
+        if (lower.startsWith("blob:")) return true;
+        return lower.endsWith(".mp4") || lower.endsWith(".webm") || lower.endsWith(".mov") ||
+               lower.includes(".mp4?") || lower.includes(".webm?") || lower.includes(".mov?");
+    }
+
     function getBestVideoUrl(video) {
-        const proxy = findProxyUrl(video);
-        if (proxy) return toFullResUrl(proxy);
-        if (video.dataset.safeSrc && isDiscordHost(video.dataset.safeSrc)) return toFullResUrl(video.dataset.safeSrc);
-        if (video.currentSrc && isDiscordHost(video.currentSrc)) return toFullResUrl(video.currentSrc);
-        if (video.src && isDiscordHost(video.src)) return toFullResUrl(video.src);
-        const source = video.querySelector("source");
-        if (source && source.src && isDiscordHost(source.src)) return toFullResUrl(source.src);
-        return toFullResUrl(video.dataset.safeSrc || video.currentSrc || video.src || (source && source.src) || "");
+        // 1. Trust what the browser resolved and is actually playing.
+        //    currentSrc is guaranteed to be a valid media source or empty.
+        if (video.currentSrc && video.currentSrc.length > 0) {
+            return toFullResUrl(video.currentSrc);
+        }
+        // 2. Check explicit <source> children (skip ones typed as images).
+        const sources = video.querySelectorAll("source");
+        for (const s of sources) {
+            if (s.src && s.src.length > 0) {
+                const type = s.getAttribute("type") || "";
+                if (!type.startsWith("image/")) {
+                    return toFullResUrl(s.src);
+                }
+            }
+        }
+        // 3. Fallbacks: src attr, data attr, React props.
+        if (video.src && video.src.length > 0) {
+            return toFullResUrl(video.src);
+        }
+        if (video.dataset && video.dataset.safeSrc && video.dataset.safeSrc.length > 0) {
+            return toFullResUrl(video.dataset.safeSrc);
+        }
+        const reactUrl = findVideoUrl(video);
+        if (reactUrl) return toFullResUrl(reactUrl);
+        return null;
     }
 
     function getBestImageUrl(img) {
+        // Try proxy first (Discord React prop with full-res URL)
+        const proxy = findProxyUrl(img);
+        if (proxy) return toFullResUrl(proxy);
+
+        // Try srcset for high-res variants
         if (img.srcset) {
             for (const entry of img.srcset.split(",")) {
                 const u = entry.trim().split(/\s+/)[0];
-                if (isDiscordHost(u)) return toFullResUrl(u);
+                if (u && u.length > 0) return toFullResUrl(u);
             }
         }
-        const proxy = findProxyUrl(img);
-        if (proxy) return toFullResUrl(proxy);
-        if (img.dataset.safeSrc && isDiscordHost(img.dataset.safeSrc)) return toFullResUrl(img.dataset.safeSrc);
-        if (img.currentSrc && isDiscordHost(img.currentSrc)) return toFullResUrl(img.currentSrc);
-        if (img.src && isDiscordHost(img.src)) return toFullResUrl(img.src);
-        return toFullResUrl(img.dataset.safeSrc || img.currentSrc || img.src);
+
+        // Fallback to whatever the browser has resolved
+        if (img.currentSrc && img.currentSrc.length > 0) return toFullResUrl(img.currentSrc);
+        if (img.src && img.src.length > 0) return toFullResUrl(img.src);
+        if (img.dataset && img.dataset.safeSrc && img.dataset.safeSrc.length > 0) return toFullResUrl(img.dataset.safeSrc);
+
+        return null;
     }
 
     function showImageInOverlay(src, isVideo) {
@@ -1069,6 +1123,7 @@ video {
         overlay.appendChild(closeBtn);
         document.body.appendChild(overlay);
         imgOverlay = overlay;
+        imgOverlayOpenTime = Date.now();
 
         if (isVideo) {
             if (img.readyState >= 1 && img.videoWidth > 0) onMediaReady();
@@ -1077,7 +1132,7 @@ video {
         }
 
         overlay.addEventListener("click", e => {
-            if (e.target === overlay && imgScale <= 1) closeImageOverlay();
+            if (e.target === overlay && imgScale <= 1 && Date.now() - imgOverlayOpenTime > 300) closeImageOverlay();
         });
 
         notifyOverlayState();
@@ -1118,10 +1173,26 @@ video {
 
     function isGifVideo(el) {
         if (el.tagName !== 'VIDEO') return false;
-        if (el.controls) return false;
+
+        // Class I: explicitly labeled GIF
         if (el.getAttribute("aria-label") === "GIF") return true;
-        if (el.poster || el.hasAttribute('poster')) return false;
+
+        // Class II: looping mute micro-clips (<15 s)
+        if (el.loop && el.muted) {
+            if (el.readyState >= 1) {
+                return el.duration > 0 && el.duration <= 15;
+            }
+            // If metadata not loaded yet, give benefit of doubt for GIF UI
+            return true;
+        }
+
+        // Class III: long videos (> 60 s) are never GIFs
         if (el.readyState >= 1 && el.duration > 60) return false;
+
+        // Default: if it has native controls or is explicitly not looping, it's a video
+        if (el.controls) return false;
+        if (!el.loop) return false;
+
         return true;
     }
 
@@ -1139,6 +1210,7 @@ video {
     let lastImagePointerDownTime = 0;
 
     function isAttachmentImage(el) {
+        if (!el) return false;
         if (el.closest('svg')) return false;
         if (el.closest('iframe, [data-hcaptcha-response], .hcaptcha, .captcha')) return false;
         if (el.closest('[class*="avatar"], [class*="Avatar"], [class*="pfp"], [class*="Pfp"]')) return false;
@@ -1148,17 +1220,36 @@ video {
     }
 
     function findImageFromTarget(target) {
-        if (target.tagName === 'IMG') return target;
+        // Direct hit on media element
         if (target.tagName === 'VIDEO') return target;
+        if (target.tagName === 'IMG') return target;
+
+        // Walk up the tree looking for media.
+        // querySelector is necessary because Discord wraps media in deep nested
+        // containers; direct-child-only iteration misses most messages.
+        // We verify spatial proximity so we don't pick a media element from a
+        // completely different message when we reach a high ancestor.
         let node = target;
         for (let i = 0; i < 6 && node; i++) {
-            if (node.tagName === 'IMG') return node;
             if (node.tagName === 'VIDEO') return node;
+            if (node.tagName === 'IMG') return node;
             if (node.querySelector) {
-                const img = node.querySelector('img');
-                if (img) return img;
                 const video = node.querySelector('video');
-                if (video) return video;
+                if (video) {
+                    const vRect = video.getBoundingClientRect();
+                    if (vRect.width > 0 && vRect.height > 0) {
+                        const tRect = target.getBoundingClientRect();
+                        if (Math.abs(vRect.top - tRect.top) < 400 && Math.abs(vRect.left - tRect.left) < 400) return video;
+                    }
+                }
+                const img = node.querySelector('img');
+                if (img) {
+                    const iRect = img.getBoundingClientRect();
+                    if (iRect.width > 0 && iRect.height > 0) {
+                        const tRect = target.getBoundingClientRect();
+                        if (Math.abs(iRect.top - tRect.top) < 400 && Math.abs(iRect.left - tRect.left) < 400) return img;
+                    }
+                }
             }
             node = node.parentElement;
         }
@@ -1166,8 +1257,10 @@ video {
     }
 
     function hookImageClick() {
+
         function onPointerDown(x, y, target) {
             if (imgOverlay) return;
+            if (vfsState) return;
             if (!isInApp()) return;
             pendingImageClickTarget = null;
             pendingImageStartX = x;
@@ -1179,15 +1272,23 @@ video {
             if (!isAttachmentImage(el)) return;
 
             if (el.tagName === 'IMG') {
-                if (!isDiscordHost(el.src || el.currentSrc || el.dataset?.safeSrc || "")) return;
                 const rect = el.getBoundingClientRect();
                 if (rect.width < 50 && rect.height < 50 && !el.srcset) return;
                 pendingImageClickTarget = el;
                 lastImagePointerDownTime = Date.now();
-            } else if (isGifVideo(el)) {
-                if (!isDiscordHost(el.src || el.currentSrc || el.dataset?.safeSrc || "")) return;
+            } else if (el.tagName === 'VIDEO') {
                 const rect = el.getBoundingClientRect();
                 if (rect.width < 50 && rect.height < 50) return;
+
+                if (!isGifVideo(el)) {
+                    // Real (non-GIF) videos: only intercept if already playing,
+                    // or if user tapped directly on the <video> element itself.
+                    // If user tapped a play-button overlay on a paused video,
+                    // let Discord handle the first click to start playback.
+                    const directHit = (target === el);
+                    if (el.paused && !directHit) return;
+                }
+
                 pendingImageClickTarget = el;
                 lastImagePointerDownTime = Date.now();
             }
@@ -1206,19 +1307,23 @@ video {
             const el = pendingImageClickTarget;
             pendingImageClickTarget = null;
             if (imgOverlay) return;
+            if (vfsState) return;
             if (pendingImageMaxDistSq > 2500) return;
 
+            if (el.tagName !== 'VIDEO') return;
+            const videoSrc = getBestVideoUrl(el);
+            if (!videoSrc) return;
+
+            e.stopImmediatePropagation();
+            e.stopPropagation();
+            e.preventDefault();
+
             if (isGifVideo(el)) {
-                const videoSrc = getBestVideoUrl(el);
-                if (!videoSrc) return;
-
-                e.stopImmediatePropagation();
-                e.stopPropagation();
-                e.preventDefault();
-
                 showImageInOverlay(videoSrc, true);
-                dismissDiscordModal();
+            } else {
+                enterVideoFullscreen(el);
             }
+            dismissDiscordModal();
         }
 
         window.addEventListener("pointerdown", (e) => {
@@ -1255,6 +1360,7 @@ video {
 
         window.addEventListener("click", (e) => {
             if (!isInApp()) return;
+            if (vfsState) return;
 
             if (imgOverlay && imgOverlay.contains(e.target)) return;
 
@@ -1276,7 +1382,6 @@ video {
             }
 
             if (el.tagName === 'IMG') {
-                if (!isDiscordHost(el.src || el.currentSrc || el.dataset?.safeSrc || "")) return;
                 const rect = el.getBoundingClientRect();
                 if (rect.width < 50 && rect.height < 50 && !el.srcset) return;
 
@@ -1285,15 +1390,30 @@ video {
 
                 showImageInOverlay(getBestImageUrl(el));
                 dismissDiscordModal();
-            } else if (isGifVideo(el)) {
-                if (!isDiscordHost(el.src || el.currentSrc || el.dataset?.safeSrc || "")) return;
+            } else if (el.tagName === 'VIDEO') {
                 const rect = el.getBoundingClientRect();
                 if (rect.width < 50 && rect.height < 50) return;
+
+                if (!isGifVideo(el)) {
+                    // Real (non-GIF) videos: only intercept if already playing,
+                    // or if user clicked directly on the <video> element itself.
+                    // If user clicked a play-button overlay on a paused video,
+                    // let Discord handle the first click to start playback.
+                    const directHit = (e.target === el);
+                    if (el.paused && !directHit) return;
+                }
+
+                const videoSrc = getBestVideoUrl(el);
+                if (!videoSrc) return;
 
                 e.stopImmediatePropagation();
                 e.preventDefault();
 
-                showImageInOverlay(getBestVideoUrl(el), true);
+                if (isGifVideo(el)) {
+                    showImageInOverlay(videoSrc, true);
+                } else {
+                    enterVideoFullscreen(el);
+                }
                 dismissDiscordModal();
             }
         }, true);
@@ -1369,7 +1489,6 @@ video {
                 if (vRect.width === 0 && vRect.height === 0) continue;
                 if (vRect.width < 50 && vRect.height < 50) continue;
                 if (!isGifVideo(video)) continue;
-                if (!isDiscordHost(video.src || video.currentSrc || video.dataset?.safeSrc || "")) continue;
                 const videoSrc = getBestVideoUrl(video);
                 if (!videoSrc) continue;
                 if (!imgOverlay) {
