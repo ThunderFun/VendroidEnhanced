@@ -52,6 +52,8 @@ class MainActivity : AppCompatActivity() {
     @Volatile
     var currentUrlForBridge: String? = null
     @Volatile
+    var currentHostForBridge: String? = null
+    @Volatile
     var missedInjection = false
     private lateinit var chromeClient: VChromeClient
     private lateinit var vencordNative: VencordNative
@@ -297,9 +299,8 @@ class MainActivity : AppCompatActivity() {
                 prewarmed.id = R.id.webview
                 prewarmUsed = true
                 // The pre-warmed WebView has no layout params yet — carry over
-                // the same width/height/background/layerType from the XML definition.
+                // the same width/height/background from the XML definition.
                 prewarmed.setBackgroundColor(android.graphics.Color.parseColor("#121214"))
-                prewarmed.setLayerType(View.LAYER_TYPE_HARDWARE, null)
                 parent.addView(prewarmed, index, params)
             }
             VendroidApp.prewarmedWebView = null
@@ -312,6 +313,28 @@ class MainActivity : AppCompatActivity() {
         val webViewClient = VWebviewClient(this)
         wv!!.setWebViewClient(webViewClient)
         wv!!.setWebChromeClient(chromeClient)
+
+        // Intercept Service Worker fetch events (API 24+) — they bypass
+        // WebViewClient.shouldInterceptRequest entirely.
+        if (androidx.webkit.WebViewFeature.isFeatureSupported(
+                androidx.webkit.WebViewFeature.SERVICE_WORKER_BASIC_USAGE)) {
+            androidx.webkit.ServiceWorkerControllerCompat.getInstance()
+                .setServiceWorkerClient(
+                    object : androidx.webkit.ServiceWorkerClientCompat() {
+                        @androidx.annotation.RequiresApi(android.os.Build.VERSION_CODES.LOLLIPOP)
+                        override fun shouldInterceptRequest(request: android.webkit.WebResourceRequest): android.webkit.WebResourceResponse? {
+                            val host = request.url.host
+                            return if (host != null && !Constants.isAllowedDomain(host)) {
+                                android.webkit.WebResourceResponse(
+                                    "text/plain", "utf-8",
+                                    java.io.ByteArrayInputStream(ByteArray(0))
+                                )
+                            } else null
+                        }
+                    }
+                )
+        }
+
         setupQuickCss()
         if (sPrefs.getBoolean("desktopMode", false)) {
             wv!!.settings.userAgentString =
@@ -326,9 +349,6 @@ class MainActivity : AppCompatActivity() {
         s.cacheMode = android.webkit.WebSettings.LOAD_DEFAULT
         @Suppress("DEPRECATION")
         s.databaseEnabled = true
-        // Pre-rasterize offscreen tiles so they're ready on scroll/touch —
-        // eliminates the "paint on demand" jank that makes interactions feel slow.
-        s.offscreenPreRaster = true
         s.mediaPlaybackRequiresUserGesture = false
         s.mixedContentMode = android.webkit.WebSettings.MIXED_CONTENT_NEVER_ALLOW
         s.setBuiltInZoomControls(false)
@@ -340,9 +360,24 @@ class MainActivity : AppCompatActivity() {
         // and layout thrash on every touch that triggers a relayout.
         s.textZoom = 100
 
-        // Hardware layer enables GPU-accelerated compositing, reducing the
-        // time between a touch event and the resulting visual feedback.
-        wv!!.setLayerType(View.LAYER_TYPE_HARDWARE, null)
+        // Remove over-scroll glow: it adds a GPU shader compositing pass on
+        // every scroll-to-edge event. In a full-screen app this is pure overhead.
+        wv!!.overScrollMode = View.OVER_SCROLL_NEVER
+
+        // Native Android scrollbars are invisible in a full-screen SPA, but
+        // View still allocates and composites them. Disabling removes that
+        // per-frame draw cost.
+        wv!!.isVerticalScrollBarEnabled = false
+        wv!!.isHorizontalScrollBarEnabled = false
+
+        // Prevent long-press from engaging Android text-selection machinery.
+        // That adds native input pipeline state and delays touch-up events.
+        wv!!.isLongClickable = false
+
+        // Suppress haptic feedback: every long-press fires a sync IPC to the
+        // vibrator service, stalling the UI thread for ~1-2 ms.
+        wv!!.isHapticFeedbackEnabled = false
+
         wv!!.isScrollContainer = true
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             wv!!.defaultFocusHighlightEnabled = false
@@ -413,6 +448,8 @@ class MainActivity : AppCompatActivity() {
                 val host = Uri.parse(lastUrl).host
                 if (host != null && Constants.isDiscordDomain(host)) {
                     wv!!.loadUrl(lastUrl)
+                    currentUrlForBridge = lastUrl
+                    currentHostForBridge = host
                     lastUrl
                 } else {
                     wv!!.loadUrl("https://discord.com/app")
@@ -441,9 +478,10 @@ class MainActivity : AppCompatActivity() {
     private fun handleUrl(url: Uri?) {
         if (url != null) {
             val host = url.host
-            if (host != "discord.com" && host != "ptb.discord.com" && host != "canary.discord.com"
-                && host != "discordapp.com" && host != "ptb.discordapp.com" && host != "canary.discordapp.com") return
+            if (host == null || !Constants.isDiscordDomain(host)) return
             val path = url.path ?: ""
+            currentUrlForBridge = url.toString()
+            currentHostForBridge = host
             if (!wvInitialized || wv == null) {
                 wv?.loadUrl(url.toString())
             } else {
@@ -463,12 +501,14 @@ class MainActivity : AppCompatActivity() {
     }
 
     override fun onPause() {
-        wv?.url?.let { url ->
+        val url = wv?.url
+        if (url != null) {
             currentUrlForBridge = url
-            val host = Uri.parse(url).host
+            currentHostForBridge = Uri.parse(url).host
+            val host = currentHostForBridge
             if (host != null && Constants.isDiscordDomain(host)) {
                 getSharedPreferences("settings", Context.MODE_PRIVATE)
-                    .edit { putString("lastUrl", url) }
+                    .edit() { putString("lastUrl", url) }
             }
         }
         wv?.onPause()

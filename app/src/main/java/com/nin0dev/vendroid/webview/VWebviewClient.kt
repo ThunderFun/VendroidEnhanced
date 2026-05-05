@@ -1,9 +1,7 @@
 package com.nin0dev.vendroid.webview
 
 import android.app.Activity
-import android.content.ActivityNotFoundException
 import android.content.Context
-import android.content.Intent
 import android.graphics.Bitmap
 import android.net.Uri
 import android.os.Build
@@ -12,10 +10,10 @@ import android.webkit.WebResourceRequest
 import android.webkit.WebResourceResponse
 import android.webkit.WebView
 import android.webkit.WebViewClient
-import android.widget.Toast
 import androidx.annotation.RequiresApi
 import com.nin0dev.vendroid.utils.Constants
 import java.io.ByteArrayInputStream
+import java.util.concurrent.ConcurrentHashMap
 import java.lang.ref.WeakReference
 import java.net.HttpURLConnection
 import java.net.URL
@@ -46,28 +44,38 @@ class VWebviewClient(
 
     override fun shouldOverrideUrlLoading(view: WebView, request: WebResourceRequest): Boolean {
         val url = request.url
-        val host = url.host
-        val isDiscordDomain = host != null && Constants.isDiscordDomain(host)
-        if (isDiscordDomain || url.scheme == "about") {
+        val scheme = url.scheme
+        if (scheme == "about") {
             return false
         }
-        val scheme = url.scheme
-        if (scheme == "http" || scheme == "https") {
-            val intent = Intent(Intent.ACTION_VIEW, url)
-            try {
-                view.context.startActivity(intent)
-            } catch (_: ActivityNotFoundException) {
-                Toast.makeText(appContext, "No app found to open this link", Toast.LENGTH_SHORT).show()
-            }
+        val host = url.host
+        if (host != null && Constants.isAllowedDomain(host)) {
+            return false
         }
         return true
     }
 
-    private val disableHighlightCss = "(function(){if(document.getElementById('vendroid-disable-highlight'))return;var s=document.createElement('style');s.id='vendroid-disable-highlight';s.textContent='*,*::before,*::after{-webkit-tap-highlight-color:transparent!important;outline:none!important}';var t=document.head||document.documentElement;if(t)t.appendChild(s)})()"
+    private val disableHighlightCss = "html{-webkit-tap-highlight-color:transparent}a,button,[role=\"button\"],input,textarea,select,[tabindex]:not([tabindex=\"-1\"]){outline:none}"
+
+    private fun maybeInjectStyleIntoHtml(text: String): String? {
+        val headIdx = text.indexOf("</head>", ignoreCase = true)
+        if (headIdx <= 0) return null
+        val tag = "<style id=\"vendroid-disable-highlight\">$disableHighlightCss</style>"
+        return text.substring(0, headIdx) + tag + text.substring(headIdx)
+    }
 
     override fun onPageStarted(view: WebView, url: String, favicon: Bitmap?) {
         val activity = activityRef.get()
-        (activity as? com.nin0dev.vendroid.MainActivity)?.currentUrlForBridge = url
+        (activity as? com.nin0dev.vendroid.MainActivity)?.let {
+            it.currentUrlForBridge = url
+            it.currentHostForBridge = Uri.parse(url).host
+        }
+
+        // Firewall backup: JS injection against cached HTML loads where
+        // shouldInterceptRequest isn't invoked. Also forces SW unregister
+        // in case the page had one registered already.
+        view.evaluateJavascript(Constants.NETWORK_FIREWALL_JS, null)
+
         view.evaluateJavascript("typeof Vencord!=='undefined'&&typeof VencordMobile!=='undefined'") { result ->
             if (result?.trim() == "true") return@evaluateJavascript
             val runtime = HttpClient.VencordRuntime
@@ -89,8 +97,10 @@ class VWebviewClient(
     override fun onPageFinished(view: WebView, url: String) {
         super.onPageFinished(view, url)
         val activity = activityRef.get()
-        (activity as? com.nin0dev.vendroid.MainActivity)?.currentUrlForBridge = url
-        view.evaluateJavascript(disableHighlightCss, null)
+        (activity as? com.nin0dev.vendroid.MainActivity)?.let {
+            it.currentUrlForBridge = url
+            it.currentHostForBridge = Uri.parse(url).host
+        }
 
         if (activity != null && !activity.isFinishing && !activity.isDestroyed) {
             (activity as? com.nin0dev.vendroid.MainActivity)?.scheduleLoadingScreenDismiss(500)
@@ -99,6 +109,11 @@ class VWebviewClient(
 
     @RequiresApi(Build.VERSION_CODES.N)
     override fun shouldInterceptRequest(view: WebView, req: WebResourceRequest): WebResourceResponse? {
+        val host = req.url.host
+        if (host != null && !Constants.isAllowedDomain(host)) {
+            // Block non-whitelisted subresources (scripts, images, XHR, media, etc.)
+            return WebResourceResponse("text/plain", "utf-8", 204, "No Content", emptyMap(), java.io.ByteArrayInputStream(ByteArray(0)))
+        }
         if (!shouldInterceptForCspStripping(req)) return null
         val urlString = req.url.toString()
         val isCss = req.url.path?.endsWith(".css") == true
@@ -161,8 +176,12 @@ class VWebviewClient(
         "github.com", "raw.githubusercontent.com", "codeberg.org"
     )
 
+    private val forgeHostCache = ConcurrentHashMap<String, Boolean>()
+
     private fun isForgeHost(host: String): Boolean =
-        host in FORGE_HOSTS_EXACT || host.endsWith(".github.io") || host.endsWith(".codeberg.page")
+        forgeHostCache.computeIfAbsent(host) { h ->
+            h in FORGE_HOSTS_EXACT || h.endsWith(".github.io") || h.endsWith(".codeberg.page")
+        } ?: false
 
     private fun shouldInterceptForCspStripping(req: WebResourceRequest): Boolean {
         val scheme = req.url.scheme ?: return false
@@ -203,6 +222,7 @@ class VWebviewClient(
     ): WebResourceResponse {
         val host = req.url.host ?: ""
         val isDiscordDomain = Constants.isDiscordDomain(host)
+        val isMainFrame = req.isForMainFrame
 
         val statusCode = conn.responseCode
 
@@ -225,10 +245,36 @@ class VWebviewClient(
         val contentType = modifiedHeaders.getOrDefault("Content-Type", "application/octet-stream")
         val reasonPhrase = conn.responseMessage.takeIf { it.isNotEmpty() } ?: "OK"
 
-        val bodyBytes = if (statusCode >= 400) {
+        var bodyBytes = if (statusCode >= 400) {
             try { conn.errorStream?.use { it.readBytes() } } catch (_: Exception) { null } ?: ByteArray(0)
         } else {
             conn.inputStream.use { it.readBytes() }
+        }
+
+        // Inject the JS network firewall into every Discord HTML response.
+        // This runs before any page scripts and prevents SW registration +
+        // wraps fetch/XHR/WebSocket for hosts that slip past shouldInterceptRequest.
+        if (isDiscordDomain && isMainFrame && statusCode in 200..299 && bodyBytes.isNotEmpty()) {
+            val ctLower = (modifiedHeaders.getOrDefault("Content-Type", "")).lowercase()
+            if (ctLower.contains("text/html")) {
+                try {
+                    val text = bodyBytes.toString(Charsets.UTF_8)
+                    val headIdx = text.indexOf("</head>", ignoreCase = true)
+                    if (headIdx > 0) {
+                        var patched = text.substring(0, headIdx) + "<script>${Constants.NETWORK_FIREWALL_JS}</script>" + text.substring(headIdx)
+                        // Inject the disable-highlight CSS at parse time instead of via
+                        // evaluateJavascript later. This avoids a full style recalculation
+                        // after the DOM is already built.
+                        maybeInjectStyleIntoHtml(patched)?.let { cssPatched ->
+                            patched = cssPatched
+                        }
+                        bodyBytes = patched.toByteArray(Charsets.UTF_8)
+                        modifiedHeaders["Content-Length"] = bodyBytes.size.toString()
+                        modifiedHeaders.remove("Content-Encoding")
+                        modifiedHeaders.remove("content-encoding")
+                    }
+                } catch (_: Exception) {}
+            }
         }
 
         if (statusCode in 200..299 && cacheTarget != null) {

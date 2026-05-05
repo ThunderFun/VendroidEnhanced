@@ -138,9 +138,7 @@ class VencordNative(private val activity: WeakReference<MainActivity>, wv: WebVi
     }
 
     private fun isOnDiscordDomain(): Boolean {
-        val url = activity.get()?.currentUrlForBridge ?: return false
-        val host = Uri.parse(url).host ?: return false
-        return Constants.isDiscordDomain(host)
+        return Constants.isDiscordDomain(activity.get()?.currentHostForBridge ?: return false)
     }
 
     fun shutdown() {
