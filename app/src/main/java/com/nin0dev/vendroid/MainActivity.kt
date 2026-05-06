@@ -513,11 +513,27 @@ class MainActivity : AppCompatActivity() {
         }
         wv?.onPause()
         wv?.pauseTimers()
+        // When backgrounded, spoof document.hidden and pause all CSS animations
+        // so Discord’s React app throttles itself and the compositor stops
+        // doing useless GPU work.  Combined with pauseTimers() this eliminates
+        // the vast majority of background CPU/GPU churn.
+        wv?.evaluateJavascript(
+            "if(window.__vendroidSetVisibility)window.__vendroidSetVisibility('hidden');" +
+            "if(window.__vendroidPauseAnimations)window.__vendroidPauseAnimations()",
+            null
+        )
         super.onPause()
     }
 
     override fun onResume() {
         super.onResume()
+        // Restore visibility spoofing before resuming timers/rendering so
+        // Discord sees the page as foregrounded immediately.
+        wv?.evaluateJavascript(
+            "if(window.__vendroidSetVisibility)window.__vendroidSetVisibility('visible');" +
+            "if(window.__vendroidResumeAnimations)window.__vendroidResumeAnimations()",
+            null
+        )
         wv?.onResume()
         wv?.resumeTimers()
     }

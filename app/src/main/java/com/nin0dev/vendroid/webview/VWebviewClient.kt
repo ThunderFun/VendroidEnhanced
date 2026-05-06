@@ -76,6 +76,10 @@ class VWebviewClient(
         // in case the page had one registered already.
         view.evaluateJavascript(Constants.NETWORK_FIREWALL_JS, null)
 
+        // Inject animation-control helpers early so they are available before
+        // onStop fires (which may pause CSS animations and spoof visibility).
+        view.evaluateJavascript(Constants.ANIMATION_PATCH_JS, null)
+
         view.evaluateJavascript("typeof Vencord!=='undefined'&&typeof VencordMobile!=='undefined'") { result ->
             if (result?.trim() == "true") return@evaluateJavascript
             val runtime = HttpClient.VencordRuntime

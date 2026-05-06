@@ -69,4 +69,24 @@ object Constants {
             h in VENCORD_ALLOWED_HOSTS || h.endsWith(".githubusercontent.com")
                     || h.endsWith(".github.io") || h.endsWith(".codeberg.page")
         } ?: false
+
+    const val ANIMATION_PATCH_JS: String =
+        "(function(){" +
+        "'use strict';" +
+        "if(window.__vendroidAnimCtrl)return;" +
+        "window.__vendroidAnimCtrl=1;" +
+        "window.__vendroidPauseAnimations=function(){" +
+        "var a=document.getAnimations;a&&a.call(document).forEach(function(x){if(x.playState==='running'){x.pause();x.__vendroidPaused=1;}});" +
+        "};" +
+        "window.__vendroidResumeAnimations=function(){" +
+        "var a=document.getAnimations;a&&a.call(document).forEach(function(x){if(x.__vendroidPaused){x.play();delete x.__vendroidPaused;}});" +
+        "};" +
+        "window.__vendroidSetVisibility=function(v){" +
+        "var h=v==='hidden';" +
+        "try{if(document.hidden===h)return;}catch(e){}" +
+        "try{Object.defineProperty(document,'visibilityState',{get:function(){return v;},configurable:true});}catch(e){try{document.visibilityState=v;}catch(e2){}}" +
+        "try{Object.defineProperty(document,'hidden',{get:function(){return h;},configurable:true});}catch(e){try{document.hidden=h;}catch(e2){}}" +
+        "document.dispatchEvent(new Event('visibilitychange'));" +
+        "};" +
+        "})()"
 }
