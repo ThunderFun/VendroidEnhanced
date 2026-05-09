@@ -548,8 +548,8 @@
 
     const cssUrls = [
         Vencord.Api.isEquicord
-            ? "https://github.com/VendroidEnhanced/plugin/releases/download/equicord/browser.css"
-            : "https://github.com/Vendicated/Vencord/releases/download/devbuild/browser.css",
+            ? "https://vde-builds.nin0.dev/equicord/browser.css"
+            : "https://vde-builds.nin0.dev/vencord/browser.css",
         "https://raw.githubusercontent.com/VendroidEnhanced/random-files/refs/heads/main/moreFixes.css"
     ];
 

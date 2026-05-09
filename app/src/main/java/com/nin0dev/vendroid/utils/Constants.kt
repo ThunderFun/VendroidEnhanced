@@ -3,12 +3,13 @@ package com.nin0dev.vendroid.utils
 import java.util.concurrent.ConcurrentHashMap
 
 object Constants {
-    const val JS_BUNDLE_URL = "https://github.com/VendroidEnhanced/plugin/releases/download/vencord/browser.js"
-    const val EQUICORD_BUNDLE_URL = "https://github.com/VendroidEnhanced/plugin/releases/download/equicord/browser.js"
+    const val JS_BUNDLE_URL = "https://vde-builds.nin0.dev/vencord/browser.js"
+    const val EQUICORD_BUNDLE_URL = "https://vde-builds.nin0.dev/equicord/browser.js"
 
     private val VENCORD_ALLOWED_HOSTS = hashSetOf(
         "github.com", "raw.githubusercontent.com", "gist.githubusercontent.com",
-        "codeload.github.com", "codeberg.org"
+        "codeload.github.com", "codeberg.org",
+        "git.nin0.dev", "vde-builds.nin0.dev"
     )
 
     private val domainCache = ConcurrentHashMap<String, Boolean>()
@@ -35,6 +36,8 @@ object Constants {
             h == "discordsays.com" || h.endsWith(".discordsays.com") ||
             h == "vencord.dev" || h.endsWith(".vencord.dev") ||
             h == "codeberg.org" || h.endsWith(".codeberg.org") ||
+            h == "git.nin0.dev" || h.endsWith(".git.nin0.dev") ||
+            h == "vde-builds.nin0.dev" || h.endsWith(".vde-builds.nin0.dev") ||
             h.endsWith(".github.io") || h.endsWith(".codeberg.page")
         } ?: false
 
@@ -54,7 +57,7 @@ object Constants {
         "'use strict';" +
         "if(window.__vendroidFw===1)return;" +
         "window.__vendroidFw=1;" +
-        "var a=['discord.com','.discord.com','discordapp.com','.discordapp.com','discord.gg','.discord.gg','discord.media','.discord.media','discordapp.net','.discordapp.net','storage.googleapis.com','.storage.googleapis.com','github.com','.github.com','githubusercontent.com','.githubusercontent.com','hcaptcha.com','.hcaptcha.com','discordsays.com','.discordsays.com','vencord.dev','.vencord.dev','codeberg.org','.codeberg.org'];" +
+        "var a=['discord.com','.discord.com','discordapp.com','.discordapp.com','discord.gg','.discord.gg','discord.media','.discord.media','discordapp.net','.discordapp.net','storage.googleapis.com','.storage.googleapis.com','github.com','.github.com','githubusercontent.com','.githubusercontent.com','hcaptcha.com','.hcaptcha.com','discordsays.com','.discordsays.com','vencord.dev','.vencord.dev','codeberg.org','.codeberg.org','git.nin0.dev','.git.nin0.dev','vde-builds.nin0.dev','.vde-builds.nin0.dev'];" +
         "function ok(u){try{var h=new URL(u).host;}catch(e){return false;}for(var i=0;i<a.length;i++)if(h===a[i]||h.endsWith(a[i]))return true;return false;}" +
         "var of=window.fetch;window.fetch=function(u,o){if(typeof u==='string'&&!ok(u)){console.warn('[Vendroid] Blocked fetch: '+u);return Promise.reject(new TypeError('Blocked by Vendroid firewall'));}return of.apply(this,arguments);};" +
         "var oxo=XMLHttpRequest.prototype.open;XMLHttpRequest.prototype.open=function(m,u){if(typeof u==='string'&&!ok(u)){console.warn('[Vendroid] Blocked XHR: '+u);throw new TypeError('Blocked by Vendroid firewall');}return oxo.apply(this,arguments);};" +
