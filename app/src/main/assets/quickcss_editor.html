@@ -1,0 +1,41 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes">
+<style>
+  * { margin:0; padding:0; box-sizing:border-box; }
+  html,body { height:100%; background:#0f0f10; color:#dcddde; font-family:monospace; font-size:15px; }
+  #wrap { display:flex; flex-direction:column; height:100%; }
+  #bar { flex:none; padding:10px; background:#1a1b1e; border-bottom:1px solid #2b2d31; display:flex; gap:10px; }
+  #bar button { flex:1; padding:12px 0; border:none; border-radius:6px; font-family:inherit; font-size:14px; font-weight:600; color:#fff; -webkit-tap-highlight-color:transparent; cursor:pointer; }
+  #save { background:#5865f2; }
+  #save:active { opacity:.85; }
+  #close { background:#4f545c; }
+  #close:active { opacity:.85; }
+  #ta { flex:1 1 auto; width:100%; border:none; outline:none; resize:none; padding:12px; background:#0f0f10; color:#dcddde; font-family:monospace; font-size:15px; line-height:1.5; -webkit-tap-highlight-color:transparent; white-space:pre; overflow:auto; }
+</style>
+</head>
+<body>
+<div id="wrap">
+  <div id="bar">
+    <button id="close">Close</button>
+    <button id="save">Save &amp; Close</button>
+  </div>
+  <textarea id="ta" spellcheck="false" autocapitalize="none" autocomplete="off" autocorrect="off"></textarea>
+</div>
+<script>
+(function(){
+  var ta = document.getElementById('ta');
+  window.qcssSet = function(css){ ta.value = css || ''; ta.scrollTop = 0; };
+  window.qcssGet = function(){ return ta.value; };
+  document.getElementById('save').addEventListener('click', function(){
+    try { VencordMobileNative.quickCssSet(ta.value); } catch(e){}
+  });
+  document.getElementById('close').addEventListener('click', function(){
+    try { VencordMobileNative.quickCssClose(); } catch(e){}
+  });
+})();
+</script>
+</body>
+</html>

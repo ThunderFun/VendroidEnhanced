@@ -86,7 +86,7 @@ object HttpClient {
 
         if (VencordRuntime != null) return
         if (vendroidFile.exists()) {
-            VencordRuntime = vendroidFile.readText()
+            VencordRuntime = applyPatches(vendroidFile.readText())
         }
         else {
             val e = sPrefs.edit()
@@ -96,21 +96,40 @@ object HttpClient {
                 conn = URL(vencordLocation).openConnection() as HttpURLConnection
                 conn.connectTimeout = 15000
                 conn.readTimeout = 15000
+                conn.instanceFollowRedirects = false
                 if (storedEtag != null) {
                     conn.setRequestProperty("If-None-Match", storedEtag)
                 }
 
                 var responseCode = conn.getResponseCode()
 
+                if (responseCode in 300..399) {
+                    val location = conn.getHeaderField("Location")
+                        ?: throw IOException("Redirect with no Location header")
+                    conn.disconnect()
+                    val redirectUrl = URL(URL(vencordLocation), location)
+                    val redirectHost = redirectUrl.host
+                    if (redirectHost != null && !Constants.isAllowedVencordHost(redirectHost)) {
+                        throw IOException("Redirect to disallowed host: $redirectHost")
+                    }
+                    conn = redirectUrl.openConnection() as HttpURLConnection
+                    conn.connectTimeout = 15000
+                    conn.readTimeout = 15000
+                    conn.instanceFollowRedirects = false
+                    responseCode = conn.getResponseCode()
+                }
+
                 if (responseCode == HttpURLConnection.HTTP_NOT_MODIFIED) {
                     if (vendroidFile.exists()) {
-                        VencordRuntime = vendroidFile.readText()
+                        VencordRuntime = applyPatches(vendroidFile.readText())
+                        conn.disconnect()
                         return
                     }
                     conn.disconnect()
                     conn = URL(vencordLocation).openConnection() as HttpURLConnection
                     conn.connectTimeout = 15000
                     conn.readTimeout = 15000
+                    conn.instanceFollowRedirects = false
                     responseCode = conn.getResponseCode()
                 }
 
@@ -122,11 +141,10 @@ object HttpClient {
                 val content = readAsText(conn.inputStream, initialSize)
                 val patched = applyPatches(content)
                 val tmpFile = File(vendroidFile.parent, "${vendroidFile.name}.tmp")
-                try {
-                    tmpFile.writeText(patched)
-                    if (!tmpFile.renameTo(vendroidFile)) throw IOException("Failed to rename ${tmpFile.name} to ${vendroidFile.name}")
-                } finally {
+                tmpFile.writeText(patched)
+                if (!tmpFile.renameTo(vendroidFile)) {
                     tmpFile.delete()
+                    throw IOException("Failed to rename ${tmpFile.name} to ${vendroidFile.name}")
                 }
 
                 val responseEtag = conn.getHeaderField("ETag")
@@ -164,6 +182,7 @@ object HttpClient {
         val conn = URL(url).openConnection() as HttpURLConnection
         conn.connectTimeout = 15000
         conn.readTimeout = 15000
+        conn.instanceFollowRedirects = false
         if (conn.getResponseCode() >= 300) {
             val ex = HttpException(conn)
             conn.disconnect()

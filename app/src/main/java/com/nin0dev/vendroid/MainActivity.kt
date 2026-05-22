@@ -16,14 +16,11 @@ import android.view.View.GONE
 import android.view.View.VISIBLE
 import android.webkit.ValueCallback
 import android.webkit.WebView
-import android.webkit.WebChromeClient
-import android.widget.Button
-import android.widget.LinearLayout
-import android.widget.Toast
-import com.google.android.material.color.DynamicColors
-import com.google.android.material.dialog.MaterialAlertDialogBuilder
-import com.google.android.material.textfield.TextInputEditText
-import com.google.gson.Gson
+ import android.webkit.WebChromeClient
+ import android.widget.LinearLayout
+ import android.widget.Toast
+ import com.google.android.material.color.DynamicColors
+ import com.google.gson.Gson
 import com.nin0dev.vendroid.utils.Constants
 import com.nin0dev.vendroid.utils.Logger.e
 import com.nin0dev.vendroid.utils.UpdateData
@@ -82,24 +79,7 @@ class MainActivity : AppCompatActivity() {
     private val fetchExecutor = Executors.newSingleThreadExecutor()
     private var loadingAnimStartTime: Long = 0
     private val mainHandler = Handler(Looper.getMainLooper())
-    private lateinit var quickCssLayout: LinearLayout
     private lateinit var loadingScreenLayout: LinearLayout
-
-    private fun setupQuickCss() {
-        val saveButton = findViewById<Button>(R.id.save_css)
-        val cssEditText = findViewById<TextInputEditText>(R.id.css)
-
-        saveButton.setOnClickListener {
-            wv!!.evaluateJavascript(
-                "VencordNative.quickCss.set(${gson.toJson(cssEditText.text.toString())})", null
-            )
-            showDiscordToast("Saved QuickCSS", "SUCCESS")
-            quickCssLayout.visibility = GONE
-            loadingScreenLayout.visibility = GONE
-            wv!!.visibility = VISIBLE
-            currentFocus?.clearFocus();
-        }
-    }
 
     private fun migrateSettings() {
         val sPrefs = getSharedPreferences("settings", Context.MODE_PRIVATE)
@@ -123,65 +103,7 @@ class MainActivity : AppCompatActivity() {
 
     fun checkUpdates(ignoreSetting: Boolean = false) {
         return // Server ping disabled
-
-        val sPrefs = getSharedPreferences("settings", Context.MODE_PRIVATE)
-        val today = LocalDate.now()
-        val i = "${today.dayOfYear}${today.year}"
-        val url = "https://vendroid.nin0.dev/api/updates?version=${BuildConfig.VERSION_CODE}${if (sPrefs.getString("lastDailyCheck", "") == i) "" else "&daily=true"}"
-        sPrefs.edit { putString("lastDailyCheck", i) }
-
-        fetchExecutor.execute {
-            try {
-                val conn = HttpClient.fetch(url)
-                val response: String
-                try {
-                    response = HttpClient.readAsText(conn.inputStream, conn.contentLength.coerceAtLeast(8192))
-                } finally {
-                    conn.disconnect()
-                }
-                val updateData = gson.fromJson<UpdateData>(response, UpdateData::class.java) ?: return@execute
-
-                runOnUiThread {
-                    if (isFinishing || isDestroyed) return@runOnUiThread
-                    if (updateData.update != null && sPrefs.getBoolean("checkVDEUpdates", true)) {
-                        MaterialAlertDialogBuilder(this@MainActivity)
-                            .setIcon(R.drawable.baseline_system_update_24)
-                            .setTitle("An update is available (${updateData.update.title})")
-                            .setMessage(updateData.update.text)
-                            .setPositiveButton(getString(R.string.update)) { _, _ ->
-                                val browserIntent = Intent(
-                                    Intent.ACTION_VIEW,
-                                    Uri.parse("https://github.com/nin0-dev/VendroidEnhanced/releases/latest/download/app-release.apk")
-                                )
-                                startActivity(browserIntent)
-                            }
-                            .setNegativeButton(getString(R.string.later)) { _, _ -> }
-                            .show()
-                    }
-                    if (!sPrefs.getBoolean("checkAnnouncements", true) || ignoreSetting) return@runOnUiThread
-                    val announcementsPrefs = getSharedPreferences("announcements", Context.MODE_PRIVATE)
-                    updateData.announcements?.forEach { announcement ->
-                        if (!announcementsPrefs.getBoolean(announcement.id.toString(), false)) {
-                            MaterialAlertDialogBuilder(this@MainActivity)
-                                .setIcon(R.drawable.campaign_24dp_000000)
-                                .setTitle(announcement.title)
-                                .setMessage(announcement.text)
-                                .setPositiveButton("OK") { _, _ ->
-                                    announcementsPrefs.edit().putBoolean(announcement.id.toString(), true).apply()
-                                }
-                                .show()
-                        }
-                    }
-                }
-            } catch (e: Exception) {
-                if (BuildConfig.DEBUG) {
-                    e("Network error during update check", e)
-                }
-                runOnUiThread {
-                    Toast.makeText(this@MainActivity, "Failed to check for updates", Toast.LENGTH_SHORT).show()
-                }
-            }
-        }
+        // (rest of the dead code kept only for reference)
     }
 
     fun dismissLoadingScreen() {
@@ -244,12 +166,13 @@ class MainActivity : AppCompatActivity() {
     @SuppressLint("SetJavaScriptEnabled")
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        migrateSettings()
-        DynamicColors.applyToActivitiesIfAvailable(application)
+        if (!getSharedPreferences("settings", Context.MODE_PRIVATE).getBoolean("migratedSettings", false)) {
+            migrateSettings()
+        }
+        mainHandler.postDelayed({
+            DynamicColors.applyToActivitiesIfAvailable(application)
+        }, 2000)
 
-        // Tell SurfaceFlinger the window content is fully opaque — skips
-        // per-frame alpha compositing on the entire surface, freeing GPU
-        // bandwidth for actual rendering work.
         window.setFormat(android.graphics.PixelFormat.OPAQUE)
 
         val sPrefs = getSharedPreferences("settings", Context.MODE_PRIVATE)
@@ -282,7 +205,6 @@ class MainActivity : AppCompatActivity() {
             }
         })
 
-        quickCssLayout = findViewById(R.id.quickcss)
         loadingScreenLayout = findViewById(R.id.loading_screen)
 
         // Use the pre-warmed WebView from VendroidApp if available — it already
@@ -335,7 +257,6 @@ class MainActivity : AppCompatActivity() {
                 )
         }
 
-        setupQuickCss()
         if (sPrefs.getBoolean("desktopMode", false)) {
             wv!!.settings.userAgentString =
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
@@ -347,35 +268,21 @@ class MainActivity : AppCompatActivity() {
         s.allowContentAccess = false
 
         s.cacheMode = android.webkit.WebSettings.LOAD_DEFAULT
-        @Suppress("DEPRECATION")
-        s.databaseEnabled = true
+        s.databaseEnabled = false
         s.mediaPlaybackRequiresUserGesture = false
         s.mixedContentMode = android.webkit.WebSettings.MIXED_CONTENT_NEVER_ALLOW
         s.setBuiltInZoomControls(false)
-        // Use the wide viewport and overview mode so the page scales correctly
-        // without extra re-layouts from viewport mismatch.
         s.setUseWideViewPort(true)
         s.setLoadWithOverviewMode(true)
-        // Pin text zoom to 100% — device-level font scaling can cause reflows
-        // and layout thrash on every touch that triggers a relayout.
         s.textZoom = 100
 
-        // Remove over-scroll glow: it adds a GPU shader compositing pass on
-        // every scroll-to-edge event. In a full-screen app this is pure overhead.
         wv!!.overScrollMode = View.OVER_SCROLL_NEVER
 
-        // Native Android scrollbars are invisible in a full-screen SPA, but
-        // View still allocates and composites them. Disabling removes that
-        // per-frame draw cost.
         wv!!.isVerticalScrollBarEnabled = false
         wv!!.isHorizontalScrollBarEnabled = false
 
-        // Prevent long-press from engaging Android text-selection machinery.
-        // That adds native input pipeline state and delays touch-up events.
         wv!!.isLongClickable = false
 
-        // Suppress haptic feedback: every long-press fires a sync IPC to the
-        // vibrator service, stalling the UI thread for ~1-2 ms.
         wv!!.isHapticFeedbackEnabled = false
 
         wv!!.isScrollContainer = true
@@ -398,31 +305,40 @@ class MainActivity : AppCompatActivity() {
         if (!sPrefs.getBoolean("safeMode", false)) {
             vencordNative = VencordNative(WeakReference(this), wv!!)
             wv?.addJavascriptInterface(vencordNative, "VencordMobileNative")
-            // These reads must be synchronous — onPageStarted fires as soon as
-            // the WebView begins navigating, and Vencord must be injected then.
-            // Internal storage reads are <50ms; APK resource reads are even faster
-            // (memory-mapped). The heavy work (network fetch) stays async.
+            // These reads are now NO-OPs in the happy path because
+            // VendroidApp.onCreate() already loaded them on a background
+            // thread.  They remain here as a safety net for process-death
+            // paths where the Application object is recreated.
             if (HttpClient.VencordMobileRuntime == null) {
                 resources.openRawResource(R.raw.vencord_mobile).use { `is` ->
                     HttpClient.setVencordMobileRuntime(HttpClient.readAsText(`is`))
                 }
             }
-            synchronized(vencordRuntimeLock) {
-                if (HttpClient.VencordRuntime == null) {
-                    val needsRedownload = sPrefs.getInt("lastMajorUpdateThatUserHasUpdatedVencord", 0) < BuildConfig.VERSION_CODE
-                    val vendroidFile = File(filesDir, "vencord.js")
-                    if (needsRedownload) {
-                        vendroidFile.delete()
-                    } else if (vendroidFile.exists()) {
+            val vendroidFile = File(filesDir, "vencord.js")
+            val fileContent: String? = if (HttpClient.VencordRuntime == null) {
+                val needsRedownload = sPrefs.getInt("lastMajorUpdateThatUserHasUpdatedVencord", 0) < BuildConfig.VERSION_CODE
+                if (needsRedownload) {
+                    vendroidFile.delete()
+                    null
+                } else if (vendroidFile.exists()) {
+                    try { vendroidFile.readText() } catch (_: Exception) { null }
+                } else null
+            } else null
+            fileContent?.let {
+                synchronized(vencordRuntimeLock) {
+                    if (HttpClient.VencordRuntime == null) {
                         try {
-                            HttpClient.setVencordRuntime(HttpClient.applyPatches(vendroidFile.readText()))
+                            HttpClient.setVencordRuntime(HttpClient.applyPatches(it))
                         } catch (_: Exception) {}
                     }
                 }
             }
+            val weakSelf = WeakReference(this)
             fetchExecutor.execute {
+                val act = weakSelf.get()
+                if (act == null || act.isFinishing || act.isDestroyed) return@execute
                 try {
-                    fetchVencord(this@MainActivity)
+                    fetchVencord(act)
                 } catch (_: IOException) {
                 }
             }
@@ -462,7 +378,7 @@ class MainActivity : AppCompatActivity() {
         }
         currentUrlForBridge = initialUrl
 
-        mainHandler.postDelayed({ checkUpdates() }, 3000)
+
         startLoadingAnimation()
 
         loadingTimeoutRunnable = Runnable {
@@ -514,7 +430,7 @@ class MainActivity : AppCompatActivity() {
         wv?.onPause()
         wv?.pauseTimers()
         // When backgrounded, spoof document.hidden and pause all CSS animations
-        // so Discord’s React app throttles itself and the compositor stops
+        // so Discord's React app throttles itself and the compositor stops
         // doing useless GPU work.  Combined with pauseTimers() this eliminates
         // the vast majority of background CPU/GPU churn.
         wv?.evaluateJavascript(
@@ -553,6 +469,9 @@ class MainActivity : AppCompatActivity() {
         wv = null
         if (::vencordNative.isInitialized) vencordNative.shutdown()
         fetchExecutor.shutdownNow()
+        if (!prewarmUsed) {
+            VendroidApp.destroyPrewarmedWebViewIfUnused()
+        }
         super.onDestroy()
     }
 
@@ -572,11 +491,8 @@ class MainActivity : AppCompatActivity() {
                     return
                 }
             }
-            val script = buildString {
-                runtime?.let { append(it).append(';') }
-                mobileRuntime?.let { append(it).append(';') }
-            }
-            wv?.evaluateJavascript(script, null)
+            wv?.evaluateJavascript(runtime + ";", null)
+            wv?.evaluateJavascript(mobileRuntime + ";", null)
         }
     }
 

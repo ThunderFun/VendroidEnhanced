@@ -1516,7 +1516,27 @@ video {
             if (fetchedCssCount < cssUrls.length) return;
             injectStyle("vendroid_fetched", fetchedCssBuffer.join("\n"));
         }
+        function cssCacheKey(url) {
+            var h = 0;
+            for (var i = 0; i < url.length; i++) {
+                h = ((31 * h) + url.charCodeAt(i)) | 0;
+            }
+            return "css_cache_vde_" + h;
+        }
         cssUrls.forEach((url, idx) => {
+            var cached = null;
+            try {
+                if (window.VencordMobileNative && window.VencordMobileNative.getCssCache) {
+                    cached = window.VencordMobileNative.getCssCache(cssCacheKey(url));
+                }
+            } catch(e) { cached = null; }
+            if (cached) {
+                if (url.includes("moreFixes")) cached = patchMoreFixesCss(cached);
+                fetchedCssBuffer[idx] = cached;
+                fetchedCssCount++;
+                flushFetchedCss();
+                return;
+            }
             fetch(url)
                 .then(r => r.text())
                 .then(css => {
@@ -1524,6 +1544,11 @@ video {
                     fetchedCssBuffer[idx] = css;
                     fetchedCssCount++;
                     flushFetchedCss();
+                    try {
+                        if (window.VencordMobileNative && window.VencordMobileNative.setString) {
+                            window.VencordMobileNative.setString(cssCacheKey(url), css);
+                        }
+                    } catch(e) {}
                 })
                 .catch(() => {
                     var link = Object.assign(document.createElement("link"), {

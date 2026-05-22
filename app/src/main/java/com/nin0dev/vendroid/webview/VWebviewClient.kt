@@ -34,19 +34,17 @@ class VWebviewClient(
 
     private enum class CacheTarget { THEME_CSS, MAIN_FRAME }
 
-    private val themeCssCache = object : LruCache<String, CachedResponse>(512 * 1024) {
-        override fun sizeOf(key: String, value: CachedResponse): Int = value.body.size
-    }
-
-    private val mainFrameCache = object : LruCache<String, CachedResponse>(512 * 1024) {
-        override fun sizeOf(key: String, value: CachedResponse): Int = value.body.size
-    }
+    // Static caches survive across MainActivity recreations (rotation, memory
+    // pressure, etc.) so previously-fetched CSS / HTML is still warm.
 
     override fun shouldOverrideUrlLoading(view: WebView, request: WebResourceRequest): Boolean {
         val url = request.url
         val scheme = url.scheme
         if (scheme == "about") {
             return false
+        }
+        if (scheme == "http") {
+            return true
         }
         val host = url.host
         if (host != null && Constants.isAllowedDomain(host)) {
@@ -85,13 +83,10 @@ class VWebviewClient(
             val runtime = HttpClient.VencordRuntime
             val mobileRuntime = HttpClient.VencordMobileRuntime
             if (runtime != null && mobileRuntime != null) {
-                val script = buildString {
-                    append(runtime)
-                    append(';')
-                    append(mobileRuntime)
-                    append(';')
-                }
-                view.evaluateJavascript(script, null)
+                // Evaluate runtimes separately to avoid building a ~1 MB
+                // intermediate string on the UI thread.
+                view.evaluateJavascript(runtime + ";", null)
+                view.evaluateJavascript(mobileRuntime + ";", null)
             } else {
                 (activityRef.get() as? com.nin0dev.vendroid.MainActivity)?.missedInjection = true
             }
@@ -118,6 +113,9 @@ class VWebviewClient(
             // Block non-whitelisted subresources (scripts, images, XHR, media, etc.)
             return WebResourceResponse("text/plain", "utf-8", 204, "No Content", emptyMap(), java.io.ByteArrayInputStream(ByteArray(0)))
         }
+        if (req.url.scheme == "http") {
+            return WebResourceResponse("text/plain", "utf-8", 204, "No Content", emptyMap(), java.io.ByteArrayInputStream(ByteArray(0)))
+        }
         if (!shouldInterceptForCspStripping(req)) return null
         val urlString = req.url.toString()
         val isCss = req.url.path?.endsWith(".css") == true
@@ -125,7 +123,7 @@ class VWebviewClient(
         val isMainFrame = req.isForMainFrame
 
         if (isThemeCss) {
-            themeCssCache[urlString]?.let { cached ->
+            themeCssCache.get(urlString)?.let { cached ->
                 if (System.currentTimeMillis() - cached.fetchedAt < THEME_CSS_TTL_MS) {
                     return WebResourceResponse("text/css", "utf-8", cached.statusCode, cached.reasonPhrase, cached.headers, ByteArrayInputStream(cached.body))
                 }
@@ -134,7 +132,7 @@ class VWebviewClient(
         }
 
         if (isMainFrame) {
-            mainFrameCache[urlString]?.let { cached ->
+            mainFrameCache.get(urlString)?.let { cached ->
                 if (System.currentTimeMillis() - cached.fetchedAt < MAIN_FRAME_TTL_MS) {
                     val ct = cached.headers.getOrDefault("Content-Type", "text/html")
                     return WebResourceResponse(ct, "utf-8", cached.statusCode, cached.reasonPhrase, cached.headers, ByteArrayInputStream(cached.body))
@@ -149,6 +147,7 @@ class VWebviewClient(
             conn.connectTimeout = 15000
             conn.readTimeout = 15000
             conn.requestMethod = req.method
+            conn.instanceFollowRedirects = false
             if (isThemeCss) {
                 conn.useCaches = false
                 conn.setRequestProperty("Cache-Control", "no-cache")
@@ -157,6 +156,7 @@ class VWebviewClient(
             for ((key, value) in req.requestHeaders) {
                 val lowerKey = key.lowercase()
                 if (isThemeCss && lowerKey in STRIPPED_CONDITIONAL_HEADERS) continue
+                if (lowerKey == "accept-encoding") continue
                 conn.setRequestProperty(key, value)
             }
             val cacheTarget = if (isThemeCss) CacheTarget.THEME_CSS else if (isMainFrame) CacheTarget.MAIN_FRAME else null
@@ -231,11 +231,13 @@ class VWebviewClient(
         val statusCode = conn.responseCode
 
         val modifiedHeaders = HashMap<String, String>(conn.headerFields?.size ?: 16)
-        var i = 1
+        var i = 0
         while (true) {
-            val key = conn.getHeaderFieldKey(i) ?: break
-            val value = conn.getHeaderField(i) ?: break
+            val key = conn.getHeaderFieldKey(i)
+            val value = conn.getHeaderField(i)
             i++
+            if (key == null && value == null) break
+            if (key == null) continue  // skip status line at index 0
             val lowerKey = key.lowercase()
             if (isDiscordDomain && lowerKey == "content-security-policy") {
                 val stripped = stripVencordIncompatibleCsp(value)
@@ -304,5 +306,20 @@ class VWebviewClient(
             "connect-src", "img-src", "font-src", "media-src",
             "worker-src", "manifest-src", "child-src"
         )
+
+        // Thread-safe LRU cache wrapping LruCache because
+        // shouldInterceptRequest runs on Chromium network threads and can be
+        // invoked concurrently.
+        private class ThreadSafeLruCache(maxSize: Int) {
+            private val cache = object : LruCache<String, CachedResponse>(maxSize) {
+                override fun sizeOf(key: String, value: CachedResponse): Int = value.body.size
+            }
+            @Synchronized fun get(key: String): CachedResponse? = cache.get(key)
+            @Synchronized fun put(key: String, value: CachedResponse): CachedResponse? = cache.put(key, value)
+            @Synchronized fun remove(key: String): CachedResponse? = cache.remove(key)
+        }
+
+        private val themeCssCache = ThreadSafeLruCache(2 * 1024 * 1024)
+        private val mainFrameCache = ThreadSafeLruCache(2 * 1024 * 1024)
     }
 }

@@ -8,6 +8,8 @@ import android.content.pm.PackageManager
 import android.graphics.Color
 import android.net.Uri
 import android.os.Build
+import android.os.Handler
+import android.os.Looper
 import android.view.View.GONE
 import android.view.View.VISIBLE
 import android.webkit.JavascriptInterface
@@ -23,6 +25,7 @@ import com.nin0dev.vendroid.utils.Logger.e
 import com.nin0dev.vendroid.utils.Logger.w
 import java.io.File
 import java.io.FileOutputStream
+import java.io.IOException
 import java.lang.ref.WeakReference
 import java.net.HttpURLConnection
 import java.util.concurrent.ConcurrentHashMap
@@ -37,6 +40,7 @@ class VencordNative(private val activity: WeakReference<MainActivity>, wv: WebVi
         @Volatile
         private var currentIcon: String = "Main"
         private val iconLock = Any()
+        private val gson = com.google.gson.Gson()
 
         private fun resolveCurrentIcon(activity: MainActivity?): String {
             val act = activity ?: return "Main"
@@ -208,6 +212,7 @@ class VencordNative(private val activity: WeakReference<MainActivity>, wv: WebVi
                 vendroidTmpFile.writeText(patched)
                 if (!vendroidTmpFile.renameTo(vendroidFile)) {
                     vendroidTmpFile.delete()
+                    throw IOException("Failed to rename ${vendroidTmpFile.name} to ${vendroidFile.name}")
                 }
                 act.runOnUiThread {
                     act.showDiscordToast("Updated Vencord, restart to apply changes!", "SUCCESS")
@@ -346,35 +351,79 @@ class VencordNative(private val activity: WeakReference<MainActivity>, wv: WebVi
             if (!isOnDiscordDomain()) return
             val act = activity.get() ?: return
             val safeQuickCss = quickCss ?: ""
-            if (safeQuickCss.isNotEmpty()) {
-                act.runOnUiThread {
-                    AlertDialog.Builder(act)
-                        .setTitle("External CSS")
-                        .setMessage("A plugin wants to open the QuickCSS editor with custom content. Apply?")
-                        .setPositiveButton("Apply") { _, _ ->
-                            val quickCssView = act.findViewById<LinearLayout>(R.id.quickcss)
-                            val loadingView = act.findViewById<LinearLayout>(R.id.loading_screen)
-                            val wvView = act.findViewById<WebView>(R.id.webview)
-                            val cssEdit = act.findViewById<TextInputEditText>(R.id.css)
-                            quickCssView.visibility = VISIBLE
-                            loadingView.visibility = GONE
-                            wvView.visibility = GONE
-                            cssEdit.setText(safeQuickCss)
+            act.runOnUiThread {
+                try {
+                    val wv = WebView(act)
+                    wv.settings.javaScriptEnabled = true
+                    wv.settings.domStorageEnabled = true
+                    wv.settings.allowFileAccess = false
+                    wv.settings.allowContentAccess = false
+                    wv.settings.mixedContentMode = android.webkit.WebSettings.MIXED_CONTENT_NEVER_ALLOW
+                    wv.setBackgroundColor(android.graphics.Color.parseColor("#0f0f10"))
+
+                    val dialog = android.app.Dialog(act, android.R.style.Theme_Black_NoTitleBar_Fullscreen)
+                    dialog.setContentView(wv)
+                    dialog.setCancelable(true)
+                    dialog.setOnDismissListener {
+                        wv.destroy()
+                    }
+
+                    val bridge = QuickCssBridge(act, wv, dialog)
+                    wv.addJavascriptInterface(bridge, "VencordMobileNative")
+
+                    wv.webViewClient = object : android.webkit.WebViewClient() {
+                        override fun onPageFinished(view: WebView?, url: String?) {
+                            if (safeQuickCss.isNotEmpty()) {
+                                view?.evaluateJavascript(
+                                    "window.qcssSet?.(${gson.toJson(safeQuickCss)})", null
+                                )
+                            } else {
+                                val mainWv = wvRef.get() ?: return
+                                mainWv.evaluateJavascript("VencordNative.quickCss.get()") { result ->
+                                    val raw = result.trim().removePrefix("\"").removeSuffix("\"")
+                                    view?.evaluateJavascript(
+                                        "window.qcssSet?.(${gson.toJson(raw.replace("\\n", "\n"))})", null
+                                    )
+                                }
+                            }
                         }
-                        .setNegativeButton("Cancel", null)
-                        .show()
-                }
-            } else {
-                act.runOnUiThread {
-                    val quickCssView = act.findViewById<LinearLayout>(R.id.quickcss)
-                    val loadingView = act.findViewById<LinearLayout>(R.id.loading_screen)
-                    val wvView = act.findViewById<WebView>(R.id.webview)
-                    quickCssView.visibility = VISIBLE
-                    loadingView.visibility = GONE
-                    wvView.visibility = GONE
-                }
+                    }
+
+                    if (act.isFinishing || act.isDestroyed) {
+                        wv.destroy()
+                        return@runOnUiThread
+                    }
+                    dialog.show()
+                    wv.loadUrl("file:///android_asset/quickcss_editor.html")
+                } catch (_: Throwable) {}
             }
         } catch (_: Throwable) {}
+    }
+
+    private class QuickCssBridge(
+        private val activity: MainActivity,
+        private val editorWebView: WebView,
+        private val dialog: android.app.Dialog
+    ) {
+        @android.webkit.JavascriptInterface
+        fun quickCssSet(css: String?) {
+            val safe = css ?: ""
+            activity.runOnUiThread {
+                val mainWv = activity.findViewById<WebView>(R.id.webview)
+                mainWv?.evaluateJavascript(
+                    "VencordNative.quickCss.set(${gson.toJson(safe)})", null
+                )
+                Toast.makeText(activity, "Saved QuickCSS", Toast.LENGTH_SHORT).show()
+                if (dialog.isShowing) dialog.dismiss()
+            }
+        }
+
+        @android.webkit.JavascriptInterface
+        fun quickCssClose() {
+            activity.runOnUiThread {
+                if (dialog.isShowing) dialog.dismiss()
+            }
+        }
     }
 
     @JavascriptInterface

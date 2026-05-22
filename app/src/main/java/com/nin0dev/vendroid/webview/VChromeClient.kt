@@ -76,17 +76,17 @@ class VChromeClient(activity: MainActivity) : WebChromeClient() {
     ): Boolean {
         val activity = activityRef.get() ?: return false
 
-        activity.filePathCallback?.onReceiveValue(null)
-        activity.filePathCallback = null
-
+        val oldCallback = activity.filePathCallback
         activity.filePathCallback = filePathCallback
+        oldCallback?.onReceiveValue(null)
 
         return try {
             val intent = fileChooserParams.createIntent()
             activity.fileChooserLauncher.launch(intent)
             true
-        } catch (e: ActivityNotFoundException) {
+        } catch (e: Exception) {
             activity.filePathCallback = null
+            filePathCallback.onReceiveValue(null)
             false
         }
     }
@@ -127,10 +127,16 @@ class VChromeClient(activity: MainActivity) : WebChromeClient() {
         customView = null
         customViewCallback = null
 
-        if (activity == null || !::fullscreenContainer.isInitialized) {
+        if (activity == null) {
             localCallback?.onCustomViewHidden()
             return
         }
+
+        if (!::fullscreenContainer.isInitialized || !::webview.isInitialized) {
+            localCallback?.onCustomViewHidden()
+            return
+        }
+
         fullscreenContainer.visibility = View.GONE
         // Restore to default layer type — the view is being removed, so
         // the GPU texture it held can be released.
