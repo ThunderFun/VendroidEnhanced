@@ -9,21 +9,16 @@ import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import java.io.File
-import android.os.Handler
-import android.os.Looper
 import android.view.View
-import android.view.View.GONE
-import android.view.View.VISIBLE
 import android.webkit.ValueCallback
 import android.webkit.WebView
- import android.webkit.WebChromeClient
- import android.widget.LinearLayout
- import android.widget.Toast
- import com.google.android.material.color.DynamicColors
- import com.google.gson.Gson
+import android.webkit.WebChromeClient
+import android.widget.Toast
+import com.google.android.material.color.DynamicColors
+import com.google.gson.Gson
 import com.nin0dev.vendroid.utils.Constants
+import com.nin0dev.vendroid.utils.JsPatches
 import com.nin0dev.vendroid.utils.Logger.e
-import com.nin0dev.vendroid.utils.UpdateData
 import com.nin0dev.vendroid.webview.HttpClient
 import com.nin0dev.vendroid.webview.HttpClient.fetchVencord
 import com.nin0dev.vendroid.webview.VChromeClient
@@ -32,11 +27,9 @@ import com.nin0dev.vendroid.webview.VencordNative
 import java.io.IOException
 import java.lang.ref.WeakReference
 import java.util.concurrent.Executors
-import java.time.LocalDate
-import androidx.core.content.edit
 import androidx.activity.result.ActivityResultLauncher
 import androidx.activity.result.contract.ActivityResultContracts
-
+import androidx.core.content.edit
 
 class MainActivity : AppCompatActivity() {
     private var wvInitialized = false
@@ -72,14 +65,8 @@ class MainActivity : AppCompatActivity() {
         callback.onReceiveValue(resultArray)
     }
 
-    private var loadingScreenDismissed = false
-    private var loadingAnimationRunnable: Runnable? = null
-    private var loadingTimeoutRunnable: Runnable? = null
-    private var loadingDismissRunnable: Runnable? = null
+    private lateinit var loadingScreenManager: LoadingScreenManager
     private val fetchExecutor = Executors.newSingleThreadExecutor()
-    private var loadingAnimStartTime: Long = 0
-    private val mainHandler = Handler(Looper.getMainLooper())
-    private lateinit var loadingScreenLayout: LinearLayout
 
     private fun migrateSettings() {
         val sPrefs = getSharedPreferences("settings", Context.MODE_PRIVATE)
@@ -101,67 +88,8 @@ class MainActivity : AppCompatActivity() {
         ed.apply()
     }
 
-    fun checkUpdates(ignoreSetting: Boolean = false) {
-        return // Server ping disabled
-        // (rest of the dead code kept only for reference)
-    }
-
-    fun dismissLoadingScreen() {
-        if (loadingScreenDismissed) return
-        loadingScreenDismissed = true
-        loadingAnimationRunnable?.let { mainHandler.removeCallbacks(it) }
-        loadingAnimationRunnable = null
-        loadingScreenLayout.animate()?.alpha(0f)?.setDuration(500)?.withEndAction {
-            loadingScreenLayout.visibility = GONE
-            loadingScreenLayout.alpha = 1f
-        }?.start()
-    }
-
-    fun scheduleLoadingScreenDismiss(delayMs: Long) {
-        if (loadingScreenDismissed) return
-        val runnable = Runnable { dismissLoadingScreen() }
-        loadingDismissRunnable = runnable
-        mainHandler.postDelayed(runnable, delayMs)
-    }
-
-    private fun startLoadingAnimation() {
-        val dots = intArrayOf(R.id.dot1, R.id.dot2, R.id.dot3).map { findViewById<View>(it) }
-        loadingAnimStartTime = System.currentTimeMillis()
-
-        dots.forEach { dot ->
-            // Hardware layer caches each dot as a GPU texture — the scale/alpha
-            // animation then becomes a pure GPU transform with zero draw calls.
-            dot.setLayerType(View.LAYER_TYPE_HARDWARE, null)
-            dot.scaleX = 0.4f
-            dot.scaleY = 0.4f
-            dot.alpha = 0.3f
-        }
-
-        // 30fps animation via postDelayed — half the callback rate of the original 60fps (16ms),
-        // reducing CPU overhead while remaining smooth enough for a loading indicator.
-        // ValueAnimator was attempted but ofInt(0,1) with extreme duration fails to produce
-        // timely frame callbacks.
-        val runnable = object : Runnable {
-            override fun run() {
-                if (loadingScreenDismissed) return
-                val elapsed = System.currentTimeMillis() - loadingAnimStartTime
-                val cycleMs = 1200L
-                dots.forEachIndexed { i, dot ->
-                    val phase = (elapsed - i * 200L).toDouble()
-                    val t = (phase % cycleMs) / cycleMs
-                    val wave = (Math.sin(t * 2.0 * Math.PI - Math.PI / 2.0) + 1.0) / 2.0
-                    val scale = 0.4f + wave.toFloat() * 0.6f
-                    val alpha = 0.3f + wave.toFloat() * 0.7f
-                    dot.scaleX = scale
-                    dot.scaleY = scale
-                    dot.alpha = alpha
-                }
-                loadingAnimationRunnable = this
-                mainHandler.postDelayed(this, 33)
-            }
-        }
-        runnable.run()
-    }
+    fun dismissLoadingScreen() = loadingScreenManager.dismiss()
+    fun scheduleLoadingScreenDismiss(delayMs: Long) = loadingScreenManager.scheduleDismiss(delayMs)
 
     @SuppressLint("SetJavaScriptEnabled")
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -169,7 +97,7 @@ class MainActivity : AppCompatActivity() {
         if (!getSharedPreferences("settings", Context.MODE_PRIVATE).getBoolean("migratedSettings", false)) {
             migrateSettings()
         }
-        mainHandler.postDelayed({
+        android.os.Handler(android.os.Looper.getMainLooper()).postDelayed({
             DynamicColors.applyToActivitiesIfAvailable(application)
         }, 2000)
 
@@ -205,7 +133,7 @@ class MainActivity : AppCompatActivity() {
             }
         })
 
-        loadingScreenLayout = findViewById(R.id.loading_screen)
+        loadingScreenManager = LoadingScreenManager(this, findViewById(R.id.loading_screen))
 
         // Use the pre-warmed WebView from VendroidApp if available — it already
         // has the Chromium renderer process initialized, eliminating ~200-500ms
@@ -310,8 +238,8 @@ class MainActivity : AppCompatActivity() {
             // thread.  They remain here as a safety net for process-death
             // paths where the Application object is recreated.
             if (HttpClient.VencordMobileRuntime == null) {
-                resources.openRawResource(R.raw.vencord_mobile).use { `is` ->
-                    HttpClient.setVencordMobileRuntime(HttpClient.readAsText(`is`))
+                resources.openRawResource(R.raw.vencord_mobile).use { inputStream ->
+                    HttpClient.setVencordMobileRuntime(HttpClient.readAsText(inputStream))
                 }
             }
             val vendroidFile = File(filesDir, "vencord.js")
@@ -321,15 +249,23 @@ class MainActivity : AppCompatActivity() {
                     vendroidFile.delete()
                     null
                 } else if (vendroidFile.exists()) {
-                    try { vendroidFile.readText() } catch (_: Exception) { null }
+                    try { vendroidFile.readText() } catch (e: Exception) { e("Failed to read vendroidFile", e); null }
                 } else null
             } else null
             fileContent?.let {
                 synchronized(vencordRuntimeLock) {
                     if (HttpClient.VencordRuntime == null) {
                         try {
-                            HttpClient.setVencordRuntime(HttpClient.applyPatches(it))
-                        } catch (_: Exception) {}
+                            // The file was written with applyPatches already
+                            // applied during a previous download.  Skip the
+                            // redundant ~1MB regex scan.
+                            HttpClient.setVencordRuntime(
+                                if (HttpClient.vencordBundlePatched) it
+                                else HttpClient.applyPatches(it)
+                            )
+                        } catch (e: Exception) {
+                            e("applyPatches failed", e)
+                        }
                     }
                 }
             }
@@ -339,7 +275,8 @@ class MainActivity : AppCompatActivity() {
                 if (act == null || act.isFinishing || act.isDestroyed) return@execute
                 try {
                     fetchVencord(act)
-                } catch (_: IOException) {
+                } catch (e: IOException) {
+                    e("fetchVencord failed", e)
                 }
             }
         } else {
@@ -379,14 +316,8 @@ class MainActivity : AppCompatActivity() {
         currentUrlForBridge = initialUrl
 
 
-        startLoadingAnimation()
-
-        loadingTimeoutRunnable = Runnable {
-            if (!loadingScreenDismissed) {
-                dismissLoadingScreen()
-            }
-        }
-        mainHandler.postDelayed(loadingTimeoutRunnable!!, 30000)
+        loadingScreenManager.start()
+        loadingScreenManager.scheduleTimeout(30000)
 
         wvInitialized = true
     }
@@ -455,11 +386,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     override fun onDestroy() {
-        loadingTimeoutRunnable?.let { mainHandler.removeCallbacks(it) }
-        loadingDismissRunnable?.let { mainHandler.removeCallbacks(it) }
-        loadingDismissRunnable = null
-        loadingAnimationRunnable?.let { mainHandler.removeCallbacks(it) }
-        loadingAnimationRunnable = null
+        loadingScreenManager.cleanup()
         wv?.onPause()
         wv?.pauseTimers()
         wv?.stopLoading()

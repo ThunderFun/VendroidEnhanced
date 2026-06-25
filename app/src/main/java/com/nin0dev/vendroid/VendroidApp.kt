@@ -6,6 +6,7 @@ import android.os.Build
 import android.view.View
 import android.webkit.WebView
 import com.nin0dev.vendroid.webview.HttpClient
+import com.nin0dev.vendroid.utils.Logger.e
 import java.io.File
 import java.net.HttpURLConnection
 import java.net.URL
@@ -32,10 +33,9 @@ class VendroidApp : Application() {
             try {
                 prewarmedWebView = WebView(this).apply {
                     setBackgroundColor(android.graphics.Color.parseColor("#121214"))
-                    setLayerType(View.LAYER_TYPE_HARDWARE, null)
                 }
-            } catch (_: Exception) {
-                // Silently ignore — some ROMs or restricted environments may fail
+            } catch (e: Exception) {
+                e("Failed to create prewarmed WebView", e)
             }
 
             // Install HTTP response cache for HttpURLConnection-based fetches
@@ -46,15 +46,43 @@ class VendroidApp : Application() {
                 val httpCacheDir = File(cacheDir, "http_cache")
                 httpCacheDir.mkdirs()
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-                    android.net.http.HttpResponseCache.install(httpCacheDir, 10L * 1024 * 1024)
+                    android.net.http.HttpResponseCache.install(httpCacheDir, 50L * 1024 * 1024)
                 } else {
                     val cls = Class.forName("android.net.http.HttpResponseCache")
                     cls.getMethod("install", File::class.java, Long::class.javaPrimitiveType)
-                        .invoke(null, httpCacheDir, 10L * 1024 * 1024)
+                        .invoke(null, httpCacheDir, 50L * 1024 * 1024)
                 }
-            } catch (_: Exception) {
-                // Hidden API unavailable — continue without HTTP caching
+            } catch (e: Exception) {
+                e("Failed to install HTTP response cache", e)
             }
+
+            // One-time migration: move CSS cache entries from the shared
+            // "settings" prefs file into a dedicated "css_cache" file.
+            // This keeps the settings file small (faster cold-start parse)
+            // and isolates CSS write churn.
+            Thread {
+                try {
+                    val settingsPrefs = getSharedPreferences("settings", Context.MODE_PRIVATE)
+                    if (settingsPrefs.getBoolean("css_cache_migrated", false)) return@Thread
+                    val cssPrefs = getSharedPreferences("css_cache", Context.MODE_PRIVATE)
+                    val editor = cssPrefs.edit()
+                    val settingsEditor = settingsPrefs.edit()
+                    var migrated = false
+                    for ((key, value) in settingsPrefs.all) {
+                        if (!key.startsWith("css_cache_")) continue
+                        when (value) {
+                            is String -> { editor.putString(key, value); migrated = true }
+                            is Long -> { editor.putLong(key, value); migrated = true }
+                        }
+                        settingsEditor.remove(key)
+                    }
+                    settingsEditor.putBoolean("css_cache_migrated", true)
+                    settingsEditor.apply()
+                    if (migrated) editor.apply()
+                } catch (ex: Exception) {
+                    e("CSS cache migration failed", ex)
+                }
+            }.start()
 
             // Pre-load Vencord runtimes on a background thread so that by the
             // time MainActivity.onCreate() runs the strings are already in
@@ -63,39 +91,51 @@ class VendroidApp : Application() {
                 try {
                     // 1. VencordMobile runtime (65 KB raw resource, memory-mapped)
                     if (HttpClient.VencordMobileRuntime == null) {
-                        resources.openRawResource(R.raw.vencord_mobile).use { `is` ->
-                            HttpClient.setVencordMobileRuntime(HttpClient.readAsText(`is`))
+                        resources.openRawResource(R.raw.vencord_mobile).use { inputStream ->
+                            HttpClient.setVencordMobileRuntime(HttpClient.readAsText(inputStream))
                         }
                     }
                     // 2. Vencord runtime (potentially ~1 MB from disk)
                     val vendroidFile = File(filesDir, "vencord.js")
                     if (vendroidFile.exists() && HttpClient.VencordRuntime == null) {
                         try {
-                            HttpClient.setVencordRuntime(HttpClient.applyPatches(vendroidFile.readText()))
-                        } catch (_: Exception) {}
+                            // The file was written with applyPatches already
+                            // applied during a previous download.  Skip the
+                            // redundant ~1MB regex scan.
+                            HttpClient.setVencordRuntime(
+                                if (HttpClient.vencordBundlePatched) vendroidFile.readText()
+                                else HttpClient.applyPatches(vendroidFile.readText())
+                            )
+                        } catch (ex: Exception) {
+                            e("Failed to apply Vencord patches", ex)
+                        }
                     }
-                } catch (_: Exception) {}
+                } catch (ex: Exception) {
+                    e("Vencord preload failed", ex)
+                }
             }.start()
 
             // 3. Pre-fetch and cache the Vencord CSS files.  These are injected
             // by vencord_mobile.js on every page load.  Stashing them in
-            // SharedPreferences means JS can skip the network fetch entirely.
+            // the dedicated css_cache prefs means JS can skip the network fetch
+            // entirely without churning the main settings XML.
             Thread {
                 try {
                     val sPrefs = getSharedPreferences("settings", Context.MODE_PRIVATE)
+                    val cssPrefs = getSharedPreferences("css_cache", Context.MODE_PRIVATE)
                     val isEquicord = sPrefs.getString("clientMod", "vencord") == "equicord"
                     val cssUrls = listOf(
                         if (isEquicord) "https://vde-builds.nin0.dev/equicord/browser.css"
                         else "https://vde-builds.nin0.dev/vencord/browser.css",
                         "https://raw.githubusercontent.com/VendroidEnhanced/random-files/refs/heads/main/moreFixes.css"
                     )
-                    val editor = sPrefs.edit()
+                    val editor = cssPrefs.edit()
                     val now = System.currentTimeMillis()
                     for (url in cssUrls) {
                         val key = "css_cache_vde_" + url.hashCode()
                         // Only re-fetch if missing or older than 12 hours
-                        val ts = sPrefs.getLong("${key}_ts", 0)
-                        if (sPrefs.getString(key, null) == null || now - ts > 12 * 60 * 60 * 1000L) {
+                        val ts = cssPrefs.getLong("${key}_ts", 0)
+                        if (cssPrefs.getString(key, null) == null || now - ts > 12 * 60 * 60 * 1000L) {
                             var conn: HttpURLConnection? = null
                             try {
                                 conn = URL(url).openConnection() as HttpURLConnection
@@ -106,13 +146,17 @@ class VendroidApp : Application() {
                                     editor.putString(key, css)
                                     editor.putLong("${key}_ts", now)
                                 }
-                            } catch (_: Exception) {} finally {
+                            } catch (ex: Exception) {
+                                e("CSS fetch failed for $url", ex)
+                            } finally {
                                 conn?.disconnect()
                             }
                         }
                     }
                     editor.apply()
-                } catch (_: Exception) {}
+                } catch (ex: Exception) {
+                    e("CSS prefetch thread failed", ex)
+                }
             }.start()
 
             // 4. Warm up the Chromium cookie DB so MainActivity doesn't pay
@@ -120,7 +164,9 @@ class VendroidApp : Application() {
             Thread {
                 try {
                     android.webkit.CookieManager.getInstance()
-                } catch (_: Exception) {}
+                } catch (ex: Exception) {
+                    e("CookieManager warmup failed", ex)
+                }
             }.start()
         }
     }
@@ -151,7 +197,8 @@ class VendroidApp : Application() {
             val bytes = java.io.File("/proc/self/cmdline").readBytes()
             val end = bytes.indexOf(0.toByte())
             String(bytes, 0, if (end > 0) end else bytes.size)
-        } catch (_: Exception) {
+        } catch (ex: Exception) {
+            e("getCurrentProcessName fallback failed", ex)
             ""
         }
     }

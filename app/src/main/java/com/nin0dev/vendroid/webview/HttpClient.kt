@@ -23,6 +23,16 @@ object HttpClient {
     var VencordMobileRuntime: String? = null
         private set
 
+    /**
+     * True when the `vencord.js` file on disk is known to contain the patched
+     * content (i.e. [applyPatches] was already run at download time).
+     * Checked by the load paths (VendroidApp preload, MainActivity safety net,
+     * fetchVencord-from-disk) to skip a redundant ~1MB regex scan on every
+     * cold start.
+     */
+    @Volatile
+    var vencordBundlePatched = false
+
     @JvmStatic
     fun setVencordRuntime(value: String?) { VencordRuntime = value }
 
@@ -74,19 +84,23 @@ object HttpClient {
                 if(BuildConfig.DEBUG) activity.runOnUiThread { Toast.makeText(activity, "Just updated app version, redownloading Vencord", Toast.LENGTH_LONG).show() }
                 vendroidFile.delete()
                 VencordRuntime = null
+                vencordBundlePatched = false
                 sPrefs.edit().remove("vencordEtag").apply()
             }
             if ((vencordLocation != Constants.JS_BUNDLE_URL && vencordLocation != Constants.EQUICORD_BUNDLE_URL) || BuildConfig.DEBUG) {
                 activity.runOnUiThread { Toast.makeText(activity, "Debugging app or Vencord, bundle will be redownloaded. Avoid using on limited networks", Toast.LENGTH_LONG).show() }
                 vendroidFile.delete()
                 VencordRuntime = null
+                vencordBundlePatched = false
                 sPrefs.edit().remove("vencordEtag").apply()
             }
         }
 
         if (VencordRuntime != null) return
         if (vendroidFile.exists()) {
-            VencordRuntime = applyPatches(vendroidFile.readText())
+            // The file was written with applyPatches already applied during a
+            // previous download.  Skip the redundant ~1MB regex scan.
+            VencordRuntime = if (vencordBundlePatched) vendroidFile.readText() else applyPatches(vendroidFile.readText())
         }
         else {
             val e = sPrefs.edit()
@@ -121,7 +135,7 @@ object HttpClient {
 
                 if (responseCode == HttpURLConnection.HTTP_NOT_MODIFIED) {
                     if (vendroidFile.exists()) {
-                        VencordRuntime = applyPatches(vendroidFile.readText())
+                        VencordRuntime = if (vencordBundlePatched) vendroidFile.readText() else applyPatches(vendroidFile.readText())
                         conn.disconnect()
                         return
                     }
@@ -154,6 +168,7 @@ object HttpClient {
                 e.putInt("lastMajorUpdateThatUserHasUpdatedVencord", BuildConfig.VERSION_CODE)
                 e.apply()
                 VencordRuntime = patched
+                vencordBundlePatched = true
             } finally {
                 try { conn?.inputStream?.close() } catch (_: IOException) {}
                 conn?.disconnect()
@@ -192,11 +207,11 @@ object HttpClient {
     }
 
     @Throws(IOException::class)
-    fun readAsText(`is`: InputStream, initialSize: Int = 8192): String {
+    fun readAsText(inputStream: InputStream, initialSize: Int = 8192): String {
         // Use pre-sized ByteArrayOutputStream to avoid ~17 StringBuilder
         // resizes when reading a ~1MB response.
         val bos = ByteArrayOutputStream(initialSize.coerceAtLeast(8192))
-        `is`.use { it.copyTo(bos, 8192) }
+        inputStream.use { it.copyTo(bos, 8192) }
         return bos.toString("UTF-8")
     }
 

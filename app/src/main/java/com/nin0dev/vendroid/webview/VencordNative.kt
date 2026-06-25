@@ -90,18 +90,25 @@ class VencordNative(private val activity: WeakReference<MainActivity>, wv: WebVi
     private val settingsPrefs: SharedPreferences? = activity.get()
         ?.getSharedPreferences("settings", Context.MODE_PRIVATE)
 
+    // Dedicated SharedPreferences for CSS cache entries.  Isolating CSS from
+    // the main "settings" prefs avoids rewriting the entire settings XML on
+    // every CSS write and keeps the settings file small (faster cold-start
+    // parse, no contention between CSS churn and actual settings).
+    private val cssCachePrefs: SharedPreferences? = activity.get()
+        ?.getSharedPreferences("css_cache", Context.MODE_PRIVATE)
+
     private val executor = Executors.newSingleThreadExecutor()
 
     private var cssCacheEvictionCounter = 0
 
     private fun evictStaleCssCache() {
-        val sPrefs = settingsPrefs ?: return
+        val cssPrefs = cssCachePrefs ?: return
         val now = System.currentTimeMillis()
-        val editor = sPrefs.edit()
+        val editor = cssPrefs.edit()
         var evicted = false
-        for (key in sPrefs.all.keys) {
+        for (key in cssPrefs.all.keys) {
             if (!key.startsWith("css_cache_") || key.endsWith("_ts")) continue
-            val ts = sPrefs.getLong("${key}_ts", 0)
+            val ts = cssPrefs.getLong("${key}_ts", 0)
             if (now - ts > CSS_CACHE_TTL_MS) {
                 editor.remove(key)
                 editor.remove("${key}_ts")
@@ -233,14 +240,27 @@ class VencordNative(private val activity: WeakReference<MainActivity>, wv: WebVi
         return try {
             if (!isOnDiscordDomain()) return safeDefault
             if (!isKeyAllowedForRead(safeId)) return safeDefault
+            // Route CSS cache reads to the dedicated cache prefs file.
+            if (safeId.startsWith("css_cache_")) {
+                val cssPrefs = cssCachePrefs ?: return safeDefault
+                return try {
+                    cssPrefs.getString(safeId, safeDefault) ?: safeDefault
+                } catch (e: ClassCastException) {
+                    if (com.nin0dev.vendroid.BuildConfig.DEBUG) e("getString($safeId) ClassCastException — removing corrupted key", e)
+                    cssPrefs.edit().remove(safeId).apply()
+                    safeDefault
+                }
+            }
             val sPrefs = settingsPrefs ?: return safeDefault
             try {
                 sPrefs.getString(safeId, safeDefault) ?: safeDefault
-            } catch (_: ClassCastException) {
+            } catch (e: ClassCastException) {
+                if (com.nin0dev.vendroid.BuildConfig.DEBUG) e("getString($safeId) ClassCastException — removing corrupted key", e)
                 sPrefs.edit().remove(safeId).apply()
                 safeDefault
             }
-        } catch (_: Throwable) {
+        } catch (t: Throwable) {
+            if (com.nin0dev.vendroid.BuildConfig.DEBUG) e("getString($safeId) failed", t)
             safeDefault
         }
     }
@@ -254,11 +274,13 @@ class VencordNative(private val activity: WeakReference<MainActivity>, wv: WebVi
             val sPrefs = settingsPrefs ?: return defaultValue
             try {
                 sPrefs.getBoolean(safeId, defaultValue)
-            } catch (_: ClassCastException) {
+            } catch (e: ClassCastException) {
+                if (com.nin0dev.vendroid.BuildConfig.DEBUG) e("getBool($safeId) ClassCastException — removing corrupted key", e)
                 sPrefs.edit().remove(safeId).apply()
                 defaultValue
             }
-        } catch (_: Throwable) {
+        } catch (t: Throwable) {
+            if (com.nin0dev.vendroid.BuildConfig.DEBUG) e("getBool($safeId) failed", t)
             defaultValue
         }
     }
@@ -271,13 +293,24 @@ class VencordNative(private val activity: WeakReference<MainActivity>, wv: WebVi
             if (!isOnDiscordDomain()) return
             if (!rateLimitWrite(safeId)) return
             if (!isKeyAllowedForWrite(safeId)) return
+            // Route CSS cache keys to the dedicated cache prefs file so they
+            // don't churn the main settings XML on every write.
+            if (safeId.startsWith("css_cache_")) {
+                val cssPrefs = cssCachePrefs ?: return
+                cssPrefs.edit {
+                    putLong("${safeId}_ts", System.currentTimeMillis())
+                    putString(safeId, safeValue)
+                }
+                return
+            }
             val sPrefs = settingsPrefs ?: return
             sPrefs.edit {
-                if (safeId.startsWith("css_cache_")) putLong("${safeId}_ts", System.currentTimeMillis())
                 if (safeId == "clientMod") putInt("lastMajorUpdateThatUserHasUpdatedVencord", 0)
                 putString(safeId, safeValue)
             }
-        } catch (_: Throwable) {}
+        } catch (t: Throwable) {
+            if (com.nin0dev.vendroid.BuildConfig.DEBUG) e("setString($safeId) failed", t)
+        }
     }
 
     @JavascriptInterface
@@ -291,7 +324,9 @@ class VencordNative(private val activity: WeakReference<MainActivity>, wv: WebVi
             sPrefs.edit {
                 putBoolean(safeId, value)
             }
-        } catch (_: Throwable) {}
+        } catch (t: Throwable) {
+            if (com.nin0dev.vendroid.BuildConfig.DEBUG) e("setBool($safeId) failed", t)
+        }
     }
 
     @JavascriptInterface
@@ -395,9 +430,13 @@ class VencordNative(private val activity: WeakReference<MainActivity>, wv: WebVi
                     }
                     dialog.show()
                     wv.loadUrl("file:///android_asset/quickcss_editor.html")
-                } catch (_: Throwable) {}
+                } catch (e: Throwable) {
+                    if (com.nin0dev.vendroid.BuildConfig.DEBUG) e("openQuickCss inner failed", e)
+                }
             }
-        } catch (_: Throwable) {}
+        } catch (e: Throwable) {
+            if (com.nin0dev.vendroid.BuildConfig.DEBUG) e("openQuickCss outer failed", e)
+        }
     }
 
     private class QuickCssBridge(
@@ -435,16 +474,19 @@ class VencordNative(private val activity: WeakReference<MainActivity>, wv: WebVi
             if (++cssCacheEvictionCounter % 50 == 0) {
                 executor.execute { evictStaleCssCache() }
             }
-            val sPrefs = settingsPrefs ?: return null
+            val cssPrefs = cssCachePrefs ?: return null
             return try {
-                sPrefs.getString(safeKey, null)
-            } catch (_: ClassCastException) {
-                sPrefs.edit().remove(safeKey).apply()
+                cssPrefs.getString(safeKey, null)
+            } catch (e: ClassCastException) {
+                if (com.nin0dev.vendroid.BuildConfig.DEBUG) e("getCssCache($safeKey) ClassCastException", e)
+                cssPrefs.edit().remove(safeKey).apply()
                 null
-            } catch (_: Throwable) {
+            } catch (e: Throwable) {
+                if (com.nin0dev.vendroid.BuildConfig.DEBUG) e("getCssCache($safeKey) failed", e)
                 null
             }
-        } catch (_: Throwable) {
+        } catch (e: Throwable) {
+            if (com.nin0dev.vendroid.BuildConfig.DEBUG) e("getCssCache($safeKey) outer failed", e)
             return null
         }
     }

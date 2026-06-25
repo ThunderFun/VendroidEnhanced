@@ -12,6 +12,7 @@ import android.webkit.WebView
 import android.webkit.WebViewClient
 import androidx.annotation.RequiresApi
 import com.nin0dev.vendroid.utils.Constants
+import com.nin0dev.vendroid.utils.JsPatches
 import java.io.ByteArrayInputStream
 import java.util.concurrent.ConcurrentHashMap
 import java.lang.ref.WeakReference
@@ -69,14 +70,15 @@ class VWebviewClient(
             it.currentHostForBridge = Uri.parse(url).host
         }
 
-        // Firewall backup: JS injection against cached HTML loads where
-        // shouldInterceptRequest isn't invoked. Also forces SW unregister
-        // in case the page had one registered already.
-        view.evaluateJavascript(Constants.NETWORK_FIREWALL_JS, null)
-
-        // Inject animation-control helpers early so they are available before
-        // onStop fires (which may pause CSS animations and spoof visibility).
-        view.evaluateJavascript(Constants.ANIMATION_PATCH_JS, null)
+        // If shouldInterceptRequest already embedded the firewall JS into the
+        // HTML for this URL, we can skip the evaluateJavascript entirely —
+        // the embedded script runs at parse time (before any page JS) and the
+        // animation patches are only needed for background/foreground toggling
+        // which happens after page load.  Otherwise, inject the combined
+        // firewall + animation patches in a single IPC call.
+        if (!companionFirewallEmbedded(url)) {
+            view.evaluateJavascript(JsPatches.STARTUP_PATCHES_JS, null)
+        }
 
         view.evaluateJavascript("typeof Vencord!=='undefined'&&typeof VencordMobile!=='undefined'") { result ->
             if (result?.trim() == "true") return@evaluateJavascript
@@ -104,6 +106,15 @@ class VWebviewClient(
         if (activity != null && !activity.isFinishing && !activity.isDestroyed) {
             (activity as? com.nin0dev.vendroid.MainActivity)?.scheduleLoadingScreenDismiss(500)
         }
+    }
+
+    /**
+     * Check if the firewall JS was already embedded in the HTML for [url]
+     * by a prior shouldInterceptRequest pass.  Consumes the flag (removes it)
+     * so it's only used once per URL.
+     */
+    private fun companionFirewallEmbedded(url: String): Boolean {
+        return firewallEmbeddedUrls.remove(url)
     }
 
     @RequiresApi(Build.VERSION_CODES.N)
@@ -267,7 +278,7 @@ class VWebviewClient(
                     val text = bodyBytes.toString(Charsets.UTF_8)
                     val headIdx = text.indexOf("</head>", ignoreCase = true)
                     if (headIdx > 0) {
-                        var patched = text.substring(0, headIdx) + "<script>${Constants.NETWORK_FIREWALL_JS}</script>" + text.substring(headIdx)
+                        var patched = text.substring(0, headIdx) + "<script>${JsPatches.NETWORK_FIREWALL_JS}</script>" + text.substring(headIdx)
                         // Inject the disable-highlight CSS at parse time instead of via
                         // evaluateJavascript later. This avoids a full style recalculation
                         // after the DOM is already built.
@@ -278,6 +289,11 @@ class VWebviewClient(
                         modifiedHeaders["Content-Length"] = bodyBytes.size.toString()
                         modifiedHeaders.remove("Content-Encoding")
                         modifiedHeaders.remove("content-encoding")
+                        // Record that this URL's HTML already contains the
+                        // firewall so onPageStarted can skip re-injecting it.
+                        if (firewallEmbeddedUrls.size < MAX_FIREWALL_TRACKED) {
+                            firewallEmbeddedUrls.add(urlString)
+                        }
                     }
                 } catch (_: Exception) {}
             }
@@ -321,5 +337,13 @@ class VWebviewClient(
 
         private val themeCssCache = ThreadSafeLruCache(2 * 1024 * 1024)
         private val mainFrameCache = ThreadSafeLruCache(2 * 1024 * 1024)
+
+        // Track main-frame URLs that already have the network firewall JS
+        // embedded in the HTML (from shouldInterceptRequest / doFetch).
+        // When onPageStarted fires for one of these, the combined
+        // firewall+animation evaluateJavascript can be skipped entirely,
+        // saving one IPC round-trip.  Capped at 16 entries to bound memory.
+        private val firewallEmbeddedUrls = ConcurrentHashMap.newKeySet<String>()
+        private const val MAX_FIREWALL_TRACKED = 16
     }
 }

@@ -3,7 +3,7 @@ package com.nin0dev.vendroid.utils
 import android.util.Log
 
 object Logger {
-    private const val TAG = "Vencord"
+    private const val TAG = "Vendroid"
     @JvmStatic
     fun e(message: String?) {
         Log.e(TAG, message.orEmpty())
