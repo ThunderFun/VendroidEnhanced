@@ -389,10 +389,175 @@
 
         recoverPlugins();
         tryStartPluginsStage();
+        setupSlateBackspaceFix();
+        setupTextCommandDispatcher();
 
         setTimeout(() => {
             try { VencordMobileNative.dismissLoadingScreen(); } catch(e) {}
         }, 800);
+    }
+
+    // Slate editor Android backspace fix.
+    //
+    // Slate skips deleteContentBackward events with a collapsed selection,
+    // so Android WebView's native contenteditable backspace runs and desyncs
+    // Slate's model. Intercept "beforeinput" at the capture phase and call
+    // deleteBackward('character') directly, preventing the default.
+    var _vendroidSlateFixInstalled = false;
+    var _vendroidSlateRetryCount = 0;
+
+    function setupSlateBackspaceFix() {
+        if (_vendroidSlateFixInstalled) return;
+        // Document-level capture listener targeting [data-slate-editor]; avoids
+        // needing the element to exist at setup time and handles recreation.
+        try {
+            document.addEventListener("beforeinput", function(e) {
+                // Only handle deleteContentBackward with collapsed selection
+                if (e.inputType !== "deleteContentBackward") return;
+                var target = e.target;
+                if (!target || !target.hasAttribute) return;
+                // Only target the Slate editor contenteditable
+                if (!target.hasAttribute("data-slate-editor") &&
+                    !target.closest("[data-slate-editor]")) return;
+                var sel = document.getSelection();
+                if (!sel || !sel.isCollapsed) return; // let Slate handle non-collapsed
+
+                // Find the Slate editor instance via the React fiber
+                var editor = findSlateEditorFromDOM(target);
+                if (!editor || typeof editor.deleteBackward !== "function") return;
+
+                // Call Slate's deleteBackward to keep state in sync
+                e.preventDefault();
+                try {
+                    editor.deleteBackward("character");
+                } catch(err) {
+                    console.error("[Vendroid] Slate backspace fix error: " + err.message);
+                }
+            }, true); // capture phase — runs before Slate's own handler
+            _vendroidSlateFixInstalled = true;
+            console.log("[Vendroid] Slate backspace fix installed");
+        } catch(e) {
+            console.error("[Vendroid] setupSlateBackspaceFix failed: " + e.message);
+        }
+    }
+
+    // Walk the React fiber tree from a DOM element to find the Slate editor
+    // instance (Discord's class eE receives `editor` as a prop). Walk up to
+    // 30 fibers looking for memoizedProps.editor with deleteBackward.
+    function findSlateEditorFromDOM(element) {
+        try {
+            // Find the React fiber key on this element
+            var fiberKey = null;
+            for (var key in element) {
+                if (key.startsWith("__reactFiber") || key.startsWith("__reactInternalInstance")) {
+                    fiberKey = key;
+                    break;
+                }
+            }
+            if (!fiberKey) return null;
+
+            var fiber = element[fiberKey];
+            var visited = 0;
+            while (fiber && visited < 30) {
+                var props = fiber.memoizedProps;
+                if (props && props.editor && typeof props.editor.deleteBackward === "function" &&
+                    typeof props.editor.insertText === "function") {
+                    return props.editor;
+                }
+                fiber = fiber.return;
+                visited++;
+            }
+        } catch(e) {
+            // React fiber access can fail if the element was unmounted
+        }
+        return null;
+    }
+
+    // Built-in text command dispatcher (/me, /tableflip, /shrug, …).
+    //
+    // The command browser's autocomplete UI has touch/IME issues on Android,
+    // so built-in text commands may not dispatch. Patch MessageActions.sendMessage
+    // to intercept "/" messages and apply the transform directly.
+    //
+    // Patched directly because MessageEvents.addMessagePreSendListener's webpack
+    // find:".handleSendMessage,onResize:" no longer exists in the mobile bundle,
+    // so the pre-send hook silently never fires.
+
+    // Built-in TEXT commands whose execute() is a pure string transform (from
+    // Discord module 917012, array `x`). Commands needing stores/RPCs (/nick,
+    // /kick, /ban, /timeout, /thread, /msg, /roll-dice) are omitted and fall
+    // through to the command browser / plain text.
+    var VENDROID_TEXT_COMMANDS = {
+        shrug:    function(msg) { return { content: (msg + " \xaf\\_(\u30C4)_/\xaf").trim() }; },
+        tableflip:function(msg) { return { content: (msg + " (\u256F\u00B0\u25A1\u00B0\u256F\uFE35) \u253B\u2501\u253B").trim() }; },
+        unflip:   function(msg) { return { content: (msg + " \u252C\u2500\u252C\u30CE( \xBA _ \xBA\u30CE)").trim() }; },
+        tts:      function(msg) { return { content: msg, tts: true }; },
+        me:       function(msg) { return { content: "_" + msg + "_" }; },
+        spoiler:  function(msg) { return { content: ("||" + msg + "||").trim() }; }
+    };
+
+    var _vendroidCmdPatched = false;
+    var _vendroidCmdRetryCount = 0;
+
+    function setupTextCommandDispatcher() {
+        if (_vendroidCmdPatched) return;
+        try {
+            var Common = Vencord.Webpack && Vencord.Webpack.Common;
+            var MessageActions = Common && Common.MessageActions;
+            if (!MessageActions || typeof MessageActions.sendMessage !== "function") {
+                // MessageActions not ready yet — retry for up to ~15s
+                if (_vendroidCmdRetryCount++ < 300) {
+                    setTimeout(setupTextCommandDispatcher, 50);
+                }
+                return;
+            }
+
+            var origSendMessage = MessageActions.sendMessage;
+            if (origSendMessage.__vendroidCmdPatched) {
+                _vendroidCmdPatched = true;
+                return;
+            }
+
+            MessageActions.sendMessage = function(channelId, messageObj, flag, options) {
+                try {
+                    var content = messageObj && typeof messageObj.content === "string" ? messageObj.content : "";
+                    // Only intercept messages that start with "/"
+                    if (content && content.charCodeAt(0) === 0x2F) { // 0x2F = '/'
+                        // Parse: /commandName rest-of-line
+                        var match = content.match(/^\/(\S+)\s*([\s\S]*)$/);
+                        if (match) {
+                            var cmdName = match[1].toLowerCase();
+                            var msgArg = match[2] || "";
+                            var executor = VENDROID_TEXT_COMMANDS[cmdName];
+                            if (executor) {
+                                // Run the command's execute transform
+                                var result = executor(msgArg);
+                                if (result && typeof result.content === "string") {
+                                    // Replace content in the message object and
+                                    // let the original sendMessage handle it.
+                                    messageObj.content = result.content;
+                                    if (result.tts) messageObj.tts = true;
+                                }
+                            }
+                        }
+                    }
+                } catch(e) {
+                    console.error("[Vendroid] text command dispatcher error: " + e.message);
+                    // On error, let the original send proceed unchanged
+                }
+                // Call original sendMessage with (possibly modified) args
+                return origSendMessage.apply(this, arguments);
+            };
+            // Mark patched so we don't double-patch on re-injection
+            MessageActions.sendMessage.__vendroidCmdPatched = true;
+            _vendroidCmdPatched = true;
+            console.log("[Vendroid] Text command dispatcher installed (/me, /shrug, /tableflip, /unflip, /tts, /spoiler)");
+        } catch(e) {
+            console.error("[Vendroid] setupTextCommandDispatcher failed: " + e.message);
+            if (_vendroidCmdRetryCount++ < 300) {
+                setTimeout(setupTextCommandDispatcher, 50);
+            }
+        }
     }
 
     // Event-driven init with fast safety-net poll (50ms instead of 500ms/1000ms).
@@ -1139,6 +1304,35 @@ video {
         delayedBlur();
     }
 
+    // Decorative / non-attachment media that should never trigger the overlay.
+    // One CSS selector string so isAttachmentImage(), isLightboxDialog, and
+    // findImageFromTarget can do a single closest() walk.
+    const DECORATIVE_UI_SELECTORS = [
+        'svg',
+        'iframe, [data-hcaptcha-response], .hcaptcha, .captcha',
+        // Avatars / profile pictures
+        '[class*="avatar"], [class*="Avatar"], [class*="pfp"], [class*="Pfp"]',
+        // Member list / user popouts
+        '[class*="member"], [class*="Member"], [class*="userPopout"], [class*="UserPopout"]',
+        // Status / role / presence icons
+        '[class*="status"], [class*="pill"], [class*="roleIcon"], [class*="RoleIcon"]',
+        // Emoji (inline + reactions)
+        '[class*="emoji"], [class*="Emoji"], [class*="reaction"], [class*="Reaction"]',
+        // Stickers
+        '[class*="sticker"], [class*="Sticker"]',
+        // Guild / server / channel icons & banners
+        '[class*="guildIcon"], [class*="GuildIcon"], [class*="serverIcon"], [class*="ServerIcon"], [class*="channelIcon"], [class*="ChannelIcon"], [class*="banner"], [class*="Banner"]',
+        // File-type / attachment placeholder icons (not real media)
+        '[class*="fileIcon"], [class*="FileIcon"], [class*="attachmentIcon"], [class*="AttachmentIcon"], [class*="mediaAttachmentIcon"]',
+        // Decorative badges / nitro / boost icons
+        '[class*="BadgeIcon"], [class*="boost"], [class*="Boost"], [class*="nitro"], [class*="Nitro"]',
+        // Collectibles shop / profile-frame preview cards (shop UI, not chat
+        // media). NOTE: do NOT add [aria-hidden="true"] — Discord marks the
+        // inner media of real GIF/image wrappers as aria-hidden too, so that
+        // selector would block legitimate GIFs.
+        '[class*="productCard"], [class*="productPreview"], [class*="profileFrame"], [class*="profileContainer"], [class*="previewContainer"], [class*="sampleProfile"]'
+    ].join(',');
+
     function isLightboxDialog(dialog) {
         const text = (dialog.textContent || "").trim();
         if (text.length > 500) return false;
@@ -1152,6 +1346,21 @@ video {
 
         const mediaCount = dialog.querySelectorAll("img, video").length;
         if (mediaCount < 1) return false;
+        return true;
+    }
+
+    // True if [el] is a real chat media element the overlay should take over,
+    // not a decorative icon in a dialog. Requires: passes isAttachmentImage(),
+    // >= 120px on the smaller side, and occupies >= 30% of the dialog area.
+    function isDialogMediaOpenable(el, dialog) {
+        if (!el) return false;
+        if (!isAttachmentImage(el)) return false;
+        const rect = el.getBoundingClientRect();
+        if (rect.width <= 0 || rect.height <= 0) return false;
+        if (Math.min(rect.width, rect.height) < 120) return false;
+        const dRect = dialog.getBoundingClientRect();
+        const dialogArea = Math.max(1, dRect.width * dRect.height);
+        if ((rect.width * rect.height) / dialogArea < 0.30) return false;
         return true;
     }
 
@@ -1211,11 +1420,9 @@ video {
 
     function isAttachmentImage(el) {
         if (!el) return false;
-        if (el.closest('svg')) return false;
-        if (el.closest('iframe, [data-hcaptcha-response], .hcaptcha, .captcha')) return false;
-        if (el.closest('[class*="avatar"], [class*="Avatar"], [class*="pfp"], [class*="Pfp"]')) return false;
-        if (el.closest('[class*="member"], [class*="Member"], [class*="userPopout"], [class*="UserPopout"]')) return false;
-        if (el.closest('[class*="status"], [class*="pill"], [class*="roleIcon"], [class*="RoleIcon"]')) return false;
+        // One closest() walk against the shared decorative-UI blocklist (see
+        // DECORATIVE_UI_SELECTORS above).
+        if (el.closest(DECORATIVE_UI_SELECTORS)) return false;
         return true;
     }
 
@@ -1224,30 +1431,35 @@ video {
         if (target.tagName === 'VIDEO') return target;
         if (target.tagName === 'IMG') return target;
 
-        // Walk up the tree looking for media.
-        // querySelector is necessary because Discord wraps media in deep nested
-        // containers; direct-child-only iteration misses most messages.
-        // We verify spatial proximity so we don't pick a media element from a
-        // completely different message when we reach a high ancestor.
+        // Walk up looking for media. querySelector is necessary because Discord
+        // wraps media in deep nested containers; direct-child iteration misses
+        // most messages. Spatial proximity (PROX=150px) prevents picking media
+        // from a different message at high ancestors. The walk bails if an
+        // ancestor is a decorative-UI container, and querySelector candidates
+        // must pass isAttachmentImage() before being accepted.
+        const PROX = 150;
         let node = target;
         for (let i = 0; i < 6 && node; i++) {
+            // If we climbed into a decorative container, the tap was on UI
+            // chrome, not chat media — stop searching.
+            if (node.matches && node.matches(DECORATIVE_UI_SELECTORS)) return null;
             if (node.tagName === 'VIDEO') return node;
             if (node.tagName === 'IMG') return node;
             if (node.querySelector) {
                 const video = node.querySelector('video');
-                if (video) {
+                if (video && isAttachmentImage(video)) {
                     const vRect = video.getBoundingClientRect();
                     if (vRect.width > 0 && vRect.height > 0) {
                         const tRect = target.getBoundingClientRect();
-                        if (Math.abs(vRect.top - tRect.top) < 400 && Math.abs(vRect.left - tRect.left) < 400) return video;
+                        if (Math.abs(vRect.top - tRect.top) < PROX && Math.abs(vRect.left - tRect.left) < PROX) return video;
                     }
                 }
                 const img = node.querySelector('img');
-                if (img) {
+                if (img && isAttachmentImage(img)) {
                     const iRect = img.getBoundingClientRect();
                     if (iRect.width > 0 && iRect.height > 0) {
                         const tRect = target.getBoundingClientRect();
-                        if (Math.abs(iRect.top - tRect.top) < 400 && Math.abs(iRect.left - tRect.left) < 400) return img;
+                        if (Math.abs(iRect.top - tRect.top) < PROX && Math.abs(iRect.left - tRect.left) < PROX) return img;
                     }
                 }
             }
@@ -1470,10 +1682,9 @@ video {
             if (!isLightboxDialog(dialog)) { lastNonLightboxDialog = dialog; lastNonLightboxDialogHash = dialogHash; return; }
             const imgs = dialog.querySelectorAll("img");
             for (const img of imgs) {
-                if (img.width === 0 && img.height === 0) continue;
-                if (img.closest('svg')) continue;
-                const rect = img.getBoundingClientRect();
-                if (rect.width < 50 && rect.height < 50) continue;
+                // Skip zero-size and decorative media; isDialogMediaOpenable
+                // enforces minimum size and dialog-area fraction.
+                if (!isDialogMediaOpenable(img, dialog)) continue;
                 if (!imgOverlay) {
                     showImageInOverlay(getBestImageUrl(img));
                     dialog.style.setProperty("display", "none", "important");
@@ -1485,9 +1696,7 @@ video {
             if (imgOverlay) return;
             const videos = dialog.querySelectorAll("video");
             for (const video of videos) {
-                const vRect = video.getBoundingClientRect();
-                if (vRect.width === 0 && vRect.height === 0) continue;
-                if (vRect.width < 50 && vRect.height < 50) continue;
+                if (!isDialogMediaOpenable(video, dialog)) continue;
                 if (!isGifVideo(video)) continue;
                 const videoSrc = getBestVideoUrl(video);
                 if (!videoSrc) continue;

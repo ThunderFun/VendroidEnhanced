@@ -39,9 +39,10 @@ object HttpClient {
     @JvmStatic
     fun setVencordMobileRuntime(value: String?) { VencordMobileRuntime = value }
 
-    private val vencordRuntimePatches = listOf(
-        "chat input type must be set" to "chat input type must be set__VENDROID_DISABLED"
-    )
+    // No string patches on the Vencord bundle. The Slate editor (with command
+    // browser support) is left enabled; its backspace bug is fixed at the DOM
+    // level by SlateBackspaceFix in vencord_mobile.js.
+    private val vencordRuntimePatches = listOf<Pair<String, String>>()
 
     // Pre-built regex for single-pass patching — avoids N full-copy allocations
     // on the ~1MB Vencord bundle.
