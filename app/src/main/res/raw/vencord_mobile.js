@@ -389,7 +389,6 @@
 
         recoverPlugins();
         tryStartPluginsStage();
-        setupSlateBackspaceFix();
         setupTextCommandDispatcher();
 
         setTimeout(() => {
@@ -560,7 +559,6 @@
         }
     }
 
-    // Event-driven init with fast safety-net poll (50ms instead of 500ms/1000ms).
     // tryAdvanceInit() is called both by hooks (vendroidCallInitWebpack) and
     // the poll loop, so init responds as soon as conditions are met.
     var initStage = 0; // 0=need webpack, 1=need plugins/flux, 2=done
@@ -768,6 +766,12 @@ video {
 [class*="embedMedia"] img, [class*="embedImage"] img {
     max-width: 100% !important;
     height: auto !important;
+}
+/* Hide the app launcher button in the chat input bar — apps/commands browser
+   isn't usable with the plain textarea editor on Android. */
+[class*="channelAppLauncher"], [class*="buttonsContainer"] [class*="appLauncher"],
+[aria-label="Apps"], [aria-label="Browse apps"] {
+    display: none !important;
 }
 `.trim();
 
@@ -1326,6 +1330,8 @@ video {
         '[class*="fileIcon"], [class*="FileIcon"], [class*="attachmentIcon"], [class*="AttachmentIcon"], [class*="mediaAttachmentIcon"]',
         // Decorative badges / nitro / boost icons
         '[class*="BadgeIcon"], [class*="boost"], [class*="Boost"], [class*="nitro"], [class*="Nitro"]',
+        // Promotional / marketing banners (e.g. premium upsell cards)
+        '[class*="asset"], [class*="Asset"], [class*="promotion"], [class*="Promotion"], [class*="marketing"], [class*="Marketing"]',
         // Collectibles shop / profile-frame preview cards (shop UI, not chat
         // media). NOTE: do NOT add [aria-hidden="true"] — Discord marks the
         // inner media of real GIF/image wrappers as aria-hidden too, so that

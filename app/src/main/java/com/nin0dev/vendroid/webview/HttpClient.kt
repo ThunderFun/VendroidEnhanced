@@ -39,10 +39,13 @@ object HttpClient {
     @JvmStatic
     fun setVencordMobileRuntime(value: String?) { VencordMobileRuntime = value }
 
-    // No string patches on the Vencord bundle. The Slate editor (with command
-    // browser support) is left enabled; its backspace bug is fixed at the DOM
-    // level by SlateBackspaceFix in vencord_mobile.js.
-    private val vencordRuntimePatches = listOf<Pair<String, String>>()
+    // Force the plain <textarea> editor instead of Slate. Slate's contenteditable
+    // breaks backspace/IME on Android WebView; the textarea fixes that at the cost
+    // of the command browser (bot/app commands). Text commands (/me, /shrug, …)
+    // are restored by the dispatcher shim in vencord_mobile.js.
+    private val vencordRuntimePatches = listOf(
+        "chat input type must be set" to "chat input type must be set__VENDROID_DISABLED"
+    )
 
     // Pre-built regex for single-pass patching — avoids N full-copy allocations
     // on the ~1MB Vencord bundle.
