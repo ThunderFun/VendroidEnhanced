@@ -5,6 +5,7 @@ import android.graphics.Bitmap
 import android.graphics.Color
 import android.net.Uri
 import android.os.Build
+import android.util.Log
 import android.view.View
 import android.webkit.ConsoleMessage
 import android.webkit.ConsoleMessage.MessageLevel
@@ -14,11 +15,10 @@ import android.webkit.WebView
 import android.widget.FrameLayout
 import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
+import com.nin0dev.vendroid.BuildConfig
 import com.nin0dev.vendroid.MainActivity
 import com.nin0dev.vendroid.R
-import com.nin0dev.vendroid.utils.Logger.e
-import com.nin0dev.vendroid.utils.Logger.i
-import com.nin0dev.vendroid.utils.Logger.w
+import com.nin0dev.vendroid.utils.VDELog
 import java.lang.ref.WeakReference
 
 class VChromeClient(activity: MainActivity) : WebChromeClient() {
@@ -53,18 +53,31 @@ class VChromeClient(activity: MainActivity) : WebChromeClient() {
     override fun getDefaultVideoPoster(): Bitmap? = transparentPoster
 
     override fun onConsoleMessage(msg: ConsoleMessage): Boolean {
-        if (!com.nin0dev.vendroid.BuildConfig.DEBUG) return true
-        // Defer string construction until AFTER level dispatch — avoids
-        // allocating the full message string for DEBUG/LOG levels that
-        // Discord emits hundreds of times per second (React dev tools,
-        // webpack HMR, etc.). This eliminates the dominant per-message
-        // GC pressure in debug mode.
-        when (msg.messageLevel()) {
-            MessageLevel.ERROR -> e("[Javascript] ${msg.message()} @ ${msg.lineNumber()}: ${msg.sourceId()}")
-            MessageLevel.WARNING -> w("[Javascript] ${msg.message()} @ ${msg.lineNumber()}: ${msg.sourceId()}")
-            // Skip DEBUG/LOG — extremely voluminous, near-zero diagnostic value
-            MessageLevel.DEBUG, MessageLevel.LOG -> {}
-            else -> i("[Javascript] ${msg.message()} @ ${msg.lineNumber()}: ${msg.sourceId()}")
+        val message = msg.message()
+
+        // Route [Vendroid] messages to VDELog in all builds (not just DEBUG)
+        // to capture vencord_mobile.js diagnostics (webpack capture, plugin
+        // init, Slate fixes, GIF picker) for the in-app log viewer.
+        if (message.startsWith("[Vendroid]") || message.startsWith("[VDE]")) {
+            val level = when (msg.messageLevel()) {
+                MessageLevel.ERROR -> VDELog.Level.ERROR
+                MessageLevel.WARNING -> VDELog.Level.WARN
+                else -> VDELog.Level.INFO
+            }
+            VDELog.log(level, "JS", message)
+            // Do not also call Logger — that would double-log to VDELog.
+            return true
+        }
+
+        // Non-Vendroid messages: logcat only in debug builds. Use Log.e/w
+        // directly, not Logger, to avoid flooding VDELog with Discord's
+        // internal JS noise (React dev tools, webpack HMR, etc.).
+        if (BuildConfig.DEBUG) {
+            when (msg.messageLevel()) {
+                MessageLevel.ERROR -> Log.e("Vendroid", "[JS] $message @ ${msg.lineNumber()}")
+                MessageLevel.WARNING -> Log.w("Vendroid", "[JS] $message @ ${msg.lineNumber()}")
+                else -> {}
+            }
         }
         return true
     }
@@ -110,12 +123,16 @@ class VChromeClient(activity: MainActivity) : WebChromeClient() {
         val controller = getInsetsController(activity)
         controller.systemBarsBehavior = WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
         controller.hide(WindowInsetsCompat.Type.navigationBars())
+        // statusBarColor and isStatusBarContrastEnforced are deprecated on API 35
+        // but remain the only way to set bar color on pre-edge-to-edge devices.
         @Suppress("DEPRECATION")
-        originalStatusBarColor = activity.window.statusBarColor
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.VANILLA_ICE_CREAM) {
-            activity.window.isStatusBarContrastEnforced = false
+        run {
+            originalStatusBarColor = activity.window.statusBarColor
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.VANILLA_ICE_CREAM) {
+                activity.window.isStatusBarContrastEnforced = false
+            }
+            activity.window.statusBarColor = Color.BLACK
         }
-        activity.window.statusBarColor = Color.BLACK
     }
 
     override fun onHideCustomView() {

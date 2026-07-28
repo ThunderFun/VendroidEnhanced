@@ -21,8 +21,10 @@ import com.google.android.material.textfield.TextInputEditText
 import com.nin0dev.vendroid.MainActivity
 import com.nin0dev.vendroid.R
 import com.nin0dev.vendroid.utils.Constants
+import com.nin0dev.vendroid.utils.FirewallConfig
 import com.nin0dev.vendroid.utils.Logger.e
 import com.nin0dev.vendroid.utils.Logger.w
+import com.nin0dev.vendroid.utils.VDELog
 import java.io.File
 import java.io.FileOutputStream
 import java.io.IOException
@@ -36,6 +38,7 @@ class VencordNative(private val activity: WeakReference<MainActivity>, wv: WebVi
 
     companion object {
         private const val CSS_CACHE_TTL_MS = 7 * 24 * 60 * 60 * 1000L
+        private const val CSS_CACHE_MAX_KEYS = 32
         private val ICON_NAMES = setOf("Main", "Jolly", "Discord", "Retro", "TS12")
         @Volatile
         private var currentIcon: String = "Main"
@@ -78,6 +81,12 @@ class VencordNative(private val activity: WeakReference<MainActivity>, wv: WebVi
     @Volatile
     var overlayActive = false
         private set
+
+    @Volatile
+    private var logsDialogActive = false
+
+    @Volatile
+    private var firewallDialogActive = false
 
     private var originalStatusBarColor: Int? = null
     private var originalNavBarColor: Int? = null
@@ -124,10 +133,12 @@ class VencordNative(private val activity: WeakReference<MainActivity>, wv: WebVi
     // that can jump on clock adjustments, breaking the rate limiter).
     private val lastWriteTime = ConcurrentHashMap<String, Long>()
 
-    private fun rateLimitWrite(id: String): Boolean {
+    private fun rateLimitWrite(id: String): Boolean = rateLimitWrite(id, 500_000_000L)
+
+    private fun rateLimitWrite(id: String, minIntervalNanos: Long): Boolean {
         val now = System.nanoTime()
         val last = lastWriteTime[id] ?: 0L
-        if (now - last < 500_000_000L) return false // 500ms in nanos
+        if (now - last < minIntervalNanos) return false
         lastWriteTime[id] = now
         return true
     }
@@ -150,6 +161,35 @@ class VencordNative(private val activity: WeakReference<MainActivity>, wv: WebVi
 
     private fun isOnDiscordDomain(): Boolean {
         return Constants.isDiscordDomain(activity.get()?.currentHostForBridge ?: return false)
+    }
+
+    /**
+     * Defense-in-depth domain check for sensitive bridge methods. Re-reads the
+     * WebView's current URL on the UI thread in addition to the cached
+     * [currentHostForBridge], closing the TOCTOU window between a navigation
+     * and the cached host being refreshed. Returns false if either source
+     * disagrees or the live URL is not a Discord domain.
+     */
+    private fun isOnDiscordDomainStrict(): Boolean {
+        if (!isOnDiscordDomain()) return false
+        val wv = wvRef.get() ?: return false
+        // WebView.getUrl() must be queried on the UI thread. Bridge methods run
+        // on a Chromium JS thread, so this does not stall the page's main thread.
+        var liveHost: String? = null
+        val wvActivity = activity.get()
+        if (wvActivity != null) {
+            val latch = java.util.concurrent.CountDownLatch(1)
+            wvActivity.runOnUiThread {
+                try { liveHost = wv.url?.let { Uri.parse(it).host } } catch (_: Exception) {}
+                latch.countDown()
+            }
+            try {
+                if (!latch.await(2, java.util.concurrent.TimeUnit.SECONDS)) return false
+            } catch (_: InterruptedException) {
+                return false
+            }
+        }
+        return liveHost != null && Constants.isDiscordDomain(liveHost!!)
     }
 
     fun shutdown() {
@@ -195,24 +235,29 @@ class VencordNative(private val activity: WeakReference<MainActivity>, wv: WebVi
 
     @JavascriptInterface
     fun updateVencord() {
-        if (!rateLimitWrite("updateVencord")) return
+        // Strict check before any work — this overwrites vencord.js via a
+        // network download, so non-Discord whitelisted pages must not invoke it.
+        if (!isOnDiscordDomainStrict()) return
+        if (!rateLimitWrite("updateVencord", 5 * 60 * 1_000_000_000L)) return
+        // Resolve and validate the bundle location before scheduling any
+        // network work, so a misconfigured vencordLocation fails fast.
+        val sPrefs = settingsPrefs ?: return
+        val defaultUrl = if (
+            sPrefs.getString("clientMod", "vencord") == "equicord"
+        ) Constants.EQUICORD_BUNDLE_URL else Constants.JS_BUNDLE_URL
+        val vencordLocation = sPrefs.getString("vencordLocation", defaultUrl) ?: defaultUrl
+        val vencordHost = Uri.parse(vencordLocation).host
+        if (vencordHost == null || !Constants.isAllowedVencordHost(vencordHost)) {
+            e("Vencord location host '$vencordHost' is not in allowed list")
+            return
+        }
         executor.execute {
             var conn: HttpURLConnection? = null
             var vendroidTmpFile: File? = null
             try {
                 val act = activity.get() ?: return@execute
-                val sPrefs = settingsPrefs ?: return@execute
                 val vendroidFile = File(act.filesDir, "vencord.js")
                 vendroidTmpFile = File(act.filesDir, "vencord.js.tmp")
-                val defaultUrl = if (
-                    sPrefs.getString("clientMod", "vencord") == "equicord"
-                ) Constants.EQUICORD_BUNDLE_URL else Constants.JS_BUNDLE_URL
-                val vencordLocation = sPrefs.getString("vencordLocation", defaultUrl) ?: defaultUrl
-                val vencordHost = Uri.parse(vencordLocation).host
-                if (vencordHost != null && !Constants.isAllowedVencordHost(vencordHost)) {
-                    activity.get()?.let { e("Vencord location host '$vencordHost' is not in allowed list") }
-                    return@execute
-                }
                 conn = HttpClient.fetch(vencordLocation)
                 val content = HttpClient.readAsText(conn.inputStream)
                 val patched = HttpClient.applyPatches(content)
@@ -221,6 +266,17 @@ class VencordNative(private val activity: WeakReference<MainActivity>, wv: WebVi
                     vendroidTmpFile.delete()
                     throw IOException("Failed to rename ${vendroidTmpFile.name} to ${vendroidFile.name}")
                 }
+                // Sync ETag/patched-flag with the startup path so the next
+                // launch's conditional GET returns 304. VencordRuntime is left
+                // untouched; the user is prompted to restart.
+                val responseEtag = conn.getHeaderField("ETag")
+                val editor = sPrefs.edit()
+                if (responseEtag != null) {
+                    editor.putString("vencordEtag", responseEtag)
+                }
+                editor.putInt("lastMajorUpdateThatUserHasUpdatedVencord", com.nin0dev.vendroid.BuildConfig.VERSION_CODE)
+                editor.apply()
+                HttpClient.vencordBundlePatched = true
                 act.runOnUiThread {
                     act.showDiscordToast("Updated Vencord, restart to apply changes!", "SUCCESS")
                 }
@@ -290,13 +346,26 @@ class VencordNative(private val activity: WeakReference<MainActivity>, wv: WebVi
         val safeId = id ?: return
         val safeValue = value ?: return
         try {
-            if (!isOnDiscordDomain()) return
+            // Strict check — setString can persist the bundle source (clientMod)
+            // and other settings, so non-Discord pages must not write.
+            if (!isOnDiscordDomainStrict()) return
             if (!rateLimitWrite(safeId)) return
             if (!isKeyAllowedForWrite(safeId)) return
             // Route CSS cache keys to the dedicated cache prefs file so they
             // don't churn the main settings XML on every write.
             if (safeId.startsWith("css_cache_")) {
                 val cssPrefs = cssCachePrefs ?: return
+                // Bound the key count to prevent unbounded prefs growth
+                // (SharedPreferences loads fully into memory). Updating an
+                // existing key is always allowed; new keys are rejected once
+                // the cap is reached.
+                if (!cssPrefs.contains(safeId)) {
+                    val cssKeyCount = cssPrefs.all.keys.count { it.startsWith("css_cache_") && !it.endsWith("_ts") }
+                    if (cssKeyCount >= CSS_CACHE_MAX_KEYS) {
+                        if (com.nin0dev.vendroid.BuildConfig.DEBUG) w("CSS cache key cap reached ($CSS_CACHE_MAX_KEYS), rejecting new key: $safeId")
+                        return
+                    }
+                }
                 cssPrefs.edit {
                     putLong("${safeId}_ts", System.currentTimeMillis())
                     putString(safeId, safeValue)
@@ -305,7 +374,16 @@ class VencordNative(private val activity: WeakReference<MainActivity>, wv: WebVi
             }
             val sPrefs = settingsPrefs ?: return
             sPrefs.edit {
-                if (safeId == "clientMod") putInt("lastMajorUpdateThatUserHasUpdatedVencord", 0)
+                if (safeId == "clientMod") {
+                    // Invalidate the stale bundle so the next launch downloads
+                    // the new mod cleanly, rather than injecting both the old
+                    // (from preload) and new (from fetchVencord) runtimes.
+                    putInt("lastMajorUpdateThatUserHasUpdatedVencord", 0)
+                    remove("vencordEtag")
+                    activity.get()?.filesDir?.let { File(it, "vencord.js").delete() }
+                    HttpClient.vencordBundlePatched = false
+                    HttpClient.setVencordRuntime(null)
+                }
                 putString(safeId, safeValue)
             }
         } catch (t: Throwable) {
@@ -317,12 +395,23 @@ class VencordNative(private val activity: WeakReference<MainActivity>, wv: WebVi
     fun setBool(id: String?, value: Boolean) {
         val safeId = id ?: return
         try {
-            if (!isOnDiscordDomain()) return
+            // Strict check — setBool persists behavior-influencing settings
+            // (safeMode, desktopMode, etc.), so non-Discord pages must not write.
+            if (!isOnDiscordDomainStrict()) return
             if (!rateLimitWrite(safeId)) return
             if (!isKeyAllowedForWrite(safeId)) return
             val sPrefs = settingsPrefs ?: return
             sPrefs.edit {
                 putBoolean(safeId, value)
+            }
+            // Live-update the typing indicator filter so the toggle takes
+            // effect without an app restart.
+            if (safeId == "vendroid_blockTypingIndicator") {
+                com.nin0dev.vendroid.webview.VWebviewClient.updateTypingBlock(value)
+            }
+            // Live-update the external-link confirmation toggle.
+            if (safeId == "vendroid_confirmExternalLinks") {
+                com.nin0dev.vendroid.webview.LinkHandler.updateConfirmExternalLinks(value)
             }
         } catch (t: Throwable) {
             if (com.nin0dev.vendroid.BuildConfig.DEBUG) e("setBool($safeId) failed", t)
@@ -343,7 +432,7 @@ class VencordNative(private val activity: WeakReference<MainActivity>, wv: WebVi
             return
         }
         try {
-            if (!isOnDiscordDomain()) {
+            if (!isOnDiscordDomainStrict()) {
                 val a = activity.get()
                 a?.runOnUiThread { Toast.makeText(a, "Icon change: not on Discord domain", Toast.LENGTH_SHORT).show() }
                 return
@@ -383,7 +472,9 @@ class VencordNative(private val activity: WeakReference<MainActivity>, wv: WebVi
     @JavascriptInterface
     fun openQuickCss(quickCss: String?) {
         try {
-            if (!isOnDiscordDomain()) return
+            // Strict check — this opens a WebView with a JS interface, so a
+            // non-Discord whitelisted page must not invoke it.
+            if (!isOnDiscordDomainStrict()) return
             val act = activity.get() ?: return
             val safeQuickCss = quickCss ?: ""
             act.runOnUiThread {
@@ -408,6 +499,7 @@ class VencordNative(private val activity: WeakReference<MainActivity>, wv: WebVi
 
                     wv.webViewClient = object : android.webkit.WebViewClient() {
                         override fun onPageFinished(view: WebView?, url: String?) {
+                            bridge.originCommitted = true
                             if (safeQuickCss.isNotEmpty()) {
                                 view?.evaluateJavascript(
                                     "window.qcssSet?.(${gson.toJson(safeQuickCss)})", null
@@ -415,10 +507,13 @@ class VencordNative(private val activity: WeakReference<MainActivity>, wv: WebVi
                             } else {
                                 val mainWv = wvRef.get() ?: return
                                 mainWv.evaluateJavascript("VencordNative.quickCss.get()") { result ->
-                                    val raw = result.trim().removePrefix("\"").removeSuffix("\"")
-                                    view?.evaluateJavascript(
-                                        "window.qcssSet?.(${gson.toJson(raw.replace("\\n", "\n"))})", null
-                                    )
+                                    // result is a JSON-encoded string; pass it to JS via
+                                    // JSON.parse. Manual unescaping breaks on literal backslashes.
+                                    if (result != null && result != "null") {
+                                        view?.evaluateJavascript(
+                                            "window.qcssSet?.(JSON.parse($result))", null
+                                        )
+                                    }
                                 }
                             }
                         }
@@ -444,8 +539,16 @@ class VencordNative(private val activity: WeakReference<MainActivity>, wv: WebVi
         private val editorWebView: WebView,
         private val dialog: android.app.Dialog
     ) {
+        // Set from onPageFinished (UI thread). WebView.getUrl() must be called
+        // on the UI thread, but @JavascriptInterface methods run on a Chromium
+        // internal thread, so checking getUrl() directly is unreliable.
+        @Volatile var originCommitted = false
+
+        private fun isExpectedOrigin(): Boolean = originCommitted
+
         @android.webkit.JavascriptInterface
         fun quickCssSet(css: String?) {
+            if (!isExpectedOrigin()) return
             val safe = css ?: ""
             activity.runOnUiThread {
                 val mainWv = activity.findViewById<WebView>(R.id.webview)
@@ -459,6 +562,7 @@ class VencordNative(private val activity: WeakReference<MainActivity>, wv: WebVi
 
         @android.webkit.JavascriptInterface
         fun quickCssClose() {
+            if (!isExpectedOrigin()) return
             activity.runOnUiThread {
                 if (dialog.isShowing) dialog.dismiss()
             }
@@ -497,6 +601,246 @@ class VencordNative(private val activity: WeakReference<MainActivity>, wv: WebVi
         val act = activity.get() ?: return
         act.runOnUiThread {
             act.dismissLoadingScreen()
+        }
+    }
+
+    @JavascriptInterface
+    fun isDebugBuild(): Boolean {
+        return com.nin0dev.vendroid.BuildConfig.DEBUG
+    }
+
+    @JavascriptInterface
+    fun openLogs() {
+        try {
+            // Gate on Discord domain. A failed Discord load still leaves
+            // currentHostForBridge on a Discord host, so troubleshooting
+            // remains possible; non-Discord whitelisted pages cannot open
+            // the viewer or read app diagnostics.
+            if (!isOnDiscordDomain()) return
+            val act = activity.get() ?: return
+            if (logsDialogActive) return
+            act.runOnUiThread {
+                try {
+                    if (act.isFinishing || act.isDestroyed) return@runOnUiThread
+
+                    val wv = WebView(act)
+                    wv.settings.javaScriptEnabled = true
+                    wv.settings.domStorageEnabled = true
+                    wv.settings.allowFileAccess = false
+                    wv.settings.allowContentAccess = false
+                    wv.settings.mixedContentMode = android.webkit.WebSettings.MIXED_CONTENT_NEVER_ALLOW
+                    wv.setBackgroundColor(android.graphics.Color.parseColor("#0f0f10"))
+
+                    val dialog = android.app.Dialog(act, android.R.style.Theme_Black_NoTitleBar_Fullscreen)
+                    dialog.setContentView(wv)
+                    dialog.setCancelable(true)
+                    dialog.setOnDismissListener {
+                        logsDialogActive = false
+                        wv.destroy()
+                    }
+
+                    val bridge = LogViewerBridge(act, wv, dialog)
+                    wv.addJavascriptInterface(bridge, "VencordMobileNative")
+
+                    wv.webViewClient = object : android.webkit.WebViewClient() {
+                        override fun onPageFinished(view: WebView?, url: String?) {
+                            bridge.originCommitted = true
+                            val logs = VDELog.getRecentLogs(500)
+                            view?.evaluateJavascript(
+                                "window.vdeSetLogs?.(${gson.toJson(logs)})", null
+                            )
+                        }
+                    }
+
+                    logsDialogActive = true
+                    dialog.show()
+                    wv.loadUrl("file:///android_asset/log_viewer.html")
+                } catch (e: Throwable) {
+                    logsDialogActive = false
+                    if (com.nin0dev.vendroid.BuildConfig.DEBUG) {
+                        android.util.Log.e("Vendroid", "openLogs inner failed", e)
+                    }
+                }
+            }
+        } catch (e: Throwable) {
+            if (com.nin0dev.vendroid.BuildConfig.DEBUG) {
+                android.util.Log.e("Vendroid", "openLogs outer failed", e)
+            }
+        }
+    }
+
+    private class LogViewerBridge(
+        private val activity: MainActivity,
+        private val viewerWebView: WebView,
+        private val dialog: android.app.Dialog
+    ) {
+        @Volatile var originCommitted = false
+
+        private fun isExpectedOrigin(): Boolean = originCommitted
+
+        @android.webkit.JavascriptInterface
+        fun close() {
+            if (!isExpectedOrigin()) return
+            if (dialog.isShowing) dialog.dismiss()
+        }
+
+        @android.webkit.JavascriptInterface
+        fun clearLogs() {
+            if (!isExpectedOrigin()) return
+            VDELog.clearLogs()
+        }
+
+        @android.webkit.JavascriptInterface
+        fun refreshLogs(): String {
+            if (!isExpectedOrigin()) return ""
+            return VDELog.getRecentLogs(500)
+        }
+
+        @android.webkit.JavascriptInterface
+        fun shareLogs() {
+            if (!isExpectedOrigin()) return
+            val text = VDELog.getLogFileContents()
+            activity.runOnUiThread {
+                try {
+                    val intent = android.content.Intent(android.content.Intent.ACTION_SEND).apply {
+                        type = "text/plain"
+                        putExtra(android.content.Intent.EXTRA_TEXT, text)
+                        putExtra(android.content.Intent.EXTRA_SUBJECT, "VendroidEnhanced Logs")
+                    }
+                    activity.startActivity(android.content.Intent.createChooser(intent, "Share logs"))
+                } catch (_: android.content.ActivityNotFoundException) {
+                    android.widget.Toast.makeText(activity, "No app available to share logs", android.widget.Toast.LENGTH_SHORT).show()
+                }
+            }
+        }
+    }
+
+    @JavascriptInterface
+    fun openFirewallEditor() {
+        try {
+            // Strict check — this mutates the firewall config, so a non-Discord
+            // page must not invoke it even if currentHostForBridge is stale.
+            if (!isOnDiscordDomainStrict()) return
+            val act = activity.get() ?: return
+            if (firewallDialogActive) return
+            act.runOnUiThread {
+                try {
+                    if (act.isFinishing || act.isDestroyed) return@runOnUiThread
+
+                    val wv = WebView(act)
+                    wv.settings.javaScriptEnabled = true
+                    wv.settings.domStorageEnabled = true
+                    wv.settings.allowFileAccess = false
+                    wv.settings.allowContentAccess = false
+                    wv.settings.mixedContentMode = android.webkit.WebSettings.MIXED_CONTENT_NEVER_ALLOW
+                    wv.setBackgroundColor(android.graphics.Color.parseColor("#0f0f10"))
+
+                    val dialog = android.app.Dialog(act, android.R.style.Theme_Black_NoTitleBar_Fullscreen)
+                    dialog.setContentView(wv)
+                    dialog.setCancelable(true)
+                    dialog.setOnDismissListener {
+                        firewallDialogActive = false
+                        wv.destroy()
+                    }
+
+                    val bridge = FirewallEditorBridge(act, wv, dialog)
+                    wv.addJavascriptInterface(bridge, "VencordMobileNative")
+
+                    // Defer the initial config push until onPageFinished, when
+                    // the page URL has committed. The bridge's isExpectedOrigin()
+                    // check reads a @Volatile flag set here (on the UI thread),
+                    // not WebView.getUrl() — getUrl() must be called on the UI
+                    // thread but bridge methods run on a Chromium internal thread.
+                    wv.webViewClient = object : android.webkit.WebViewClient() {
+                        override fun onPageFinished(view: WebView?, url: String?) {
+                            bridge.originCommitted = true
+                            val json = gson.toJson(FirewallConfig.toJson())
+                            view?.evaluateJavascript(
+                                "window.vdeFirewallInit?.($json)", null
+                            )
+                        }
+                    }
+
+                    firewallDialogActive = true
+                    dialog.show()
+                    wv.loadUrl("file:///android_asset/firewall_editor.html")
+                } catch (e: Throwable) {
+                    firewallDialogActive = false
+                    if (com.nin0dev.vendroid.BuildConfig.DEBUG) {
+                        android.util.Log.e("Vendroid", "openFirewallEditor inner failed", e)
+                    }
+                }
+            }
+        } catch (e: Throwable) {
+            if (com.nin0dev.vendroid.BuildConfig.DEBUG) {
+                android.util.Log.e("Vendroid", "openFirewallEditor outer failed", e)
+            }
+        }
+    }
+
+    private class FirewallEditorBridge(
+        private val activity: MainActivity,
+        private val editorWebView: WebView,
+        private val dialog: android.app.Dialog
+    ) {
+        @Volatile var originCommitted = false
+        @Volatile private var lastError: String? = null
+
+        private fun isExpectedOrigin(): Boolean = originCommitted
+
+        @android.webkit.JavascriptInterface
+        fun close() {
+            try {
+                if (!isExpectedOrigin()) return
+                if (dialog.isShowing) dialog.dismiss()
+            } catch (t: Throwable) {
+                lastError = "close: ${t.message}"
+            }
+        }
+
+        @android.webkit.JavascriptInterface
+        fun getFirewallConfig(): String {
+            try {
+                if (!isExpectedOrigin()) return "{\"error\":\"origin\"}"
+                return FirewallConfig.toJson()
+            } catch (t: Throwable) {
+                lastError = "getFirewallConfig: ${t.javaClass.name}: ${t.message}"
+                return "{\"categories\":[],\"customDomains\":[],\"error\":\"$lastError\"}"
+            }
+        }
+
+        @android.webkit.JavascriptInterface
+        fun saveFirewallConfig(json: String): Boolean {
+            try {
+                if (!isExpectedOrigin()) return false
+                val ok = FirewallConfig.fromJsonAndSave(json)
+                if (ok) {
+                    activity.runOnUiThread {
+                        android.widget.Toast.makeText(
+                            activity, "Firewall saved", android.widget.Toast.LENGTH_SHORT
+                        ).show()
+                    }
+                }
+                return ok
+            } catch (t: Throwable) {
+                lastError = "saveFirewallConfig: ${t.message}"
+                return false
+            }
+        }
+
+        @android.webkit.JavascriptInterface
+        fun resetFirewallConfig() {
+            try {
+                if (!isExpectedOrigin()) return
+                FirewallConfig.resetToDefaults()
+                activity.runOnUiThread {
+                    android.widget.Toast.makeText(
+                        activity, "Firewall reset to defaults", android.widget.Toast.LENGTH_SHORT
+                    ).show()
+                }
+            } catch (t: Throwable) {
+                lastError = "resetFirewallConfig: ${t.message}"
+            }
         }
     }
 }

@@ -12,7 +12,9 @@ import android.webkit.WebView
 import android.webkit.WebViewClient
 import androidx.annotation.RequiresApi
 import com.nin0dev.vendroid.utils.Constants
+import com.nin0dev.vendroid.utils.FirewallConfig
 import com.nin0dev.vendroid.utils.JsPatches
+import com.nin0dev.vendroid.utils.VDELog
 import java.io.ByteArrayInputStream
 import java.util.concurrent.ConcurrentHashMap
 import java.lang.ref.WeakReference
@@ -24,6 +26,7 @@ class VWebviewClient(
 ) : WebViewClient() {
     private val appContext: Context = context.applicationContext
     private val activityRef: WeakReference<Activity> = if (context is Activity) WeakReference(context) else WeakReference(null)
+    private val linkHandler: LinkHandler = LinkHandler(context)
 
     private class CachedResponse(
         val statusCode: Int,
@@ -44,13 +47,16 @@ class VWebviewClient(
         if (scheme == "about") {
             return false
         }
-        if (scheme == "http") {
-            return true
-        }
         val host = url.host
+        // Whitelisted hosts (Discord, GitHub, etc.) load inside the WebView.
         if (host != null && Constants.isAllowedDomain(host)) {
             return false
         }
+        // Non-allowlisted links go to the link popup (Copy / Open / Share /
+        // Cancel). Returning true cancels in-WebView navigation and prevents the
+        // click from bubbling up to Discord, which would treat it as a message tap.
+        VDELog.d("WV", "External link: $url")
+        linkHandler.showLinkPopup(url)
         return true
     }
 
@@ -69,6 +75,7 @@ class VWebviewClient(
             it.currentUrlForBridge = url
             it.currentHostForBridge = Uri.parse(url).host
         }
+        VDELog.i("WV", "Page started: $url")
 
         // If shouldInterceptRequest already embedded the firewall JS into the
         // HTML for this URL, we can skip the evaluateJavascript entirely —
@@ -82,6 +89,12 @@ class VWebviewClient(
 
         view.evaluateJavascript("typeof Vencord!=='undefined'&&typeof VencordMobile!=='undefined'") { result ->
             if (result?.trim() == "true") return@evaluateJavascript
+            // Only inject the Vencord runtimes on Discord pages. The runtimes
+            // hook webpack and patch globals designed for Discord; running them
+            // on whitelisted non-Discord pages (github.com, *.github.io, etc.)
+            // is unnecessary and exposes the bridge object to third-party pages.
+            val host = Uri.parse(url).host ?: ""
+            if (!Constants.isDiscordDomain(host)) return@evaluateJavascript
             val runtime = HttpClient.VencordRuntime
             val mobileRuntime = HttpClient.VencordMobileRuntime
             if (runtime != null && mobileRuntime != null) {
@@ -102,6 +115,7 @@ class VWebviewClient(
             it.currentUrlForBridge = url
             it.currentHostForBridge = Uri.parse(url).host
         }
+        VDELog.d("WV", "Page finished: $url")
 
         if (activity != null && !activity.isFinishing && !activity.isDestroyed) {
             (activity as? com.nin0dev.vendroid.MainActivity)?.scheduleLoadingScreenDismiss(500)
@@ -119,14 +133,25 @@ class VWebviewClient(
 
     @RequiresApi(Build.VERSION_CODES.N)
     override fun shouldInterceptRequest(view: WebView, req: WebResourceRequest): WebResourceResponse? {
+        // Restrict to browser/inline schemes. data:, file:, intent:, and
+        // custom schemes have a null host and would otherwise bypass the
+        // domain allowlist below. blob: is needed for Discord media; data:
+        // for embedded images/CSS.
+        val scheme = req.url.scheme
+        if (scheme != "https" && scheme != "http" && scheme != "blob" && scheme != "data") {
+            return WebResourceResponse("text/plain", "utf-8", 204, "No Content", emptyMap(), java.io.ByteArrayInputStream(ByteArray(0)))
+        }
         val host = req.url.host
         if (host != null && !Constants.isAllowedDomain(host)) {
             // Block non-whitelisted subresources (scripts, images, XHR, media, etc.)
             return WebResourceResponse("text/plain", "utf-8", 204, "No Content", emptyMap(), java.io.ByteArrayInputStream(ByteArray(0)))
         }
-        if (req.url.scheme == "http") {
+        if (scheme == "http") {
             return WebResourceResponse("text/plain", "utf-8", 204, "No Content", emptyMap(), java.io.ByteArrayInputStream(ByteArray(0)))
         }
+        // Privacy: block Discord telemetry, Sentry, and fingerprinting before
+        // the CSP-stripping/fetch path so they never reach the network.
+        shouldBlockForPrivacy(host, req.url.path)?.let { return it }
         if (!shouldInterceptForCspStripping(req)) return null
         val urlString = req.url.toString()
         val isCss = req.url.path?.endsWith(".css") == true
@@ -188,14 +213,15 @@ class VWebviewClient(
     }
 
     private val FORGE_HOSTS_EXACT = hashSetOf(
-        "github.com", "raw.githubusercontent.com", "codeberg.org"
+        "github.com", "raw.githubusercontent.com", "codeberg.org",
+        "githack.com", "raw.githack.com", "cdn.githack.com", "cbcdn.githack.com"
     )
 
     private val forgeHostCache = ConcurrentHashMap<String, Boolean>()
 
     private fun isForgeHost(host: String): Boolean =
         forgeHostCache.computeIfAbsent(host) { h ->
-            h in FORGE_HOSTS_EXACT || h.endsWith(".github.io") || h.endsWith(".codeberg.page")
+            h in FORGE_HOSTS_EXACT || h.endsWith(".github.io") || h.endsWith(".codeberg.page") || h.endsWith(".githack.com")
         } ?: false
 
     private fun shouldInterceptForCspStripping(req: WebResourceRequest): Boolean {
@@ -293,6 +319,7 @@ class VWebviewClient(
                         // firewall so onPageStarted can skip re-injecting it.
                         if (firewallEmbeddedUrls.size < MAX_FIREWALL_TRACKED) {
                             firewallEmbeddedUrls.add(urlString)
+                            VDELog.i("WV", "Embedded firewall JS: $host (${FirewallConfig.jsAllowedHosts().size} hosts)")
                         }
                     }
                 } catch (_: Exception) {}
@@ -345,5 +372,54 @@ class VWebviewClient(
         // saving one IPC round-trip.  Capped at 16 entries to bound memory.
         private val firewallEmbeddedUrls = ConcurrentHashMap.newKeySet<String>()
         private const val MAX_FIREWALL_TRACKED = 16
+
+        // Privacy filter — blocks Discord telemetry, Sentry, fingerprinting,
+        // and (optionally) typing indicators at the path level. Shared by
+        // VWebviewClient.shouldInterceptRequest and the Service Worker client
+        // in MainActivity so SW-fetched requests can't bypass it.
+
+        @Volatile
+        private var blockTypingIndicator = false
+
+        private val SENTRY_PATTERN = Regex("^/assets/sentry\\.[^/]+\\.js$")
+
+        /** Update the typing indicator block. Called at startup and on toggle. */
+        fun updateTypingBlock(block: Boolean) {
+            blockTypingIndicator = block
+        }
+
+        /**
+         * Returns a blocking [WebResourceResponse] if the request matches a
+         * privacy filter, or null to allow. Always blocks telemetry (/science,
+         * /track), Sentry SDK, and fingerprinting (/api.js, /cdn-cgi/). Blocks
+         * typing indicators only if [blockTypingIndicator] is true.
+         *
+         * A fresh [WebResourceResponse] is allocated per call to match the
+         * existing host-block pattern and avoid relying on Chromium
+         * stream-reuse semantics.
+         */
+        fun shouldBlockForPrivacy(host: String?, path: String?): WebResourceResponse? {
+            if (host == null || path.isNullOrEmpty()) return null
+            if (!Constants.isDiscordDomain(host)) return null
+            return when {
+                path.endsWith("/science") || path.endsWith("/track") -> {
+                    VDELog.d("WV", "Blocked telemetry: $path")
+                    WebResourceResponse("text/plain", "utf-8", 204, "No Content", emptyMap(), java.io.ByteArrayInputStream(ByteArray(0)))
+                }
+                path.endsWith("/api.js") || path.startsWith("/cdn-cgi/") -> {
+                    VDELog.d("WV", "Blocked fingerprinting: $path")
+                    WebResourceResponse("text/plain", "utf-8", 204, "No Content", emptyMap(), java.io.ByteArrayInputStream(ByteArray(0)))
+                }
+                SENTRY_PATTERN.matches(path) -> {
+                    VDELog.d("WV", "Blocked Sentry SDK: $path")
+                    WebResourceResponse("text/plain", "utf-8", 204, "No Content", emptyMap(), java.io.ByteArrayInputStream(ByteArray(0)))
+                }
+                blockTypingIndicator && path.endsWith("/typing") -> {
+                    VDELog.d("WV", "Blocked typing indicator: $path")
+                    WebResourceResponse("text/plain", "utf-8", 204, "No Content", emptyMap(), java.io.ByteArrayInputStream(ByteArray(0)))
+                }
+                else -> null
+            }
+        }
     }
 }

@@ -38,7 +38,7 @@
                     currentPush = fn;
                     if (typeof fn === 'function' && !_vendroidJsonpCallback) {
                         _vendroidJsonpCallback = fn;
-                        console.log("[Vendroid] Captured push override #" + overrideCount + ": " + fn.toString().substring(0, 80));
+                        console.warn("[Vendroid] Captured push override #" + overrideCount + ": " + fn.toString().substring(0, 80));
                         setTimeout(vendroidTryCaptureWreq, 50);
                     }
                 },
@@ -67,12 +67,12 @@
         try {
             _vendroidJsonpCallback(fakeChunk);
         } catch(e) {
-            if (_vendroidCaptureAttempts <= 3) console.log("[Vendroid] Fake chunk error: " + e.message);
+            if (_vendroidCaptureAttempts <= 3) console.warn("[Vendroid] Fake chunk error: " + e.message);
         }
 
         if (captured && typeof captured === "function" && captured.c) {
             _vendroidCapturedWreq = captured;
-            console.log("[Vendroid] Captured __webpack_require__ from fake chunk!");
+            console.warn("[Vendroid] Captured __webpack_require__ from fake chunk!");
             vendroidCallInitWebpack();
         } else if (captured && typeof captured === "object") {
             var found = null;
@@ -85,16 +85,16 @@
             } catch(e) {}
             if (found) {
                 _vendroidCapturedWreq = found;
-                console.log("[Vendroid] Captured __webpack_require__ from object wrapper!");
+                console.warn("[Vendroid] Captured __webpack_require__ from object wrapper!");
                 vendroidCallInitWebpack();
             } else {
-                if (_vendroidCaptureAttempts <= 3) console.log("[Vendroid] Fake chunk captured object but no wreq inside (keys=" + (captured ? Object.keys(captured).length : 0) + ")");
+                if (_vendroidCaptureAttempts <= 3) console.warn("[Vendroid] Fake chunk captured object but no wreq inside (keys=" + (captured ? Object.keys(captured).length : 0) + ")");
                 if (!_vendroidCapturedWreq) {
                     setTimeout(vendroidTryCaptureWreq, 500);
                 }
             }
         } else {
-            if (_vendroidCaptureAttempts <= 3) console.log("[Vendroid] Fake chunk did not capture __webpack_require__ (type=" + typeof captured + ", hasC=" + !!(captured && captured.c) + ")");
+            if (_vendroidCaptureAttempts <= 3) console.warn("[Vendroid] Fake chunk did not capture __webpack_require__ (type=" + typeof captured + ", hasC=" + !!(captured && captured.c) + ")");
             if (!_vendroidCapturedWreq) {
                 setTimeout(vendroidTryCaptureWreq, 500);
             }
@@ -107,12 +107,12 @@
             try {
                 if (typeof Vencord !== "undefined" && Vencord.Webpack) {
                     if (Vencord.Webpack.wreq) {
-                        console.log("[Vendroid] wreq already set, skipping _initWebpack");
+                        console.warn("[Vendroid] wreq already set, skipping _initWebpack");
                         return;
                     }
                     if (typeof Vencord.Webpack._initWebpack === "function") {
                         Vencord.Webpack._initWebpack(_vendroidCapturedWreq);
-                        console.log("[Vendroid] _initWebpack called! wreq=" + typeof Vencord.Webpack.wreq + " cache=" + typeof Vencord.Webpack.cache);
+                        console.warn("[Vendroid] _initWebpack called! wreq=" + typeof Vencord.Webpack.wreq + " cache=" + typeof Vencord.Webpack.cache);
                         // Immediately try to advance to plugins stage — no need to wait for the poll
                         tryAdvanceInit();
                         return;
@@ -147,15 +147,15 @@
         } catch(e) {}
         if (captured && typeof captured === "function" && captured.c) {
             _vendroidCapturedWreq = captured;
-            console.log("[Vendroid] Captured __webpack_require__ via direct push!");
+            console.warn("[Vendroid] Captured __webpack_require__ via direct push!");
             vendroidCallInitWebpack();
             return true;
         }
         return false;
     }
 
-    console.log("[Vendroid] vencord_mobile.js loaded");
-    console.log("[Vendroid] Early state: chunkArr=" + (window.webpackChunkdiscord_app ? "exists len=" + window.webpackChunkdiscord_app.length + " push=" + window.webpackChunkdiscord_app.push.toString().substring(0, 80) : "MISSING"));
+    console.warn("[Vendroid] vencord_mobile.js loaded");
+    console.warn("[Vendroid] Early state: chunkArr=" + (window.webpackChunkdiscord_app ? "exists len=" + window.webpackChunkdiscord_app.length + " push=" + window.webpackChunkdiscord_app.push.toString().substring(0, 80) : "MISSING"));
 
     function getModalEscapeHandler() {
         try {
@@ -172,9 +172,9 @@
     try {
         ModalEscapeHandler = getModalEscapeHandler();
         if (ModalEscapeHandler) {
-            console.log("[Vendroid] ModalEscapeHandler found");
+            console.warn("[Vendroid] ModalEscapeHandler found");
         } else {
-            console.log("[Vendroid] ModalEscapeHandler not ready yet");
+            console.warn("[Vendroid] ModalEscapeHandler not ready yet");
         }
     } catch(e) {
         console.error("[Vendroid] ModalEscapeHandler FAILED: " + e.message);
@@ -193,12 +193,12 @@
             const plugins = Vencord.Plugins.plugins;
             const total = Object.keys(plugins).length;
             const enabled = Object.values(plugins).filter(p => Vencord.Plugins.isPluginEnabled(p.name)).length;
-            console.log("[Vendroid] Plugin state: " + enabled + "/" + total + " enabled");
+            console.warn("[Vendroid] Plugin state: " + enabled + "/" + total + " enabled");
 
             const disabledRequired = Object.values(plugins).filter(p =>
                 (p.required || p.enabledByDefault) && !Vencord.Plugins.isPluginEnabled(p.name)
             );
-            console.log("[Vendroid] " + disabledRequired.length + " required/default plugins are disabled");
+            console.warn("[Vendroid] " + disabledRequired.length + " required/default plugins are disabled");
             let successCount = 0;
             if (disabledRequired.length > 0) {
                 for (const p of disabledRequired) {
@@ -212,14 +212,14 @@
                             try { Vencord.Plugins.startDependenciesRecursive(p); } catch(e) {}
                             Vencord.Plugins.startPlugin(p);
                         }
-                        console.log("[Vendroid] Enabled: " + p.name + " (now=" + Vencord.Plugins.isPluginEnabled(p.name) + ",started=" + p.started + ")");
+                        console.warn("[Vendroid] Enabled: " + p.name + " (now=" + Vencord.Plugins.isPluginEnabled(p.name) + ",started=" + p.started + ")");
                         successCount++;
                     } catch(e) {
                         console.error("[Vendroid] Failed to enable " + p.name + ": " + e.message);
                     }
                 }
             }
-            console.log("[Vendroid] Recovery result: " + successCount + "/" + disabledRequired.length + " enabled");
+            console.warn("[Vendroid] Recovery result: " + successCount + "/" + disabledRequired.length + " enabled");
             return disabledRequired.length - successCount;
         } catch(e) {
             console.error("[Vendroid] recoverPlugins error: " + e.message);
@@ -235,13 +235,13 @@
                     stages[p.startAt] = (stages[p.startAt] || 0) + 1;
                 }
             });
-            console.log("[Vendroid] Plugin startAt distribution: " + JSON.stringify(stages));
+            console.warn("[Vendroid] Plugin startAt distribution: " + JSON.stringify(stages));
 
             var keys = Object.keys(stages);
             for (var i = 0; i < keys.length; i++) {
                 try {
                     Vencord.Plugins.startAllPlugins(keys[i]);
-                    console.log("[Vendroid] Called startAllPlugins(" + JSON.stringify(keys[i]) + ")");
+                    console.warn("[Vendroid] Called startAllPlugins(" + JSON.stringify(keys[i]) + ")");
                 } catch(e) {
                     console.error("[Vendroid] startAllPlugins(" + JSON.stringify(keys[i]) + ") failed: " + e.message);
                 }
@@ -274,7 +274,7 @@
                         var val = obj[keys[k]];
                         if (typeof val === "function" && val.c && typeof val.c === "object" &&
                             (val.m !== undefined || val.d !== undefined)) {
-                            console.log("[Vendroid] Found __webpack_require__ candidate at " + keys[k]);
+                            console.warn("[Vendroid] Found __webpack_require__ candidate at " + keys[k]);
                             return val;
                         }
                     } catch(e) {}
@@ -304,7 +304,7 @@
                                 return {};
                             });
                             if (captured && typeof captured === "function" && captured.c) {
-                                console.log("[Vendroid] Extracted __webpack_require__ from chunk " + i + " module " + mkeys[j]);
+                                console.warn("[Vendroid] Extracted __webpack_require__ from chunk " + i + " module " + mkeys[j]);
                                 return captured;
                             }
                         } catch(e) {}
@@ -319,7 +319,7 @@
 
     function tryInitWebpack() {
         if (Vencord.Webpack.wreq) {
-            console.log("[Vendroid] wreq already set, skipping manual init");
+            console.warn("[Vendroid] wreq already set, skipping manual init");
             return true;
         }
 
@@ -327,7 +327,7 @@
             try {
                 if (typeof Vencord.Webpack._initWebpack === "function") {
                     Vencord.Webpack._initWebpack(_vendroidCapturedWreq);
-                    console.log("[Vendroid] _initWebpack called from captured wreq, wreq=" + typeof Vencord.Webpack.wreq);
+                    console.warn("[Vendroid] _initWebpack called from captured wreq, wreq=" + typeof Vencord.Webpack.wreq);
                     if (Vencord.Webpack.wreq) return true;
                 }
             } catch(e) {
@@ -339,7 +339,7 @@
         if (wreq && typeof Vencord.Webpack._initWebpack === "function") {
             try {
                 Vencord.Webpack._initWebpack(wreq);
-                console.log("[Vendroid] _initWebpack called, wreq=" + typeof Vencord.Webpack.wreq + " cache=" + typeof Vencord.Webpack.cache);
+                console.warn("[Vendroid] _initWebpack called, wreq=" + typeof Vencord.Webpack.wreq + " cache=" + typeof Vencord.Webpack.cache);
                 if (Vencord.Webpack.wreq) return true;
             } catch(e) {
                 console.error("[Vendroid] _initWebpack failed: " + e.message);
@@ -369,17 +369,413 @@
         return null;
     }
 
+    var _vendroidLogsPoll = null;
+
+    // Injects a "View logs" row into the VendroidEnhanced Settings tab.
+    //
+    // The plugin renders, per section in settings/settings.tsx:
+    //     <div className={cl("settings-tab")} />
+    //     <section title={section}> ...rows... </section>
+    // cl("settings-tab") → class "vde-settings-tab", the reliable signal
+    // that the Settings tab is mounted.
+    //
+    // The tab mounts/unmounts on navigation, destroying the injected row
+    // each time. We poll every 750ms and (re)inject when .vde-settings-tab
+    // is present and the row is missing — one querySelector per tick, only
+    // while the tab is open.
+    function setupLogsButton() {
+        if (_vendroidLogsPoll) return;
+        try {
+            _vendroidLogsPoll = setInterval(injectLogsRowIfMissing, 750);
+            injectLogsRowIfMissing(); // immediate try in case tab is open
+        } catch(e) {
+            console.error('[Vendroid] setupLogsButton error: ' + e.message);
+        }
+    }
+
+    function injectLogsRowIfMissing() {
+        try {
+            // .vde-settings-tab exists only when the Settings tab is mounted.
+            // The plugin renders one per section; append into the last so the
+            // row lands at the bottom, next to "Other > Developer settings".
+            var tabContainers = document.querySelectorAll('.vde-settings-tab');
+            if (!tabContainers || tabContainers.length === 0) return;
+
+            // Markup is <div class="vde-settings-tab"></div><section>…</section>;
+            // the row belongs inside a <section>, so find the last <section>
+            // after the last vde-settings-tab.
+            var lastTab = tabContainers[tabContainers.length - 1];
+            var section = lastTab.parentElement && lastTab.parentElement.querySelector('section:last-of-type');
+            if (!section) {
+                // Fallback: use the last tab container itself.
+                section = lastTab;
+            }
+
+            if (section.querySelector('[data-vde-logs-btn]')) return;
+
+            var wrap = document.createElement('div');
+            wrap.setAttribute('data-vde-logs-btn', '1');
+            wrap.style.cssText = 'margin-top:20px;width:100%;';
+
+            var title = document.createElement('div');
+            title.className = 'vde-component-setting-title';
+            title.style.cssText = 'color:var(--header-primary);margin-bottom:8px;font-weight:600;';
+            title.textContent = 'View logs';
+            wrap.appendChild(title);
+
+            var desc = document.createElement('div');
+            desc.className = 'vde-component-setting-description';
+            desc.style.cssText = 'color:var(--text-muted);margin-bottom:10px;';
+            desc.textContent = 'Open the VendroidEnhanced in-app log viewer. Useful for debugging patching, injection, or loading issues.';
+            wrap.appendChild(desc);
+
+            var btn = document.createElement('button');
+            btn.type = 'button';
+            btn.textContent = 'View logs';
+            btn.style.cssText = 'display:inline-flex;align-items:center;justify-content:center;padding:8px 16px;background:var(--brand-primary,#5865f2);color:#fff;border:none;border-radius:8px;font-size:14px;font-weight:600;cursor:pointer;-webkit-tap-highlight-color:transparent;';
+            btn.addEventListener('click', function() {
+                try { VencordMobileNative.openLogs(); } catch(e) {
+                    console.error('[Vendroid] openLogs failed: ' + e.message);
+                }
+            });
+            wrap.appendChild(btn);
+
+            var divider = document.createElement('div');
+            divider.className = 'vde-divider-setting';
+            divider.style.cssText = 'width:100%;height:1px;border-top:thin solid var(--background-modifier-accent);margin-top:20px;margin-bottom:20px;';
+            wrap.appendChild(divider);
+
+            section.appendChild(wrap);
+            console.warn('[Vendroid] Logs row injected into VendroidEnhanced settings');
+        } catch(e) {
+            console.error('[Vendroid] injectLogsRowIfMissing error: ' + e.message);
+        }
+    }
+
+    var _vendroidFirewallPoll = null;
+
+    // Injects a "Firewall" row into the VendroidEnhanced Settings tab.
+    // Uses the same polling/idempotency pattern as injectLogsRowIfMissing,
+    // with its own interval handle so the two injectors are independent.
+    function setupFirewallButton() {
+        if (_vendroidFirewallPoll) return;
+        try {
+            _vendroidFirewallPoll = setInterval(injectFirewallRowIfMissing, 750);
+            injectFirewallRowIfMissing(); // immediate try in case tab is open
+        } catch(e) {
+            console.error('[Vendroid] setupFirewallButton error: ' + e.message);
+        }
+    }
+
+    function injectFirewallRowIfMissing() {
+        try {
+            var tabContainers = document.querySelectorAll('.vde-settings-tab');
+            if (!tabContainers || tabContainers.length === 0) return;
+
+            var lastTab = tabContainers[tabContainers.length - 1];
+            var section = lastTab.parentElement && lastTab.parentElement.querySelector('section:last-of-type');
+            if (!section) {
+                // Fallback: use the last tab container itself.
+                section = lastTab;
+            }
+
+            if (section.querySelector('[data-vde-firewall-btn]')) return;
+
+            var wrap = document.createElement('div');
+            wrap.setAttribute('data-vde-firewall-btn', '1');
+            wrap.style.cssText = 'margin-top:20px;width:100%;';
+
+            var title = document.createElement('div');
+            title.className = 'vde-component-setting-title';
+            title.style.cssText = 'color:var(--header-primary);margin-bottom:8px;font-weight:600;';
+            title.textContent = 'Firewall';
+            wrap.appendChild(title);
+
+            var desc = document.createElement('div');
+            desc.className = 'vde-component-setting-description';
+            desc.style.cssText = 'color:var(--text-muted);margin-bottom:10px;';
+            desc.textContent = 'Edit the domain allowlist that controls which hosts the WebView and in-page JS can contact.';
+            wrap.appendChild(desc);
+
+            var btn = document.createElement('button');
+            btn.type = 'button';
+            btn.textContent = 'Open firewall editor';
+            btn.style.cssText = 'display:inline-flex;align-items:center;justify-content:center;padding:8px 16px;background:var(--brand-primary,#5865f2);color:#fff;border:none;border-radius:8px;font-size:14px;font-weight:600;cursor:pointer;-webkit-tap-highlight-color:transparent;';
+            btn.addEventListener('click', function() {
+                try { VencordMobileNative.openFirewallEditor(); } catch(e) {
+                    console.error('[Vendroid] openFirewallEditor failed: ' + e.message);
+                }
+            });
+            wrap.appendChild(btn);
+
+            var divider = document.createElement('div');
+            divider.className = 'vde-divider-setting';
+            divider.style.cssText = 'width:100%;height:1px;border-top:thin solid var(--background-modifier-accent);margin-top:20px;margin-bottom:20px;';
+            wrap.appendChild(divider);
+
+            section.appendChild(wrap);
+            console.warn('[Vendroid] Firewall row injected into VendroidEnhanced settings');
+        } catch(e) {
+            console.error('[Vendroid] injectFirewallRowIfMissing error: ' + e.message);
+        }
+    }
+
+    var _vendroidPrivacyPoll = null;
+
+    // Injects a "Block typing indicator" toggle into the VendroidEnhanced
+    // Settings tab. Same polling/idempotency pattern as the logs and firewall
+    // injectors, with its own interval handle.
+    function setupPrivacyToggle() {
+        if (_vendroidPrivacyPoll) return;
+        try {
+            _vendroidPrivacyPoll = setInterval(injectPrivacyToggleIfMissing, 750);
+            injectPrivacyToggleIfMissing(); // immediate try in case tab is open
+        } catch(e) {
+            console.error('[Vendroid] setupPrivacyToggle error: ' + e.message);
+        }
+    }
+
+    function injectPrivacyToggleIfMissing() {
+        try {
+            var tabContainers = document.querySelectorAll('.vde-settings-tab');
+            if (!tabContainers || tabContainers.length === 0) return;
+
+            var lastTab = tabContainers[tabContainers.length - 1];
+            var section = lastTab.parentElement && lastTab.parentElement.querySelector('section:last-of-type');
+            if (!section) {
+                section = lastTab;
+            }
+
+            if (section.querySelector('[data-vde-privacy-toggle]')) return;
+
+            var wrap = document.createElement('div');
+            wrap.setAttribute('data-vde-privacy-toggle', '1');
+            wrap.style.cssText = 'margin-top:20px;width:100%;';
+
+            var title = document.createElement('div');
+            title.className = 'vde-component-setting-title';
+            title.style.cssText = 'color:var(--header-primary);margin-bottom:8px;font-weight:600;';
+            title.textContent = 'Privacy';
+            wrap.appendChild(title);
+
+            var row = document.createElement('div');
+            row.style.cssText = 'display:flex;align-items:center;justify-content:space-between;gap:12px;';
+
+            var labelCol = document.createElement('div');
+            labelCol.style.cssText = 'flex:1 1 auto;';
+
+            var label = document.createElement('div');
+            label.style.cssText = 'color:var(--header-primary);font-size:14px;font-weight:500;';
+            label.textContent = 'Block typing indicator';
+            labelCol.appendChild(label);
+
+            var desc = document.createElement('div');
+            desc.className = 'vde-component-setting-description';
+            desc.style.cssText = 'color:var(--text-muted);margin-top:4px;font-size:12px;';
+            desc.textContent = 'Prevent Discord from sending typing indicators. Telemetry, Sentry, and fingerprinting are always blocked.';
+            labelCol.appendChild(desc);
+
+            row.appendChild(labelCol);
+
+            var sw = document.createElement('label');
+            sw.style.cssText = 'position:relative;width:44px;height:24px;flex:none;cursor:pointer;';
+            var cb = document.createElement('input');
+            cb.type = 'checkbox';
+            cb.style.cssText = 'opacity:0;width:0;height:0;position:absolute;';
+            var sl = document.createElement('span');
+            sl.style.cssText = 'position:absolute;inset:0;background:var(--background-modifier-accent,#36393f);border-radius:24px;transition:background .2s;';
+            var knob = document.createElement('span');
+            knob.style.cssText = 'position:absolute;width:18px;height:18px;left:3px;top:3px;background:#fff;border-radius:50%;transition:transform .2s;';
+            sl.appendChild(knob);
+            sw.appendChild(cb);
+            sw.appendChild(sl);
+            row.appendChild(sw);
+
+            var checked = false;
+            try {
+                checked = VencordMobileNative.getBool('vendroid_blockTypingIndicator', false);
+            } catch(e) {
+                console.error('[Vendroid] getBool for typing toggle failed: ' + e.message);
+            }
+            cb.checked = checked;
+            if (checked) {
+                sl.style.background = 'var(--brand-primary,#5865f2)';
+                knob.style.transform = 'translateX(20px)';
+            }
+
+            // setBool can early-return silently (strict-domain gate, rate
+            // limiter, key allowlist) without throwing, so re-read the
+            // persisted value and reconcile the UI to the actual state.
+            cb.addEventListener('change', function() {
+                try {
+                    VencordMobileNative.setBool('vendroid_blockTypingIndicator', cb.checked);
+                    var persisted = VencordMobileNative.getBool('vendroid_blockTypingIndicator', false);
+                    if (persisted !== cb.checked) {
+                        cb.checked = persisted;
+                    }
+                    if (cb.checked) {
+                        sl.style.background = 'var(--brand-primary,#5865f2)';
+                        knob.style.transform = 'translateX(20px)';
+                    } else {
+                        sl.style.background = 'var(--background-modifier-accent,#36393f)';
+                        knob.style.transform = 'translateX(0)';
+                    }
+                } catch(e) {
+                    console.error('[Vendroid] setBool for typing toggle failed: ' + e.message);
+                    cb.checked = !cb.checked;
+                    if (cb.checked) {
+                        sl.style.background = 'var(--brand-primary,#5865f2)';
+                        knob.style.transform = 'translateX(20px)';
+                    } else {
+                        sl.style.background = 'var(--background-modifier-accent,#36393f)';
+                        knob.style.transform = 'translateX(0)';
+                    }
+                }
+            });
+
+            wrap.appendChild(row);
+
+            var divider = document.createElement('div');
+            divider.className = 'vde-divider-setting';
+            divider.style.cssText = 'width:100%;height:1px;border-top:thin solid var(--background-modifier-accent);margin-top:20px;margin-bottom:20px;';
+            wrap.appendChild(divider);
+
+            section.appendChild(wrap);
+            console.warn('[Vendroid] Privacy toggle injected into VendroidEnhanced settings');
+        } catch(e) {
+            console.error('[Vendroid] injectPrivacyToggleIfMissing error: ' + e.message);
+        }
+    }
+
+    var _vendroidLinkConfirmPoll = null;
+
+    // Injects a "Confirm external links" toggle into the VendroidEnhanced
+    // Settings tab. Same polling/idempotency pattern as the privacy toggle.
+    function setupLinkConfirmToggle() {
+        if (_vendroidLinkConfirmPoll) return;
+        try {
+            _vendroidLinkConfirmPoll = setInterval(injectLinkConfirmToggleIfMissing, 750);
+            injectLinkConfirmToggleIfMissing(); // immediate try in case tab is open
+        } catch(e) {
+            console.error('[Vendroid] setupLinkConfirmToggle error: ' + e.message);
+        }
+    }
+
+    function injectLinkConfirmToggleIfMissing() {
+        try {
+            var tabContainers = document.querySelectorAll('.vde-settings-tab');
+            if (!tabContainers || tabContainers.length === 0) return;
+
+            var lastTab = tabContainers[tabContainers.length - 1];
+            var section = lastTab.parentElement && lastTab.parentElement.querySelector('section:last-of-type');
+            if (!section) {
+                section = lastTab;
+            }
+
+            if (section.querySelector('[data-vde-link-confirm-toggle]')) return;
+
+            var wrap = document.createElement('div');
+            wrap.setAttribute('data-vde-link-confirm-toggle', '1');
+            wrap.style.cssText = 'margin-top:20px;width:100%;';
+
+            var row = document.createElement('div');
+            row.style.cssText = 'display:flex;align-items:center;justify-content:space-between;gap:12px;';
+
+            var labelCol = document.createElement('div');
+            labelCol.style.cssText = 'flex:1 1 auto;';
+
+            var label = document.createElement('div');
+            label.style.cssText = 'color:var(--header-primary);font-size:14px;font-weight:500;';
+            label.textContent = 'Confirm external links';
+            labelCol.appendChild(label);
+
+            var desc = document.createElement('div');
+            desc.className = 'vde-component-setting-description';
+            desc.style.cssText = 'color:var(--text-muted);margin-top:4px;font-size:12px;';
+            desc.textContent = 'Show a Copy / Open / Share prompt when tapping a link that would leave Discord.';
+            labelCol.appendChild(desc);
+
+            row.appendChild(labelCol);
+
+            var sw = document.createElement('label');
+            sw.style.cssText = 'position:relative;width:44px;height:24px;flex:none;cursor:pointer;';
+            var cb = document.createElement('input');
+            cb.type = 'checkbox';
+            cb.style.cssText = 'opacity:0;width:0;height:0;position:absolute;';
+            var sl = document.createElement('span');
+            sl.style.cssText = 'position:absolute;inset:0;background:var(--background-modifier-accent,#36393f);border-radius:24px;transition:background .2s;';
+            var knob = document.createElement('span');
+            knob.style.cssText = 'position:absolute;width:18px;height:18px;left:3px;top:3px;background:#fff;border-radius:50%;transition:transform .2s;';
+            sl.appendChild(knob);
+            sw.appendChild(cb);
+            sw.appendChild(sl);
+            row.appendChild(sw);
+
+            // Default ON; matches the SharedPreferences default in MainActivity.
+            var checked = true;
+            try {
+                checked = VencordMobileNative.getBool('vendroid_confirmExternalLinks', true);
+            } catch(e) {
+                console.error('[Vendroid] getBool for link-confirm toggle failed: ' + e.message);
+            }
+            cb.checked = checked;
+            if (checked) {
+                sl.style.background = 'var(--brand-primary,#5865f2)';
+                knob.style.transform = 'translateX(20px)';
+            }
+
+            cb.addEventListener('change', function() {
+                try {
+                    VencordMobileNative.setBool('vendroid_confirmExternalLinks', cb.checked);
+                    var persisted = VencordMobileNative.getBool('vendroid_confirmExternalLinks', true);
+                    if (persisted !== cb.checked) {
+                        cb.checked = persisted;
+                    }
+                    if (cb.checked) {
+                        sl.style.background = 'var(--brand-primary,#5865f2)';
+                        knob.style.transform = 'translateX(20px)';
+                    } else {
+                        sl.style.background = 'var(--background-modifier-accent,#36393f)';
+                        knob.style.transform = 'translateX(0)';
+                    }
+                } catch(e) {
+                    console.error('[Vendroid] setBool for link-confirm toggle failed: ' + e.message);
+                    cb.checked = !cb.checked;
+                    if (cb.checked) {
+                        sl.style.background = 'var(--brand-primary,#5865f2)';
+                        knob.style.transform = 'translateX(20px)';
+                    } else {
+                        sl.style.background = 'var(--background-modifier-accent,#36393f)';
+                        knob.style.transform = 'translateX(0)';
+                    }
+                }
+            });
+
+            wrap.appendChild(row);
+
+            var divider = document.createElement('div');
+            divider.className = 'vde-divider-setting';
+            divider.style.cssText = 'width:100%;height:1px;border-top:thin solid var(--background-modifier-accent);margin-top:20px;margin-bottom:20px;';
+            wrap.appendChild(divider);
+
+            section.appendChild(wrap);
+            console.warn('[Vendroid] Link-confirm toggle injected into VendroidEnhanced settings');
+        } catch(e) {
+            console.error('[Vendroid] injectLinkConfirmToggleIfMissing error: ' + e.message);
+        }
+    }
+
     function doInit() {
         if (initialized) return;
         initialized = true;
-        console.log("[Vendroid] Initializing (webpack ready)");
+        console.warn("[Vendroid] Initializing (webpack ready)");
 
         var fd = findFluxDispatcher();
         if (fd) {
             try {
                 fd.subscribe("MOBILE_WEB_SIDEBAR_OPEN", () => { isSidebarOpen = true; });
                 fd.subscribe("MOBILE_WEB_SIDEBAR_CLOSE", () => { isSidebarOpen = false; });
-                console.log("[Vendroid] FluxDispatcher subscribed OK");
+                console.warn("[Vendroid] FluxDispatcher subscribed OK");
             } catch(e) {
                 console.error("[Vendroid] FluxDispatcher subscribe FAILED: " + e.message);
             }
@@ -389,63 +785,284 @@
 
         recoverPlugins();
         tryStartPluginsStage();
+        setupSlateOverride();
+        setupSlateAutocorrect();
+        setupSlateInputFix();
         setupTextCommandDispatcher();
+        setupGifPickerButton();
+        setupLogsButton();
+        setupFirewallButton();
+        setupPrivacyToggle();
+        setupLinkConfirmToggle();
 
         setTimeout(() => {
             try { VencordMobileNative.dismissLoadingScreen(); } catch(e) {}
         }, 800);
     }
 
-    // Slate editor Android backspace fix.
-    //
-    // Slate skips deleteContentBackward events with a collapsed selection,
-    // so Android WebView's native contenteditable backspace runs and desyncs
-    // Slate's model. Intercept "beforeinput" at the capture phase and call
-    // deleteBackward('character') directly, preventing the default.
-    var _vendroidSlateFixInstalled = false;
-    var _vendroidSlateRetryCount = 0;
+    // Force Slate on Android to restore the command browser. Discord disables
+    // Slate when isAndroidWeb() is true; we override the platform module so
+    // Slate is used, and setupSlateInputFix handles the resulting input issues.
+    var _vendroidSlateOverrideDone = false;
+    var _vendroidSlateOverrideRetries = 0;
 
-    function setupSlateBackspaceFix() {
-        if (_vendroidSlateFixInstalled) return;
-        // Document-level capture listener targeting [data-slate-editor]; avoids
-        // needing the element to exist at setup time and handles recreation.
+    function setupSlateOverride() {
+        if (_vendroidSlateOverrideDone) return;
         try {
-            document.addEventListener("beforeinput", function(e) {
-                // Only handle deleteContentBackward with collapsed selection
-                if (e.inputType !== "deleteContentBackward") return;
-                var target = e.target;
-                if (!target || !target.hasAttribute) return;
-                // Only target the Slate editor contenteditable
-                if (!target.hasAttribute("data-slate-editor") &&
-                    !target.closest("[data-slate-editor]")) return;
-                var sel = document.getSelection();
-                if (!sel || !sel.isCollapsed) return; // let Slate handle non-collapsed
-
-                // Find the Slate editor instance via the React fiber
-                var editor = findSlateEditorFromDOM(target);
-                if (!editor || typeof editor.deleteBackward !== "function") return;
-
-                // Call Slate's deleteBackward to keep state in sync
-                e.preventDefault();
+            if (typeof Vencord === "undefined" || !Vencord.Webpack || !Vencord.Webpack.findByProps) {
+                if (_vendroidSlateOverrideRetries++ < 300) setTimeout(setupSlateOverride, 50);
+                return;
+            }
+            var PlatformUtils = null;
+            try {
+                PlatformUtils = Vencord.Webpack.findByProps("isAndroidWeb", "isDesktop", "isIOS");
+            } catch(e) {}
+            if (!PlatformUtils || typeof PlatformUtils.isAndroidWeb !== "function") {
+                if (_vendroidSlateOverrideRetries++ < 300) setTimeout(setupSlateOverride, 50);
+                return;
+            }
+            var origResult = false;
+            try { origResult = PlatformUtils.isAndroidWeb.call(); } catch(e) {}
+            if (!origResult) {
+                _vendroidSlateOverrideDone = true;
+                return;
+            }
+            try {
+                Object.defineProperty(PlatformUtils, "isAndroidWeb", {
+                    value: function() { return false; },
+                    writable: true, configurable: true, enumerable: true
+                });
+                _vendroidSlateOverrideDone = true;
+                console.warn("[Vendroid] Slate override: isAndroidWeb → false (enables Slate + command browser)");
+            } catch(e) {
                 try {
-                    editor.deleteBackward("character");
-                } catch(err) {
-                    console.error("[Vendroid] Slate backspace fix error: " + err.message);
+                    PlatformUtils.isAndroidWeb = function() { return false; };
+                    _vendroidSlateOverrideDone = true;
+                    console.warn("[Vendroid] Slate override: isAndroidWeb → false (fallback)");
+                } catch(e2) {
+                    console.error("[Vendroid] Slate override failed: " + e2.message);
                 }
-            }, true); // capture phase — runs before Slate's own handler
-            _vendroidSlateFixInstalled = true;
-            console.log("[Vendroid] Slate backspace fix installed");
+            }
         } catch(e) {
-            console.error("[Vendroid] setupSlateBackspaceFix failed: " + e.message);
+            console.error("[Vendroid] setupSlateOverride error: " + e.message);
+            if (_vendroidSlateOverrideRetries++ < 300) setTimeout(setupSlateOverride, 50);
         }
     }
 
-    // Walk the React fiber tree from a DOM element to find the Slate editor
-    // instance (Discord's class eE receives `editor` as a prop). Walk up to
-    // 30 fibers looking for memoizedProps.editor with deleteBackward.
+    // Re-enable autocorrect on the Slate editor.  setupSlateOverride() makes
+    // Discord render its desktop editor, which sets autocorrect="off" /
+    // spellcheck="false" on the contenteditable div.  On Android WebView a
+    // contenteditable without autocorrect="on" never receives IME corrections,
+    // so suggestions appear but never apply.  A MutationObserver re-applies the
+    // attributes so React re-renders can't revert them.
+    var _vendroidAutocorrectInstalled = false;
+
+    function applyAutocorrectAttrs(el) {
+        var curAC = el.getAttribute("autocorrect");
+        var curSC = el.getAttribute("spellcheck");
+        if (curAC !== "on" || curSC !== "true") {
+            console.warn("[Vendroid] autocorrect attr fix: autocorrect=" + curAC + "→on spellcheck=" + curSC + "→true");
+        }
+        if (el.getAttribute("autocorrect") !== "on") el.setAttribute("autocorrect", "on");
+        if (el.getAttribute("spellcheck") !== "true") el.setAttribute("spellcheck", "true");
+    }
+
+    function setupSlateAutocorrect() {
+        if (_vendroidAutocorrectInstalled) return;
+        try {
+            var existing = document.querySelector("[data-slate-editor]");
+            if (existing) applyAutocorrectAttrs(existing);
+
+            var observer = new MutationObserver(function(mutations) {
+                for (var i = 0; i < mutations.length; i++) {
+                    var m = mutations[i];
+                    if (m.type === "attributes") {
+                        if (m.target.getAttribute("data-slate-editor") === "true") {
+                            applyAutocorrectAttrs(m.target);
+                        }
+                    } else if (m.type === "childList") {
+                        for (var j = 0; j < m.addedNodes.length; j++) {
+                            var node = m.addedNodes[j];
+                            if (node.nodeType !== 1) continue;
+                            if (node.getAttribute && node.getAttribute("data-slate-editor") === "true") {
+                                applyAutocorrectAttrs(node);
+                            } else if (node.querySelector) {
+                                var ed = node.querySelector("[data-slate-editor]");
+                                if (ed) applyAutocorrectAttrs(ed);
+                            }
+                        }
+                    }
+                }
+            });
+            observer.observe(document.body || document.documentElement, {
+                childList: true, subtree: true, attributes: true,
+                attributeFilter: ["autocorrect", "spellcheck"]
+            });
+            _vendroidAutocorrectInstalled = true;
+            console.warn("[Vendroid] Slate autocorrect enabled");
+        } catch(e) {
+            console.error("[Vendroid] setupSlateAutocorrect error: " + e.message);
+        }
+    }
+
+    // Slate Android input fix. Android WebView's beforeinput events desync
+    // Slate's model (backspace, text insertion, composition). We intercept
+    // at capture phase, preventDefault, and route through Slate's editor API.
+    var _vendroidSlateFixInstalled = false;
+
+    function setupSlateInputFix() {
+        if (_vendroidSlateFixInstalled) return;
+        try {
+            var composingText = null;  // last composition text inserted via Slate
+            var isComposing = false;
+
+            // Helper to read the current text from the Slate editor DOM
+            function getEditorText() {
+                var el = document.querySelector("[data-slate-editor]");
+                return el ? el.textContent : "(no editor)";
+            }
+
+            document.addEventListener("compositionstart", function(e) {
+                var target = e.target;
+                if (!target || !target.hasAttribute) return;
+                if (!target.hasAttribute("data-slate-editor") &&
+                    !target.closest("[data-slate-editor]")) return;
+                isComposing = true;
+                composingText = null;
+                console.warn("[Vendroid] compositionstart");
+            }, true);
+
+            document.addEventListener("compositionend", function(e) {
+                var target = e.target;
+                if (!target || !target.hasAttribute) return;
+                if (!target.hasAttribute("data-slate-editor") &&
+                    !target.closest("[data-slate-editor]")) return;
+                isComposing = false;
+                composingText = null;
+                console.warn("[Vendroid] compositionend data=" + JSON.stringify(e.data));
+            }, true);
+
+            document.addEventListener("beforeinput", function(e) {
+                var target = e.target;
+                if (!target || !target.hasAttribute) return;
+                if (!target.hasAttribute("data-slate-editor") &&
+                    !target.closest("[data-slate-editor]")) return;
+
+                var inputType = e.inputType;
+                var data = e.data;
+
+                // Log every beforeinput event for the Slate editor
+                console.warn("[Vendroid] beforeinput type=" + inputType + " data=" + JSON.stringify(data) + " composing=" + isComposing);
+
+                // Only handle types needing manual Slate routing. Skip
+                // insertCompositionText — Discord's Slate plugin has its own
+                // deferred-diff system that batches keystrokes and flushes on
+                // compositionend, keeping the model in sync and the command
+                // autocomplete filter live.
+                if (inputType !== "deleteContentBackward" &&
+                    inputType !== "deleteContentForward" &&
+                    inputType !== "insertText" &&
+                    inputType !== "insertReplacementText") {
+                    return;
+                }
+
+                var editor = findSlateEditorFromDOM(target);
+                if (!editor) return;
+
+                // After routing through Slate's API, dispatch a synthetic
+                // InputEvent so Discord's autocomplete plugin (which filters
+                // on native 'input' events) sees the change. Without this,
+                // editor.insertText() updates Slate's model and onChange but
+                // not the DOM 'input' event we suppressed via preventDefault.
+                // Only needed in slash-command context (editor starts with
+                // "/"); elsewhere Discord's plugin handles re-rendering and
+                // the popout isn't open.
+                function notifyDiscordInputEvent(evType, evData) {
+                    try {
+                        var curEditorText = getEditorText();
+                        if (!curEditorText || curEditorText.charCodeAt(0) !== 0x2F) return; // only in slash context
+                        var ev = new InputEvent("input", {
+                            data: evData || null,
+                            inputType: evType || "insertText",
+                            bubbles: true,
+                            cancelable: false,
+                            composed: false
+                        });
+                        target.dispatchEvent(ev);
+                        console.warn("[Vendroid] synthetic input dispatched. type=" + (evType || "insertText") + " editorText=" + JSON.stringify(curEditorText.substring(0, 50)));
+                    } catch(e) {
+                        console.error("[Vendroid] synthetic input error: " + e.message);
+                    }
+                }
+
+                if (inputType === "deleteContentBackward") {
+                    var sel = document.getSelection();
+                    if (!sel || !sel.isCollapsed) return; // non-collapsed handled by Slate
+                    e.preventDefault();
+                    e.stopPropagation();
+                    try { editor.deleteBackward("character"); } catch(err) {
+                        console.error("[Vendroid] Slate backspace error: " + err.message);
+                    }
+                    notifyDiscordInputEvent("deleteContentBackward", null);
+                } else if (inputType === "deleteContentForward") {
+                    var sel2 = document.getSelection();
+                    if (!sel2 || !sel2.isCollapsed) return;
+                    e.preventDefault();
+                    e.stopPropagation();
+                    try { editor.deleteForward("character"); } catch(err) {
+                        console.error("[Vendroid] Slate delete error: " + err.message);
+                    }
+                    notifyDiscordInputEvent("deleteContentForward", null);
+                } else if (inputType === "insertText") {
+                    // Direct text insertion (non-composition, e.g. paste, quick type)
+                    e.preventDefault();
+                    e.stopPropagation();
+                    try {
+                        editor.insertText(data || "");
+                        console.warn("[Vendroid] insertText done. editorText=" + JSON.stringify(getEditorText().substring(0, 50)));
+                    } catch(err) {
+                        console.error("[Vendroid] Slate insertText error: " + err.message);
+                    }
+                    notifyDiscordInputEvent("insertText", data);
+                } else if (inputType === "insertReplacementText") {
+                    // IME autocorrect / suggestion completion.  Same delete-then-
+                    // insert pattern: delete the characters being replaced, then
+                    // insert the corrected text via Slate's API.
+                    e.preventDefault();
+                    e.stopPropagation();
+                    try {
+                        var delLen = 0;
+                        var ranges = e.getTargetRanges ? e.getTargetRanges() : null;
+                        if (ranges && ranges.length > 0) {
+                            delLen = ranges[0].endOffset - ranges[0].startOffset;
+                        } else if (composingText && composingText.length > 0) {
+                            delLen = composingText.length;
+                        }
+                        console.warn("[Vendroid] insertReplacementText delLen=" + delLen + " data=" + JSON.stringify(data));
+                        for (var r = 0; r < delLen; r++) {
+                            editor.deleteBackward("character");
+                        }
+                        if (data && data.length > 0) {
+                            editor.insertText(data);
+                        }
+                        composingText = data || "";
+                    } catch(err) {
+                        console.error("[Vendroid] Slate replacement error: " + err.message);
+                    }
+                    notifyDiscordInputEvent("insertReplacementText", data);
+                }
+            }, true); // capture phase — runs before Slate's handler
+
+            _vendroidSlateFixInstalled = true;
+            console.warn("[Vendroid] Slate input fix installed (backspace + text + autocorrect)");
+        } catch(e) {
+            console.error("[Vendroid] setupSlateInputFix failed: " + e.message);
+        }
+    }
+
+    // Walk the React fiber tree to find the Slate editor instance.
     function findSlateEditorFromDOM(element) {
         try {
-            // Find the React fiber key on this element
             var fiberKey = null;
             for (var key in element) {
                 if (key.startsWith("__reactFiber") || key.startsWith("__reactInternalInstance")) {
@@ -454,7 +1071,6 @@
                 }
             }
             if (!fiberKey) return null;
-
             var fiber = element[fiberKey];
             var visited = 0;
             while (fiber && visited < 30) {
@@ -466,21 +1082,15 @@
                 fiber = fiber.return;
                 visited++;
             }
-        } catch(e) {
-            // React fiber access can fail if the element was unmounted
-        }
+        } catch(e) {}
         return null;
     }
 
     // Built-in text command dispatcher (/me, /tableflip, /shrug, …).
-    //
-    // The command browser's autocomplete UI has touch/IME issues on Android,
-    // so built-in text commands may not dispatch. Patch MessageActions.sendMessage
-    // to intercept "/" messages and apply the transform directly.
-    //
-    // Patched directly because MessageEvents.addMessagePreSendListener's webpack
-    // find:".handleSendMessage,onResize:" no longer exists in the mobile bundle,
-    // so the pre-send hook silently never fires.
+    // Safety net for cases where the command browser's text-transform path
+    // doesn't fire.  Intercepts sendMessage and applies the transform.
+    // MessageEvents.addMessagePreSendListener no longer exists in the
+    // mobile bundle, so we patch MessageActions.sendMessage directly.
 
     // Built-in TEXT commands whose execute() is a pure string transform (from
     // Discord module 917012, array `x`). Commands needing stores/RPCs (/nick,
@@ -550,12 +1160,162 @@
             // Mark patched so we don't double-patch on re-injection
             MessageActions.sendMessage.__vendroidCmdPatched = true;
             _vendroidCmdPatched = true;
-            console.log("[Vendroid] Text command dispatcher installed (/me, /shrug, /tableflip, /unflip, /tts, /spoiler)");
+            console.warn("[Vendroid] Text command dispatcher installed (/me, /shrug, /tableflip, /unflip, /tts, /spoiler)");
         } catch(e) {
             console.error("[Vendroid] setupTextCommandDispatcher failed: " + e.message);
             if (_vendroidCmdRetryCount++ < 300) {
                 setTimeout(setupTextCommandDispatcher, 50);
             }
+        }
+    }
+
+
+    // GIF picker: unblock Discord's built-in GIF picker on mobile.
+    //
+    // The expression-picker overlay hides the GIF tab when isMobile (Fr) is
+    // true: `en = gifs.allowSending && !d.Fr && ...`. We wrap the overlay's
+    // render (React.memo — inner fn at memo.type) so Fr reads false only
+    // during that one render, then restores it. A permanent Fr=false breaks
+    // navigation (MobileWebSidebarStore.getIsOpen returns `!Fr || aW`, so the
+    // sidebar would always report open).
+    //
+    // Result: the GIF tab appears inside the existing emoji picker — tap the
+    // emoji button and switch to GIF, like desktop. No separate button; sending
+    // works via the overlay's native onSelectGIF.
+
+    var _vendroidGifPatched = false;
+    var _vendroidGifOverlayPatched = false;
+    var _vendroidGifRetryCount = 0;
+
+    function setupGifPickerButton() {
+        if (_vendroidGifPatched) return;
+        try {
+            if (typeof Vencord === "undefined" || !Vencord.Webpack || !Vencord.Webpack.findByProps) {
+                if (_vendroidGifRetryCount++ < 300) setTimeout(setupGifPickerButton, 50);
+                return;
+            }
+
+            // Resolve core modules.
+            var PlatformUtils = null;
+            try {
+                PlatformUtils = Vencord.Webpack.findByProps("Fr", "Ct", "KY", "v1");
+            } catch(e) {}
+            var ExpressionPickerStore = null;
+            try {
+                ExpressionPickerStore = Vencord.Webpack.findByProps("r$", "ed", "v8", "RQ");
+            } catch(e) {}
+            var ExpressionPickerViewTypes = null;
+            try {
+                ExpressionPickerViewTypes = Vencord.Webpack.findByProps("kx", "VQ", "wp");
+            } catch(e) {}
+
+            if (!PlatformUtils || PlatformUtils.Fr === undefined ||
+                !ExpressionPickerStore || !ExpressionPickerStore.r$ ||
+                !ExpressionPickerViewTypes || !ExpressionPickerViewTypes.kx) {
+                if (_vendroidGifRetryCount++ < 300) setTimeout(setupGifPickerButton, 50);
+                return;
+            }
+            console.warn("[Vendroid] GIF: core modules resolved (Fr=" + PlatformUtils.Fr + ")");
+
+            // Find a module by scanning webpack factory source for a unique
+            // code signature (findByCode may not exist in all Vencord builds).
+            function findModuleByCode(signature) {
+                var wreq = Vencord.Webpack.wreq;
+                if (!wreq || !wreq.m) return null;
+                var factories = wreq.m;
+                try {
+                    var ids = Object.keys(factories);
+                    for (var i = 0; i < ids.length; i++) {
+                        var id = ids[i];
+                        if (typeof factories[id] !== "function") continue;
+                        if (factories[id].toString().indexOf(signature) !== -1) {
+                            try {
+                                var exports = wreq(id);
+                                console.warn("[Vendroid] GIF: found module by code -> id=" + id);
+                                return exports;
+                            } catch(e) {
+                                console.error("[Vendroid] GIF: wreq(" + id + ") failed: " + e.message);
+                            }
+                        }
+                    }
+                } catch(e) {
+                    console.error("[Vendroid] GIF: factory scan error: " + e.message);
+                }
+                return null;
+            }
+
+            // Patch the overlay: flip Fr->false only during its render call.
+            // Only needed on mobile (Fr===true); desktop already shows GIF.
+            if (PlatformUtils.Fr === true && !_vendroidGifOverlayPatched) {
+                var OverlayModule = findModuleByCode(
+                    "onSelectGIF:a,onSelectEmoji:l,onSelectSticker:A,onSelectSound:v,onSelectKaomoji:b"
+                );
+                var overlayTypeFn = null;
+                if (OverlayModule && OverlayModule.A) {
+                    // React.memo: the render fn is at .type, not the memo object.
+                    if (typeof OverlayModule.A.type === "function") {
+                        overlayTypeFn = OverlayModule.A.type;
+                    } else if (typeof OverlayModule.A === "function") {
+                        overlayTypeFn = OverlayModule.A;
+                    }
+                }
+                if (overlayTypeFn) {
+                    _vendroidGifOverlayPatched = true;
+                    var origOverlayRender = overlayTypeFn;
+                    var _gifOriginalFrGetter = null;
+                    try {
+                        var desc = Object.getOwnPropertyDescriptor(PlatformUtils, "Fr");
+                        if (desc && desc.get) _gifOriginalFrGetter = desc.get;
+                    } catch(e) {}
+
+                    function flipFrForRender() {
+                        try {
+                            Object.defineProperty(PlatformUtils, "Fr", {
+                                get: function() { return false; },
+                                configurable: true, enumerable: true
+                            });
+                        } catch(e) {}
+                    }
+                    function restoreFr(savedFr) {
+                        try {
+                            Object.defineProperty(PlatformUtils, "Fr", {
+                                get: _gifOriginalFrGetter || function() { return savedFr; },
+                                configurable: true, enumerable: true
+                            });
+                        } catch(e) {}
+                    }
+
+                    OverlayModule.A.type = function() {
+                        var savedFr = PlatformUtils.Fr;
+                        flipFrForRender();
+                        var res;
+                        try {
+                            res = origOverlayRender.apply(this, arguments);
+                        } finally {
+                            restoreFr(savedFr);
+                        }
+                        return res;
+                    };
+                    console.warn("[Vendroid] GIF: patched overlay (Fr scoped to render only)");
+                } else {
+                    console.error("[Vendroid] GIF: overlay not found (A type=" + (OverlayModule ? typeof OverlayModule.A : "null") + ")");
+                }
+            }
+
+            // Reset lastActiveView to emoji so the emoji button opens emoji
+            // by default (not GIF left over from prior r$ calls).
+            try {
+                ExpressionPickerStore.U(ExpressionPickerViewTypes.kx.EMOJI);
+            } catch(e) {
+                console.error("[Vendroid] GIF: failed to reset lastActiveView: " + e.message);
+            }
+
+            _vendroidGifPatched = true;
+            console.warn("[Vendroid] GIF picker setup complete");
+
+        } catch(e) {
+            console.error("[Vendroid] setupGifPickerButton failed: " + e.message);
+            if (_vendroidGifRetryCount++ < 300) setTimeout(setupGifPickerButton, 50);
         }
     }
 
@@ -578,6 +1338,11 @@
             } else if (tryInitWebpack()) {
                 initStage = 1;
             }
+            // Apply Slate override at stage 1 (before React renders).
+            if (initStage === 1) {
+                setupSlateOverride();
+                setupSlateInputFix();
+            }
         }
 
         if (initStage === 1) {
@@ -588,7 +1353,7 @@
             var hasPlugins = typeof Vencord !== "undefined" && Vencord.Plugins && Object.keys(Vencord.Plugins.plugins).length > 0;
             var fd = findFluxDispatcher();
             if (fd && hasPlugins) {
-                console.log("[Vendroid] Init ready: FluxDispatcher OK, plugins OK");
+                console.warn("[Vendroid] Init ready: FluxDispatcher OK, plugins OK");
                 initStage = 2;
                 doInit();
                 return;
@@ -616,29 +1381,6 @@
         setTimeout(initTick, 50);
     }
     initTick();
-
-    setTimeout(() => {
-        try {
-            var results = [];
-            results.push("URL: " + window.location.pathname);
-            var settingsPlugin = Vencord.Plugins?.plugins?.Settings;
-            if (settingsPlugin) {
-                results.push("Settings: enabled=" + Vencord.Plugins.isPluginEnabled("Settings") + " started=" + settingsPlugin.started + " startAt=" + settingsPlugin.startAt);
-                var patchDetails = (settingsPlugin.patches || []).map(function(p, i) {
-                    var hasAll = !!(p.all && p.all.length);
-                    var matchStr = p.match ? p.match.toString().substring(0, 60) : (p.find || "no-match-or-find");
-                    return i + ":applied=" + hasAll + ":find=" + (p.find || "none") + ":match=" + matchStr;
-                });
-                results.push("Patches: " + patchDetails.join("; "));
-            }
-            var vencordEls = document.querySelectorAll('[class*="vencord"], [class*="Vencord"], [class*="vcd"]');
-            results.push("Vencord DOM els: " + vencordEls.length);
-            results.push("initialized: " + initialized);
-            console.log("[Vendroid] Settings diag 20s: " + results.join(" | "));
-        } catch(e) {
-            console.error("[Vendroid] Settings diag error: " + e.message);
-        }
-    }, 20000);
 
     let vfsState = null;
     let imgOverlay = null;
@@ -767,8 +1509,9 @@ video {
     max-width: 100% !important;
     height: auto !important;
 }
-/* Hide the app launcher button in the chat input bar — apps/commands browser
-   isn't usable with the plain textarea editor on Android. */
+/* Hide the app launcher button in the chat input bar — it opens a separate
+   apps/commands browser that is redundant with the slash-command autocomplete
+   and clutters the mobile input bar. */
 [class*="channelAppLauncher"], [class*="buttonsContainer"] [class*="appLauncher"],
 [aria-label="Apps"], [aria-label="Browse apps"] {
     display: none !important;
@@ -1314,6 +2057,10 @@ video {
     const DECORATIVE_UI_SELECTORS = [
         'svg',
         'iframe, [data-hcaptcha-response], .hcaptcha, .captcha',
+        // Expression picker (GIF/emoji/sticker). Renders as <section role="dialog">
+        // (lightbox dialogs use <div role="dialog">). Without this, our image
+        // viewer intercepts GIF clicks inside the picker, blocking selection.
+        'section[role="dialog"]',
         // Avatars / profile pictures
         '[class*="avatar"], [class*="Avatar"], [class*="pfp"], [class*="Pfp"]',
         // Member list / user popouts
@@ -1717,6 +2464,29 @@ video {
             });
         });
         observer.observe(document.body, { childList: true, subtree: true });
+
+        // Block the expression picker's search input from autofocus-opening the
+        // keyboard. The picker calls input.focus() synchronously on mount; we
+        // intercept HTMLElement.prototype.focus to suppress programmatic focus
+        // inside the picker, while still allowing it on user-initiated taps.
+        var userTappedPickerInput = false;
+        var tapResetTimer = 0;
+        document.addEventListener("pointerdown", function(e) {
+            if (e.target && e.target.tagName === "INPUT" &&
+                e.target.closest('section[role="dialog"]')) {
+                userTappedPickerInput = true;
+                clearTimeout(tapResetTimer);
+                tapResetTimer = setTimeout(function() { userTappedPickerInput = false; }, 300);
+            }
+        }, true);
+        var origFocus = HTMLElement.prototype.focus;
+        HTMLElement.prototype.focus = function() {
+            if (this.tagName === "INPUT" && this.closest('section[role="dialog"]') &&
+                !userTappedPickerInput) {
+                return;
+            }
+            return origFocus.apply(this, arguments);
+        };
 
         document.addEventListener("keydown", e => {
             if (e.key === "Escape") {

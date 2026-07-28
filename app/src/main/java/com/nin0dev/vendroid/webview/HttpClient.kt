@@ -2,11 +2,13 @@ package com.nin0dev.vendroid.webview
 
 import android.app.Activity
 import android.content.Context
+import android.content.SharedPreferences
 import android.net.Uri
 import android.widget.Toast
 import com.nin0dev.vendroid.BuildConfig
 import com.nin0dev.vendroid.R
 import com.nin0dev.vendroid.utils.Constants
+import com.nin0dev.vendroid.utils.VDELog
 import java.io.ByteArrayOutputStream
 import java.io.File
 import java.io.IOException
@@ -39,23 +41,13 @@ object HttpClient {
     @JvmStatic
     fun setVencordMobileRuntime(value: String?) { VencordMobileRuntime = value }
 
-    // Force the plain <textarea> editor instead of Slate. Slate's contenteditable
-    // breaks backspace/IME on Android WebView; the textarea fixes that at the cost
-    // of the command browser (bot/app commands). Text commands (/me, /shrug, …)
-    // are restored by the dispatcher shim in vencord_mobile.js.
-    private val vencordRuntimePatches = listOf(
-        "chat input type must be set" to "chat input type must be set__VENDROID_DISABLED"
+    // Vencord bundle patches applied at download time.
+    // The Slate/command-browser fix is done at runtime in vencord_mobile.js.
+    private data class BundlePatch(val pattern: Regex, val replacement: String)
+    private val vencordRuntimePatches: List<BundlePatch> = listOf(
+        BundlePatch(Regex.escape("chat input type must be set").toRegex(),
+            "chat input type must be set__VENDROID_DISABLED")
     )
-
-    // Pre-built regex for single-pass patching — avoids N full-copy allocations
-    // on the ~1MB Vencord bundle.
-    private val patchRegex: Regex by lazy {
-        vencordRuntimePatches.map { Regex.escape(it.first) }
-            .joinToString("|").toRegex()
-    }
-    private val patchReplaceMap: Map<String, String> by lazy {
-        vencordRuntimePatches.toMap()
-    }
 
     @JvmStatic
     fun clearInjectedBundles() {
@@ -72,13 +64,28 @@ object HttpClient {
         val bundleURLToUse = if(sPrefs.getString("clientMod", "vencord") == "equicord") Constants.EQUICORD_BUNDLE_URL else Constants.JS_BUNDLE_URL
         val vencordLocation = sPrefs.getString("vencordLocation", bundleURLToUse) ?: bundleURLToUse
         val vencordHost = Uri.parse(vencordLocation).host
-        if (vencordHost != null && !Constants.isAllowedVencordHost(vencordHost)) {
+        VDELog.i("HTTP", "Fetching bundle from $vencordLocation")
+        // Reject null host explicitly; the bundle is arbitrary JS executed in
+        // the Discord origin, so the host whitelist must be a hard gate.
+        if (vencordHost == null || !Constants.isAllowedVencordHost(vencordHost)) {
             throw IOException("Vencord location host '$vencordHost' is not in allowed list")
         }
+        if (!vencordLocation.startsWith("https://")) {
+            throw IOException("Vencord location must use HTTPS: $vencordLocation")
+        }
         val vendroidFile = File(activity.filesDir, "vencord.js")
+        // A zero-length file results from an interrupted write; discard it so
+        // the cache branches below don't load an empty bundle.
+        if (vendroidFile.exists() && vendroidFile.length() == 0L) {
+            VDELog.w("HTTP", "Cached vencord.js is empty, discarding")
+            vendroidFile.delete()
+            vencordBundlePatched = false
+            sPrefs.edit().remove("vencordEtag").apply()
+        }
 
-        // Version / debug checks must run BEFORE the early-return so that
-        // a synchronous pre-load (in onCreate) doesn't block re-downloads.
+        // Forced redownload on app version bump, custom bundle URL, or debug
+        // builds. Runs before any cache short-circuit so a pre-load can't skip
+        // it; deletes the cached file to force a full download below.
         val needsRedownload = sPrefs.getInt("lastMajorUpdateThatUserHasUpdatedVencord", 0) < BuildConfig.VERSION_CODE
                 || (vencordLocation != Constants.JS_BUNDLE_URL && vencordLocation != Constants.EQUICORD_BUNDLE_URL)
                 || BuildConfig.DEBUG
@@ -87,110 +94,169 @@ object HttpClient {
             if (sPrefs.getInt("lastMajorUpdateThatUserHasUpdatedVencord", 0) < BuildConfig.VERSION_CODE) {
                 if(BuildConfig.DEBUG) activity.runOnUiThread { Toast.makeText(activity, "Just updated app version, redownloading Vencord", Toast.LENGTH_LONG).show() }
                 vendroidFile.delete()
-                VencordRuntime = null
                 vencordBundlePatched = false
                 sPrefs.edit().remove("vencordEtag").apply()
             }
             if ((vencordLocation != Constants.JS_BUNDLE_URL && vencordLocation != Constants.EQUICORD_BUNDLE_URL) || BuildConfig.DEBUG) {
                 activity.runOnUiThread { Toast.makeText(activity, "Debugging app or Vencord, bundle will be redownloaded. Avoid using on limited networks", Toast.LENGTH_LONG).show() }
                 vendroidFile.delete()
-                VencordRuntime = null
                 vencordBundlePatched = false
                 sPrefs.edit().remove("vencordEtag").apply()
             }
         }
 
-        if (VencordRuntime != null) return
-        if (vendroidFile.exists()) {
-            // The file was written with applyPatches already applied during a
-            // previous download.  Skip the redundant ~1MB regex scan.
-            VencordRuntime = if (vencordBundlePatched) vendroidFile.readText() else applyPatches(vendroidFile.readText())
+        // Warm-navigation fast path: skip the network round-trip when the
+        // bundle is already in memory and no forced redownload is pending.
+        // The on-disk file alone is NOT sufficient — it may be stale, so the
+        // ETag-conditional GET below handles that case (304 when current).
+        if (VencordRuntime != null && !needsRedownload) {
+            VDELog.d("HTTP", "Bundle already in memory and cache valid, skipping fetch")
+            return
         }
-        else {
-            val e = sPrefs.edit()
-            val storedEtag = sPrefs.getString("vencordEtag", null)
-            var conn: HttpURLConnection? = null
-            try {
-                conn = URL(vencordLocation).openConnection() as HttpURLConnection
+
+        val storedEtag = sPrefs.getString("vencordEtag", null)
+        var conn: HttpURLConnection? = null
+        try {
+            // ETag-conditional GET: 304 keeps the cache (cheap), 200 swaps in
+            // a newer build. This detects new Vencord builds without wiping
+            // app data.
+            conn = URL(vencordLocation).openConnection() as HttpURLConnection
+            conn.connectTimeout = 15000
+            conn.readTimeout = 15000
+            conn.instanceFollowRedirects = false
+            if (storedEtag != null) {
+                conn.setRequestProperty("If-None-Match", storedEtag)
+            }
+
+            var responseCode = conn.getResponseCode()
+
+            if (responseCode in 300..399) {
+                val location = conn.getHeaderField("Location")
+                    ?: throw IOException("Redirect with no Location header")
+                conn.disconnect()
+                val redirectUrl = URL(URL(vencordLocation), location)
+                if (!redirectUrl.protocol.equals("https", ignoreCase = true)) {
+                    throw IOException("Redirect to non-HTTPS scheme: ${redirectUrl.protocol}")
+                }
+                val redirectHost = redirectUrl.host
+                // Reject null host so the whitelist stays a hard gate rather
+                // than relying on openConnection() to throw later.
+                if (redirectHost == null || !Constants.isAllowedVencordHost(redirectHost)) {
+                    throw IOException("Redirect to disallowed or unresolvable host: $redirectHost")
+                }
+                conn = redirectUrl.openConnection() as HttpURLConnection
                 conn.connectTimeout = 15000
                 conn.readTimeout = 15000
                 conn.instanceFollowRedirects = false
-                if (storedEtag != null) {
-                    conn.setRequestProperty("If-None-Match", storedEtag)
-                }
+                responseCode = conn.getResponseCode()
+            }
 
-                var responseCode = conn.getResponseCode()
-
-                if (responseCode in 300..399) {
-                    val location = conn.getHeaderField("Location")
-                        ?: throw IOException("Redirect with no Location header")
-                    conn.disconnect()
-                    val redirectUrl = URL(URL(vencordLocation), location)
-                    val redirectHost = redirectUrl.host
-                    if (redirectHost != null && !Constants.isAllowedVencordHost(redirectHost)) {
-                        throw IOException("Redirect to disallowed host: $redirectHost")
-                    }
-                    conn = redirectUrl.openConnection() as HttpURLConnection
-                    conn.connectTimeout = 15000
-                    conn.readTimeout = 15000
-                    conn.instanceFollowRedirects = false
-                    responseCode = conn.getResponseCode()
-                }
-
-                if (responseCode == HttpURLConnection.HTTP_NOT_MODIFIED) {
-                    if (vendroidFile.exists()) {
+            when {
+                responseCode == HttpURLConnection.HTTP_NOT_MODIFIED && vendroidFile.exists() -> {
+                    VDELog.i("HTTP", "Bundle not modified (304), using cache")
+                    if (VencordRuntime == null) {
                         VencordRuntime = if (vencordBundlePatched) vendroidFile.readText() else applyPatches(vendroidFile.readText())
-                        conn.disconnect()
-                        return
                     }
+                }
+
+                responseCode == HttpURLConnection.HTTP_NOT_MODIFIED -> {
+                    // 304 with no local file — re-request unconditionally.
                     conn.disconnect()
                     conn = URL(vencordLocation).openConnection() as HttpURLConnection
                     conn.connectTimeout = 15000
                     conn.readTimeout = 15000
                     conn.instanceFollowRedirects = false
                     responseCode = conn.getResponseCode()
+                    if (responseCode !in 200..299) {
+                        throw IOException("HTTP $responseCode fetching Vencord bundle from $vencordLocation")
+                    }
+                    downloadAndStore(conn, vendroidFile, sPrefs)
                 }
 
-                if (responseCode >= 300) {
-                    throw IOException("HTTP $responseCode fetching Vencord bundle from $vencordLocation")
+                responseCode in 200..299 -> {
+                    downloadAndStore(conn, vendroidFile, sPrefs)
                 }
 
-                val initialSize = conn.contentLength.coerceAtLeast(8192)
-                val content = readAsText(conn.inputStream, initialSize)
-                val patched = applyPatches(content)
-                val tmpFile = File(vendroidFile.parent, "${vendroidFile.name}.tmp")
-                tmpFile.writeText(patched)
-                if (!tmpFile.renameTo(vendroidFile)) {
-                    tmpFile.delete()
-                    throw IOException("Failed to rename ${tmpFile.name} to ${vendroidFile.name}")
+                else -> {
+                    // Fall back to the cached bundle on transient server errors
+                    // so startup doesn't break; otherwise surface the failure.
+                    if (vendroidFile.exists() && VencordRuntime == null) {
+                        VDELog.w("HTTP", "HTTP $responseCode; falling back to cached bundle")
+                        VencordRuntime = if (vencordBundlePatched) vendroidFile.readText() else applyPatches(vendroidFile.readText())
+                    } else {
+                        throw IOException("HTTP $responseCode fetching Vencord bundle from $vencordLocation")
+                    }
                 }
-
-                val responseEtag = conn.getHeaderField("ETag")
-                if (responseEtag != null) {
-                    e.putString("vencordEtag", responseEtag)
-                }
-                e.putInt("lastMajorUpdateThatUserHasUpdatedVencord", BuildConfig.VERSION_CODE)
-                e.apply()
-                VencordRuntime = patched
-                vencordBundlePatched = true
-            } finally {
-                try { conn?.inputStream?.close() } catch (_: IOException) {}
-                conn?.disconnect()
             }
+        } catch (io: IOException) {
+            // Network failure during the version check must not brick startup
+            // when a cached bundle exists; only the no-cache case propagates.
+            if (vendroidFile.exists() && VencordRuntime == null) {
+                VDELog.w("HTTP", "Network error during version check; using cached bundle: ${io.message}")
+                VencordRuntime = if (vencordBundlePatched) vendroidFile.readText() else applyPatches(vendroidFile.readText())
+            } else {
+                throw io
+            }
+        } finally {
+            try { conn?.inputStream?.close() } catch (_: IOException) {}
+            conn?.disconnect()
         }
         activity.runOnUiThread {
             (activity as? com.nin0dev.vendroid.MainActivity)?.injectVencordIfReady()
         }
     }
 
+    /**
+     * Downloads, patches, and atomically writes the Vencord bundle, and
+     * updates the [VencordRuntime] / [vencordBundlePatched] / `vencordEtag` /
+     * `lastMajorUpdateThatUserHasUpdatedVencord` bookkeeping.
+     *
+     * Shared by the startup path so the post-write state stays consistent and
+     * the next launch doesn't re-download a fresh bundle. Caller must have
+     * validated HTTPS + host whitelist and is responsible for disconnecting.
+     */
+    @Throws(IOException::class)
+    private fun downloadAndStore(
+        conn: HttpURLConnection,
+        vendroidFile: File,
+        sPrefs: SharedPreferences
+    ) {
+        val initialSize = conn.contentLength.coerceAtLeast(8192)
+        val content = readAsText(conn.inputStream, initialSize)
+        VDELog.i("HTTP", "Bundle downloaded (${content.length} chars), applying patches...")
+        val patched = applyPatches(content)
+        val tmpFile = File(vendroidFile.parent, "${vendroidFile.name}.tmp")
+        tmpFile.writeText(patched)
+        if (!tmpFile.renameTo(vendroidFile)) {
+            tmpFile.delete()
+            throw IOException("Failed to rename ${tmpFile.name} to ${vendroidFile.name}")
+        }
+
+        val responseEtag = conn.getHeaderField("ETag")
+        val e = sPrefs.edit()
+        if (responseEtag != null) {
+            e.putString("vencordEtag", responseEtag)
+        }
+        e.putInt("lastMajorUpdateThatUserHasUpdatedVencord", BuildConfig.VERSION_CODE)
+        e.apply()
+        VencordRuntime = patched
+        vencordBundlePatched = true
+        VDELog.i("HTTP", "Bundle patched and saved to disk")
+    }
+
     @JvmStatic
     fun applyPatches(content: String): String {
         if (vencordRuntimePatches.isEmpty()) return content
-        // Single-pass replacement — avoids creating N intermediate 1MB strings
-        // when there are N patches (each .replace() allocates a full copy).
-        return patchRegex.replace(content) { match ->
-            patchReplaceMap[match.value] ?: match.value
+        VDELog.d("HTTP", "Applying ${vencordRuntimePatches.size} patches")
+        // Few patches means sequential replace is simpler than mapping
+        // combined-regex matches back to individual patches. Each replace
+        // copies ~1MB, acceptable for 2-3 patches at download time.
+        var result = content
+        for (patch in vencordRuntimePatches) {
+            VDELog.d("HTTP", "Patch: ${patch.pattern.pattern}")
+            result = patch.pattern.replace(result, patch.replacement)
         }
+        return result
     }
 
     @Throws(IOException::class)

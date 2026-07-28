@@ -17,30 +17,17 @@ object Constants {
     private val allowedDomainCache = ConcurrentHashMap<String, Boolean>()
 
     /**
-     * Regex-based whitelist of domains the WebView is permitted to load.
-     *
-     * Covers Discord's own domains, Vencord/Equicord update sources,
-     * captcha providers, and CSS/asset CDNs.
+     * WebView domain allowlist. Backed by [FirewallConfig]. Entries use
+     * leading-dot form (".example.com") so apex and subdomain matches do
+     * not falsely match lookalikes such as "evildiscord.com".
      */
     fun isAllowedDomain(host: String): Boolean =
         allowedDomainCache.computeIfAbsent(host) { h ->
-            h == "discord.com" || h.endsWith(".discord.com") ||
-            h == "discordapp.com" || h.endsWith(".discordapp.com") ||
-            h == "discord.gg" || h.endsWith(".discord.gg") ||
-            h == "discord.media" || h.endsWith(".discord.media") ||
-            h == "discordapp.net" || h.endsWith(".discordapp.net") ||
-            h == "storage.googleapis.com" || h.endsWith(".storage.googleapis.com") ||
-            h == "github.com" || h.endsWith(".github.com") ||
-            h == "githubusercontent.com" || h.endsWith(".githubusercontent.com") ||
-            h == "hcaptcha.com" || h.endsWith(".hcaptcha.com") ||
-            h == "discordsays.com" || h.endsWith(".discordsays.com") ||
-            h == "vencord.dev" || h.endsWith(".vencord.dev") ||
-            h == "codeberg.org" || h.endsWith(".codeberg.org") ||
-            h == "git.nin0.dev" || h.endsWith(".git.nin0.dev") ||
-            h == "vde-builds.nin0.dev" || h.endsWith(".vde-builds.nin0.dev") ||
-            h.endsWith(".github.io") || h.endsWith(".codeberg.page") ||
-            h == "cdn.jsdelivr.net" || h.endsWith(".cdn.jsdelivr.net") ||
-            h == "jsdelivr.net" || h.endsWith(".jsdelivr.net")
+            for (entry in FirewallConfig.allowedHosts()) {
+                // ".domain.tld": substring(1) matches the apex, endsWith matches subdomains.
+                if (h == entry.substring(1) || h.endsWith(entry)) return@computeIfAbsent true
+            }
+            false
         } ?: false
 
     fun isDiscordDomain(host: String): Boolean =
@@ -54,4 +41,11 @@ object Constants {
             h in VENCORD_ALLOWED_HOSTS || h.endsWith(".githubusercontent.com")
                     || h.endsWith(".github.io") || h.endsWith(".codeberg.page")
         } ?: false
+
+    /** Clears the per-host allowlist cache after a config change. Discord
+     *  core and Vencord update host caches are not user-editable, so they
+     *  are preserved. */
+    fun invalidateFirewallCaches() {
+        allowedDomainCache.clear()
+    }
 }

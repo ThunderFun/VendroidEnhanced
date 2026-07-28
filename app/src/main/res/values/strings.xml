@@ -40,4 +40,13 @@
     <string name="save_exit"><![CDATA[Save & exit]]></string>
     <string name="force_update">Force update Vencord</string>
     <string name="force_update_desc">Start VendroidEnhanced, but force a Vencord update. Useful if you are crashing or similar and cannot access the Updater tab.</string>
+    <string name="view_logs">View logs</string>
+    <string name="view_logs_desc">View VendroidEnhanced\'s internal logs. Useful for debugging issues with patching, injection, or loading.</string>
+    <string name="link_dialog_title">External link</string>
+    <string name="link_dialog_copy">Copy link</string>
+    <string name="link_dialog_open">Open in browser</string>
+    <string name="link_dialog_share">Share link</string>
+    <string name="link_dialog_cancel">Cancel</string>
+    <string name="link_copied">Link copied to clipboard</string>
+    <string name="link_blocked_scheme">Cannot open this type of link</string>
 </resources>

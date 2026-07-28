@@ -38,11 +38,9 @@
 
                 <data android:scheme="https" />
                 <data android:host="discord.com" />
-                <data android:host="*.discord.com" />
                 <data android:host="ptb.discord.com" />
                 <data android:host="canary.discord.com" />
                 <data android:host="discordapp.com" />
-                <data android:host="*.discordapp.com" />
             </intent-filter>
         </activity>
 

@@ -6,7 +6,9 @@ import android.os.Build
 import android.view.View
 import android.webkit.WebView
 import com.nin0dev.vendroid.webview.HttpClient
+import com.nin0dev.vendroid.utils.FirewallConfig
 import com.nin0dev.vendroid.utils.Logger.e
+import com.nin0dev.vendroid.utils.VDELog
 import java.io.File
 import java.net.HttpURLConnection
 import java.net.URL
@@ -17,6 +19,17 @@ class VendroidApp : Application() {
         val isWebProcess = getCurrentProcessName().endsWith(":web")
 
         if (isWebProcess) {
+            // Initialize in-app logging first — must happen before anything else
+            // so that subsequent init steps are captured even if they crash.
+            VDELog.init(applicationContext)
+            VDELog.i("VDE", "App started (PID=${android.os.Process.myPid()})")
+
+            // Initialize the firewall config before any WebView request can
+            // fire. shouldInterceptRequest() reads the snapshot via
+            // Constants.isAllowedDomain(), so it must be built up-front.
+            FirewallConfig.init(applicationContext)
+            VDELog.i("VDE", "Firewall config initialized")
+
             // On Android P+, WebView requires a unique data directory suffix
             // for each non-default process. Without this, creating a WebView in
             // the :web process crashes with an IllegalStateException.
@@ -55,6 +68,7 @@ class VendroidApp : Application() {
             } catch (e: Exception) {
                 e("Failed to install HTTP response cache", e)
             }
+            VDELog.i("VDE", "HTTP response cache installed")
 
             // One-time migration: move CSS cache entries from the shared
             // "settings" prefs file into a dedicated "css_cache" file.
@@ -95,8 +109,21 @@ class VendroidApp : Application() {
                             HttpClient.setVencordMobileRuntime(HttpClient.readAsText(inputStream))
                         }
                     }
+                    VDELog.i("VDE", "VencordMobile runtime preloaded")
                     // 2. Vencord runtime (potentially ~1 MB from disk)
                     val vendroidFile = File(filesDir, "vencord.js")
+                    // Don't serve a stale bundle: if a redownload is pending
+                    // (clientMod switch or app version bump), drop the file
+                    // before the preload read so fetchVencord can replace it.
+                    val sPrefs = getSharedPreferences("settings", Context.MODE_PRIVATE)
+                    val needsRedownload = sPrefs.getInt(
+                        "lastMajorUpdateThatUserHasUpdatedVencord", 0
+                    ) < com.nin0dev.vendroid.BuildConfig.VERSION_CODE
+                    if (needsRedownload) {
+                        vendroidFile.delete()
+                        HttpClient.vencordBundlePatched = false
+                        sPrefs.edit().remove("vencordEtag").apply()
+                    }
                     if (vendroidFile.exists() && HttpClient.VencordRuntime == null) {
                         try {
                             // The file was written with applyPatches already
@@ -106,12 +133,15 @@ class VendroidApp : Application() {
                                 if (HttpClient.vencordBundlePatched) vendroidFile.readText()
                                 else HttpClient.applyPatches(vendroidFile.readText())
                             )
+                            VDELog.i("VDE", "Vencord runtime preloaded (${vendroidFile.length()} bytes)")
                         } catch (ex: Exception) {
                             e("Failed to apply Vencord patches", ex)
+                            VDELog.e("VDE", "Failed to apply Vencord patches: ${ex.message}", ex)
                         }
                     }
                 } catch (ex: Exception) {
                     e("Vencord preload failed", ex)
+                    VDELog.e("VDE", "Vencord preload failed: ${ex.message}", ex)
                 }
             }.start()
 
@@ -133,21 +163,31 @@ class VendroidApp : Application() {
                     val now = System.currentTimeMillis()
                     for (url in cssUrls) {
                         val key = "css_cache_vde_" + url.hashCode()
+                        VDELog.d("VDE", "Prefetching CSS: $url")
                         // Only re-fetch if missing or older than 12 hours
                         val ts = cssPrefs.getLong("${key}_ts", 0)
                         if (cssPrefs.getString(key, null) == null || now - ts > 12 * 60 * 60 * 1000L) {
                             var conn: HttpURLConnection? = null
                             try {
+                                if (!url.startsWith("https://")) {
+                                    VDELog.w("VDE", "CSS prefetch rejected non-HTTPS URL: $url")
+                                    continue
+                                }
                                 conn = URL(url).openConnection() as HttpURLConnection
                                 conn.connectTimeout = 15000
                                 conn.readTimeout = 15000
-                                if (conn.responseCode in 200..299) {
+                                conn.instanceFollowRedirects = false
+                                val code = conn.responseCode
+                                if (code in 200..299) {
                                     val css = HttpClient.readAsText(conn.inputStream)
                                     editor.putString(key, css)
                                     editor.putLong("${key}_ts", now)
+                                } else if (code in 300..399) {
+                                    VDELog.w("VDE", "CSS prefetch rejected redirect ($code) from $url")
                                 }
                             } catch (ex: Exception) {
                                 e("CSS fetch failed for $url", ex)
+                                VDELog.w("VDE", "CSS fetch failed for $url: ${ex.message}")
                             } finally {
                                 conn?.disconnect()
                             }

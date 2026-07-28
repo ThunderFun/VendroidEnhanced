@@ -1,0 +1,235 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<style>
+  * { margin:0; padding:0; box-sizing:border-box; }
+  html,body { height:100%; background:#0f0f10; color:#dcddde; font-family:monospace; font-size:13px; }
+  #wrap { display:flex; flex-direction:column; height:100%; }
+  #bar { flex:none; padding:10px; background:#1a1b1e; border-bottom:1px solid #2b2d31; display:flex; gap:8px; align-items:center; }
+  #bar button { padding:10px 16px; border:none; border-radius:6px; font-family:inherit; font-size:13px; font-weight:600; color:#fff; -webkit-tap-highlight-color:transparent; cursor:pointer; }
+  #clear { background:#ed4245; }
+  #clear:active { opacity:.85; }
+  #copy { background:#5865f2; }
+  #copy:active { opacity:.85; }
+  #close { background:#4f545c; margin-left:auto; }
+  #close:active { opacity:.85; }
+  #logs { flex:1 1 auto; width:100%; overflow:auto; padding:8px; -webkit-overflow-scrolling:touch; }
+  .entry { padding:2px 0; white-space:pre-wrap; word-break:break-all; line-height:1.4; border-bottom:1px solid rgba(255,255,255,0.03); }
+  .time { color:#72767d; }
+  .tag { color:#b9bbbe; }
+  .msg { color:#dcddde; }
+  .level-ERROR .msg { color:#ed4245; }
+  .level-WARN .msg { color:#fee75c; }
+  .level-INFO .msg { color:#5865f2; }
+  .level-DEBUG .msg { color:#72767d; }
+  #empty { text-align:center; padding:40px; color:#72767d; }
+  #filter-bar { flex:none; padding:4px 10px 6px; background:#1a1b1e; border-bottom:1px solid #2b2d31; display:flex; gap:6px; align-items:center; }
+  .filter-btn { padding:4px 10px; border:1px solid #4f545c; border-radius:4px; font-family:inherit; font-size:11px; font-weight:600; color:#72767d; background:transparent; cursor:pointer; -webkit-tap-highlight-color:transparent; }
+  .filter-btn.active { border-color:currentColor; color:currentColor; }
+  .filter-btn[data-level="ERROR"].active { color:#ed4245; border-color:#ed4245; }
+  .filter-btn[data-level="WARN"].active { color:#fee75c; border-color:#fee75c; }
+  .filter-btn[data-level="INFO"].active { color:#5865f2; border-color:#5865f2; }
+  .filter-btn[data-level="DEBUG"].active { color:#72767d; border-color:#72767d; }
+  .level-ERROR .level { color:#ed4245; }
+  .level-WARN .level { color:#fee75c; }
+  .level-INFO .level { color:#5865f2; }
+  .level-DEBUG .level { color:#72767d; }
+  .entry { cursor:pointer; }
+  .entry:active { background:rgba(255,255,255,0.04); }
+  #share { background:#57F287; }
+  #share:active { opacity:.85; }
+  #auto-refresh { background:transparent; border:1px solid #4f545c; color:#57F287; }
+  #auto-refresh.active { border-color:#57F287; }
+  #toast { position:fixed; bottom:60px; left:50%; transform:translateX(-50%); background:rgba(0,0,0,.85); color:#fff; padding:8px 16px; border-radius:8px; font-size:12px; opacity:0; transition:opacity .2s; pointer-events:none; z-index:10; }
+  #toast.show { opacity:1; }
+</style>
+</head>
+<body>
+<div id="wrap">
+  <div id="bar">
+    <button id="clear">Clear</button>
+    <button id="copy">Copy All</button>
+    <button id="share">Share</button>
+    <button id="auto-refresh" class="active">Live</button>
+    <button id="close">Close</button>
+  </div>
+  <div id="filter-bar">
+    <span style="color:#72767d;font-size:11px;margin-right:4px;">Filter:</span>
+    <button class="filter-btn active" data-level="ERROR">ERROR</button>
+    <button class="filter-btn active" data-level="WARN">WARN</button>
+    <button class="filter-btn active" data-level="INFO">INFO</button>
+    <button class="filter-btn active" data-level="DEBUG">DEBUG</button>
+  </div>
+  <div id="logs"><div id="empty">Loading logs...</div></div>
+  <div id="toast">Copied!</div>
+</div>
+<script>
+(function(){
+  var logsEl = document.getElementById('logs');
+  var rawText = '';
+  var activeFilters = { ERROR: true, WARN: true, INFO: true, DEBUG: true };
+  var autoRefreshInterval = null;
+
+  window.vdeSetLogs = function(text) {
+    rawText = text || '';
+    renderLogs(rawText);
+  };
+
+  function renderLogs(text) {
+    // Only auto-scroll if user is already near the bottom — don't yank
+    // them away if they're reading older logs.
+    var wasNearBottom = logsEl.scrollHeight - logsEl.scrollTop - logsEl.clientHeight < 60;
+    logsEl.innerHTML = '';
+    if (!text || text === 'No logs available.') {
+      logsEl.innerHTML = '<div id="empty">No logs available.</div>';
+      return;
+    }
+    var lines = text.split('\n');
+    var frag = document.createDocumentFragment();
+    for (var i = 0; i < lines.length; i++) {
+      var line = lines[i];
+      if (!line.trim()) continue;
+      var match = line.match(/^\[(\d{2}:\d{2}:\d{2}\.\d{3})\]\s+\[(\w+)\]\s+\[(\w+)\]\s+([\s\S]*)$/);
+      var div = document.createElement('div');
+      div.className = 'entry';
+      if (match) {
+        div.setAttribute('data-level', match[2]);
+        if (!activeFilters[match[2]]) div.style.display = 'none';
+        div.className += ' level-' + match[2];
+        var timeSpan = document.createElement('span');
+        timeSpan.className = 'time';
+        timeSpan.textContent = match[1] + ' ';
+        var levelSpan = document.createElement('span');
+        levelSpan.className = 'level';
+        levelSpan.textContent = '[' + match[2] + '] ';
+        var tagSpan = document.createElement('span');
+        tagSpan.className = 'tag';
+        tagSpan.textContent = '[' + match[3] + '] ';
+        var msgSpan = document.createElement('span');
+        msgSpan.className = 'msg';
+        // Decode escaped newlines from VDELog format
+        msgSpan.textContent = match[4].replace(/\\n/g, '\n');
+        div.appendChild(timeSpan);
+        div.appendChild(levelSpan);
+        div.appendChild(tagSpan);
+        div.appendChild(msgSpan);
+      } else {
+        var fallback = document.createElement('span');
+        fallback.className = 'msg';
+        fallback.textContent = line;
+        div.appendChild(fallback);
+      }
+      frag.appendChild(div);
+    }
+    logsEl.appendChild(frag);
+    // Auto-scroll to bottom only if user was already near the bottom
+    if (wasNearBottom) logsEl.scrollTop = logsEl.scrollHeight;
+  }
+
+  // --- Per-entry copy (tap a log line to copy it) ---
+  logsEl.addEventListener('click', function(e) {
+    var entry = e.target.closest('.entry');
+    if (!entry) return;
+    var text = entry.textContent;
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(text).then(showToast).catch(function() { fallbackCopy(text); });
+    } else {
+      fallbackCopy(text);
+    }
+  });
+
+  function fallbackCopy(text) {
+    var ta = document.createElement('textarea');
+    ta.value = text;
+    ta.style.cssText = 'position:fixed;left:-9999px';
+    document.body.appendChild(ta);
+    ta.select();
+    try { document.execCommand('copy'); showToast(); } catch(e) {}
+    document.body.removeChild(ta);
+  }
+
+  function showToast() {
+    var toast = document.getElementById('toast');
+    toast.classList.add('show');
+    setTimeout(function() { toast.classList.remove('show'); }, 1500);
+  }
+
+  // --- Level filter toggles ---
+  var filterBtns = document.querySelectorAll('.filter-btn');
+  for (var f = 0; f < filterBtns.length; f++) {
+    filterBtns[f].addEventListener('click', function() {
+      var level = this.getAttribute('data-level');
+      activeFilters[level] = !activeFilters[level];
+      this.classList.toggle('active');
+      var entries = logsEl.querySelectorAll('.entry[data-level]');
+      for (var j = 0; j < entries.length; j++) {
+        entries[j].style.display = activeFilters[entries[j].getAttribute('data-level')] ? '' : 'none';
+      }
+    });
+  }
+
+  // --- Clear ---
+  document.getElementById('clear').addEventListener('click', function() {
+    try { VencordMobileNative.clearLogs(); } catch(e) {}
+    rawText = '';
+    logsEl.innerHTML = '<div id="empty">Logs cleared.</div>';
+  });
+
+  // --- Copy All ---
+  document.getElementById('copy').addEventListener('click', function() {
+    var text = rawText || 'No logs.';
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(text).then(showToast).catch(function() { fallbackCopy(text); });
+    } else {
+      fallbackCopy(text);
+    }
+  });
+
+  // --- Share ---
+  document.getElementById('share').addEventListener('click', function() {
+    try { VencordMobileNative.shareLogs(); } catch(e) {}
+  });
+
+  // --- Auto-refresh (live tail) ---
+  function startAutoRefresh() {
+    if (autoRefreshInterval) clearInterval(autoRefreshInterval);
+    autoRefreshInterval = setInterval(function() {
+      try {
+        var newLogs = VencordMobileNative.refreshLogs();
+        if (newLogs && newLogs !== rawText) {
+          rawText = newLogs;
+          renderLogs(rawText);
+        }
+      } catch(e) {}
+    }, 2000);
+  }
+
+  function stopAutoRefresh() {
+    if (autoRefreshInterval) { clearInterval(autoRefreshInterval); autoRefreshInterval = null; }
+  }
+
+  var autoBtn = document.getElementById('auto-refresh');
+  autoBtn.addEventListener('click', function() {
+    if (autoRefreshInterval) {
+      stopAutoRefresh();
+      autoBtn.classList.remove('active');
+      autoBtn.textContent = 'Paused';
+    } else {
+      startAutoRefresh();
+      autoBtn.classList.add('active');
+      autoBtn.textContent = 'Live';
+    }
+  });
+  startAutoRefresh();
+
+  // --- Close ---
+  document.getElementById('close').addEventListener('click', function() {
+    stopAutoRefresh();
+    try { VencordMobileNative.close(); } catch(e) {}
+  });
+})();
+</script>
+</body>
+</html>

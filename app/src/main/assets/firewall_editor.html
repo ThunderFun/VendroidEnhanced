@@ -1,0 +1,160 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<style>
+  * { margin:0; padding:0; box-sizing:border-box; }
+  html,body { height:100%; background:#0f0f10; color:#dcddde;
+    font-family: -apple-system, Roboto, 'Segoe UI', sans-serif; font-size:14px; }
+  #wrap { display:flex; flex-direction:column; height:100%; }
+  #bar { flex:none; padding:10px; background:#1a1b1e; border-bottom:1px solid #2b2d31;
+    display:flex; gap:8px; align-items:center; }
+  #bar button { padding:10px 16px; border:none; border-radius:6px;
+    font-family:inherit; font-size:13px; font-weight:600; color:#fff;
+    -webkit-tap-highlight-color:transparent; cursor:pointer; }
+  #save { background:#57F287; }
+  #save:active { opacity:.85; }
+  #reset { background:#4f545c; }
+  #reset:active { opacity:.85; }
+  #close { background:#4f545c; margin-left:auto; }
+  #close:active { opacity:.85; }
+  #body { flex:1 1 auto; overflow:auto; padding:16px; -webkit-overflow-scrolling:touch; }
+  h2 { font-size:15px; font-weight:600; color:#fff; margin:18px 0 8px; }
+  h2:first-child { margin-top:0; }
+  .cat { padding:12px; background:#1a1b1e; border:1px solid #2b2d31; border-radius:8px;
+    margin-bottom:8px; }
+  .cat-head { display:flex; align-items:center; justify-content:space-between; gap:12px; }
+  .cat-label { font-weight:600; color:#fff; }
+  .cat-desc { color:#72767d; font-size:12px; margin-top:4px; word-break:break-all; }
+  /* Toggle switch */
+  .switch { position:relative; width:44px; height:24px; flex:none; }
+  .switch input { opacity:0; width:0; height:0; }
+  .switch input:disabled { cursor:not-allowed; }
+  .slider { position:absolute; inset:0; background:#36393f; border-radius:24px;
+    transition:.2s; cursor:pointer; }
+  .slider:before { content:""; position:absolute; width:18px; height:18px; left:3px; top:3px;
+    background:#fff; border-radius:50%; transition:.2s; }
+  input:checked + .slider { background:#57F287; }
+  input:checked + .slider:before { transform:translateX(20px); }
+  /* Locked (always-on) category: green slider, non-interactive */
+  .switch.locked { opacity:.85; }
+  .switch.locked .slider { background:#57F287; cursor:not-allowed; }
+  .switch.locked .slider:before { transform:translateX(20px); }
+  .cat-lock { font-size:11px; color:#57F287; font-weight:600; margin-left:8px;
+    white-space:nowrap; }
+  #note { color:#72767d; font-size:12px; line-height:1.5; margin-top:16px; padding:10px;
+    background:#1a1b1e; border-radius:6px; }
+  #toast { position:fixed; bottom:60px; left:50%; transform:translateX(-50%);
+    background:rgba(0,0,0,.85); color:#fff; padding:8px 16px; border-radius:8px;
+    font-size:12px; opacity:0; transition:opacity .2s; pointer-events:none; z-index:10; }
+  #toast.show { opacity:1; }
+</style>
+</head>
+<body>
+<div id="wrap">
+  <div id="bar">
+    <button id="save">Save</button>
+    <button id="reset">Reset</button>
+    <button id="close">Close</button>
+  </div>
+  <div id="body">
+    <h2>Domain categories</h2>
+    <div id="categories"></div>
+    <div id="note">
+      Changes apply on the next page load. The native request filter updates
+      immediately; the in-page JS firewall regenerates when Discord reloads.
+      Removing a domain may break Discord features that depend on it.
+    </div>
+  </div>
+  <div id="toast"></div>
+</div>
+<script>
+(function(){
+  var config = null;
+
+  function renderCategories(cats) {
+    var el = document.getElementById('categories');
+    el.innerHTML = '';
+    for (var i = 0; i < cats.length; i++) {
+      (function(c){
+        var div = document.createElement('div');
+        div.className = 'cat';
+        var head = document.createElement('div');
+        head.className = 'cat-head';
+        var label = document.createElement('div');
+        label.className = 'cat-label';
+        label.textContent = c.label;
+        var sw = document.createElement('label');
+        sw.className = 'switch' + (c.locked ? ' locked' : '');
+        var cb = document.createElement('input');
+        cb.type = 'checkbox';
+        cb.checked = c.enabled;
+        if (c.locked) {
+          cb.disabled = true;
+        } else {
+          cb.addEventListener('change', function(){ c.enabled = cb.checked; });
+        }
+        var sl = document.createElement('span');
+        sl.className = 'slider';
+        sw.appendChild(cb); sw.appendChild(sl);
+        head.appendChild(label);
+        if (c.locked) {
+          var lock = document.createElement('span');
+          lock.className = 'cat-lock';
+          lock.textContent = 'always on';
+          head.appendChild(lock);
+        }
+        head.appendChild(sw);
+        var desc = document.createElement('div');
+        desc.className = 'cat-desc';
+        desc.textContent = c.domains.join(', ');
+        div.appendChild(head); div.appendChild(desc);
+        el.appendChild(div);
+      })(cats[i]);
+    }
+  }
+
+  function showToast(msg) {
+    var t = document.getElementById('toast');
+    t.textContent = msg;
+    t.classList.add('show');
+    setTimeout(function(){ t.classList.remove('show'); }, 1500);
+  }
+
+  document.getElementById('save').addEventListener('click', function(){
+    if (!config) return;
+    var root = { categories: config.categories };
+    var ok = VencordMobileNative.saveFirewallConfig(JSON.stringify(root));
+    showToast(ok ? 'Saved' : 'Save failed');
+  });
+
+  document.getElementById('reset').addEventListener('click', function(){
+    VencordMobileNative.resetFirewallConfig();
+    var fresh = JSON.parse(VencordMobileNative.getFirewallConfig());
+    config = fresh;
+    renderCategories(fresh.categories || []);
+    showToast('Reset to defaults');
+  });
+
+  document.getElementById('close').addEventListener('click', function(){
+    try { VencordMobileNative.close(); } catch(e) {}
+  });
+
+  // Called from native onPageFinished after the page URL has committed.
+  window.vdeFirewallInit = function(raw) {
+    try {
+      config = JSON.parse(raw);
+      if (config && config.error) {
+        document.getElementById('body').innerHTML = '<div class="cat-desc">Failed to load firewall config: ' + config.error + '</div>';
+        return;
+      }
+      renderCategories(config.categories || []);
+    } catch(e) {
+      document.getElementById('body').innerHTML = '<div class="cat-desc">Failed to load firewall config: ' + e.message + '</div>';
+    }
+  };
+})();
+</script>
+</body>
+</html>

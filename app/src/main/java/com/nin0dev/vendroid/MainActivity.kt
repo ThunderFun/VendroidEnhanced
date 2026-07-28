@@ -19,6 +19,7 @@ import com.google.gson.Gson
 import com.nin0dev.vendroid.utils.Constants
 import com.nin0dev.vendroid.utils.JsPatches
 import com.nin0dev.vendroid.utils.Logger.e
+import com.nin0dev.vendroid.utils.VDELog
 import com.nin0dev.vendroid.webview.HttpClient
 import com.nin0dev.vendroid.webview.HttpClient.fetchVencord
 import com.nin0dev.vendroid.webview.VChromeClient
@@ -94,6 +95,7 @@ class MainActivity : AppCompatActivity() {
     @SuppressLint("SetJavaScriptEnabled")
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        VDELog.i("Main", "onCreate()")
         if (!getSharedPreferences("settings", Context.MODE_PRIVATE).getBoolean("migratedSettings", false)) {
             migrateSettings()
         }
@@ -106,7 +108,9 @@ class MainActivity : AppCompatActivity() {
         val sPrefs = getSharedPreferences("settings", Context.MODE_PRIVATE)
         val editor = sPrefs.edit()
 
-        WebView.setWebContentsDebuggingEnabled(BuildConfig.DEBUG)
+        // WebView debugging exposes the page (cookies, token, JS context) to any
+        // attached debugger. Gate it behind an explicit build flag; never in dev/release.
+        WebView.setWebContentsDebuggingEnabled(BuildConfig.ALLOW_WEBVIEW_DEBUGGING)
         setContentView(R.layout.activity_main)
         WindowCompat.setDecorFitsSystemWindows(window, true)
 
@@ -164,6 +168,16 @@ class MainActivity : AppCompatActivity() {
         wv!!.setWebViewClient(webViewClient)
         wv!!.setWebChromeClient(chromeClient)
 
+        // Sync the typing indicator toggle to the WebView client. Read once
+        // at startup into a @Volatile field; shouldInterceptRequest reads
+        // that field instead of SharedPreferences per request.
+        val blockTyping = sPrefs.getBoolean("vendroid_blockTypingIndicator", false)
+        VWebviewClient.updateTypingBlock(blockTyping)
+
+        // Sync the external-link confirmation toggle to the link popup.
+        val confirmLinks = sPrefs.getBoolean("vendroid_confirmExternalLinks", true)
+        com.nin0dev.vendroid.webview.LinkHandler.updateConfirmExternalLinks(confirmLinks)
+
         // Intercept Service Worker fetch events (API 24+) — they bypass
         // WebViewClient.shouldInterceptRequest entirely.
         if (androidx.webkit.WebViewFeature.isFeatureSupported(
@@ -173,13 +187,34 @@ class MainActivity : AppCompatActivity() {
                     object : androidx.webkit.ServiceWorkerClientCompat() {
                         @androidx.annotation.RequiresApi(android.os.Build.VERSION_CODES.LOLLIPOP)
                         override fun shouldInterceptRequest(request: android.webkit.WebResourceRequest): android.webkit.WebResourceResponse? {
-                            val host = request.url.host
-                            return if (host != null && !Constants.isAllowedDomain(host)) {
-                                android.webkit.WebResourceResponse(
+                            // Restrict to browser/inline schemes; data:, file:,
+                            // and custom schemes have a null host and would
+                            // otherwise bypass the domain allowlist.
+                            val scheme = request.url.scheme
+                            if (scheme != "https" && scheme != "http" && scheme != "blob" && scheme != "data") {
+                                return android.webkit.WebResourceResponse(
                                     "text/plain", "utf-8",
                                     java.io.ByteArrayInputStream(ByteArray(0))
                                 )
-                            } else null
+                            }
+                            if (scheme == "http") {
+                                return android.webkit.WebResourceResponse(
+                                    "text/plain", "utf-8",
+                                    java.io.ByteArrayInputStream(ByteArray(0))
+                                )
+                            }
+                            val host = request.url.host
+                            if (host != null && !Constants.isAllowedDomain(host)) {
+                                return android.webkit.WebResourceResponse(
+                                    "text/plain", "utf-8",
+                                    java.io.ByteArrayInputStream(ByteArray(0))
+                                )
+                            }
+                            // Apply the same privacy path filter as
+                            // VWebviewClient so SW-fetched telemetry/Sentry
+                            // requests can't bypass it.
+                            VWebviewClient.shouldBlockForPrivacy(host, request.url.path)?.let { return it }
+                            return null
                         }
                     }
                 )
@@ -196,7 +231,6 @@ class MainActivity : AppCompatActivity() {
         s.allowContentAccess = false
 
         s.cacheMode = android.webkit.WebSettings.LOAD_DEFAULT
-        s.databaseEnabled = false
         s.mediaPlaybackRequiresUserGesture = false
         s.mixedContentMode = android.webkit.WebSettings.MIXED_CONTENT_NEVER_ALLOW
         s.setBuiltInZoomControls(false)
@@ -282,6 +316,7 @@ class MainActivity : AppCompatActivity() {
         } else {
             Toast.makeText(this, "Safe mode enabled, Vencord won't be loaded", Toast.LENGTH_SHORT)
                 .show()
+            VDELog.w("Main", "Safe mode enabled — Vencord will not load")
             editor.putBoolean("safeMode", false)
             editor.apply()
         }
@@ -409,21 +444,30 @@ class MainActivity : AppCompatActivity() {
             runtime = HttpClient.VencordRuntime
             mobileRuntime = HttpClient.VencordMobileRuntime
         }
+        VDELog.i("Main", "Injecting Vencord runtime (${runtime?.length ?: 0} chars, mobile=${mobileRuntime?.length ?: 0} chars)")
         if (wv != null && runtime != null && mobileRuntime != null) {
             if (missedInjection) {
                 missedInjection = false
+                VDELog.w("Main", "Missed injection, scheduling reload")
                 val url = currentUrlForBridge
                 if (url != null && Constants.isDiscordDomain(Uri.parse(url).host ?: "")) {
                     wv?.reload()
                     return
                 }
             }
+            // Only inject on Discord pages; the runtimes are designed for
+            // Discord and should not run on whitelisted non-Discord pages.
+            val url = currentUrlForBridge
+            if (url == null || !Constants.isDiscordDomain(Uri.parse(url).host ?: "")) return
             wv?.evaluateJavascript(runtime + ";", null)
             wv?.evaluateJavascript(mobileRuntime + ";", null)
         }
     }
 
     fun showDiscordToast(message: String, type: String) {
+        // message is JSON-encoded via gson.toJson before interpolation, but type
+        // is concatenated raw. Keep the allowList strict; widening it would allow
+        // JS injection via the unencoded type value.
         val allowedTypes = setOf("SUCCESS", "ERROR", "INFO", "WARN")
         val safeType = if (type in allowedTypes) type else "INFO"
         wv?.post(Runnable {

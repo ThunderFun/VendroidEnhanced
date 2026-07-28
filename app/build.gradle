@@ -40,6 +40,7 @@ android {
     buildTypes {
         debug {
             applicationIdSuffix ".debug"
+            buildConfigField "boolean", "ALLOW_WEBVIEW_DEBUGGING", "true"
         }
 
         dev {
@@ -48,6 +49,7 @@ android {
             shrinkResources true
             signingConfig signingConfigs.debug
             proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
+            buildConfigField "boolean", "ALLOW_WEBVIEW_DEBUGGING", "false"
         }
 
         release {
@@ -55,6 +57,7 @@ android {
             shrinkResources true
             signingConfig signingConfigs.release
             proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
+            buildConfigField "boolean", "ALLOW_WEBVIEW_DEBUGGING", "false"
         }
     }
     compileOptions {

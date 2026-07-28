@@ -7,23 +7,46 @@ package com.nin0dev.vendroid.utils
 object JsPatches {
     /**
      * Compact JS that wraps all JavaScript network APIs and blocks calls to
-     * non-whitelisted hosts.  Service Workers are **allowed** to register
-     * so Discord can cache assets locally; SW fetch events are still
-     * intercepted at the Android layer by ServiceWorkerClientCompat.
+     * non-whitelisted hosts. Service Workers are **allowed** to register so
+     * Discord can cache assets locally; SW fetch events are still intercepted
+     * at the Android layer by ServiceWorkerClientCompat.
+     *
+     * The allowlist array is built from [FirewallConfig] at injection time,
+     * so config edits take effect on the next page load without a restart.
      */
-    val NETWORK_FIREWALL_JS: String =
-        "(function(){" +
-        "'use strict';" +
-        "if(window.__vendroidFw===1)return;" +
-        "window.__vendroidFw=1;" +
-        "var a=['discord.com','.discord.com','discordapp.com','.discordapp.com','discord.gg','.discord.gg','discord.media','.discord.media','discordapp.net','.discordapp.net','storage.googleapis.com','.storage.googleapis.com','github.com','.github.com','githubusercontent.com','.githubusercontent.com','hcaptcha.com','.hcaptcha.com','discordsays.com','.discordsays.com','vencord.dev','.vencord.dev','codeberg.org','.codeberg.org','git.nin0.dev','.git.nin0.dev','vde-builds.nin0.dev','.vde-builds.nin0.dev','cdn.jsdelivr.net','.cdn.jsdelivr.net','jsdelivr.net','.jsdelivr.net'];" +
-        "function ok(u){try{var h=new URL(u).host;}catch(e){return false;}for(var i=0;i<a.length;i++)if(h===a[i]||h.endsWith(a[i]))return true;return false;}" +
-        "var of=window.fetch;window.fetch=function(u,o){if(typeof u==='string'&&!ok(u)){console.warn('[Vendroid] Blocked fetch: '+u);return Promise.reject(new TypeError('Blocked by Vendroid firewall'));}return of.apply(this,arguments);};" +
-        "var oxo=XMLHttpRequest.prototype.open;XMLHttpRequest.prototype.open=function(m,u){if(typeof u==='string'&&!ok(u)){console.warn('[Vendroid] Blocked XHR: '+u);throw new TypeError('Blocked by Vendroid firewall');}return oxo.apply(this,arguments);};" +
-        "var ow=window.WebSocket;window.WebSocket=function(u,p){if(typeof u==='string'&&!ok(u)){console.warn('[Vendroid] Blocked WS: '+u);throw new TypeError('Blocked by Vendroid firewall');}return new ow(u,p);};Object.setPrototypeOf(window.WebSocket,ow);window.WebSocket.prototype=ow.prototype;" +
-        "if(window.EventSource){var oes=window.EventSource;window.EventSource=function(u,o){if(typeof u==='string'&&!ok(u)){console.warn('[Vendroid] Blocked ES: '+u);throw new TypeError('Blocked by Vendroid firewall');}return new oes(u,o);};}" +
-        "if(window.Worker){var owr=window.Worker;window.Worker=function(u,o){if(typeof u==='string'&&!ok(u)){console.warn('[Vendroid] Blocked Worker: '+u);throw new TypeError('Blocked by Vendroid firewall');}return new owr(u,o);};}" +
-        "})()"
+    val NETWORK_FIREWALL_JS: String
+        get() = buildNetworkFirewallJs()
+
+    /** Builds the JS firewall string from the current [FirewallConfig] snapshot. */
+    fun buildNetworkFirewallJs(): String {
+        val hosts = FirewallConfig.jsAllowedHosts()
+        val sb = StringBuilder(hosts.size * 30)
+        sb.append('[')
+        var first = true
+        for (h in hosts) {
+            if (!first) sb.append(',')
+            first = false
+            sb.append('\'')
+            // Escape backslash first, then single quote. normalizeDomain()
+            // already restricts chars to [a-z0-9.-], so this is defense in depth.
+            sb.append(h.replace("\\", "\\\\").replace("'", "\\'"))
+            sb.append('\'')
+        }
+        sb.append(']')
+        val arr = sb.toString()
+        return "(function(){" +
+            "'use strict';" +
+            "if(window.__vendroidFw===1)return;" +
+            "window.__vendroidFw=1;" +
+            "var a=$arr;" +
+            "function ok(u){try{var h=new URL(u).host;}catch(e){return false;}for(var i=0;i<a.length;i++){var e=a[i];if(h===e||h.endsWith(e))return true;if(e.charCodeAt(0)===46&&h===e.slice(1))return true;}return false;}" +
+            "var of=window.fetch;window.fetch=function(u,o){if(typeof u==='string'&&!ok(u)){console.warn('[Vendroid] Blocked fetch: '+u);return Promise.reject(new TypeError('Blocked by Vendroid firewall'));}return of.apply(this,arguments);};" +
+            "var oxo=XMLHttpRequest.prototype.open;XMLHttpRequest.prototype.open=function(m,u){if(typeof u==='string'&&!ok(u)){console.warn('[Vendroid] Blocked XHR: '+u);throw new TypeError('Blocked by Vendroid firewall');}return oxo.apply(this,arguments);};" +
+            "var ow=window.WebSocket;window.WebSocket=function(u,p){if(typeof u==='string'&&!ok(u)){console.warn('[Vendroid] Blocked WS: '+u);throw new TypeError('Blocked by Vendroid firewall');}return new ow(u,p);};Object.setPrototypeOf(window.WebSocket,ow);window.WebSocket.prototype=ow.prototype;" +
+            "if(window.EventSource){var oes=window.EventSource;window.EventSource=function(u,o){if(typeof u==='string'&&!ok(u)){console.warn('[Vendroid] Blocked ES: '+u);throw new TypeError('Blocked by Vendroid firewall');}return new oes(u,o);};}" +
+            "if(window.Worker){var owr=window.Worker;window.Worker=function(u,o){if(typeof u==='string'&&!ok(u)){console.warn('[Vendroid] Blocked Worker: '+u);throw new TypeError('Blocked by Vendroid firewall');}return new owr(u,o);};}" +
+            "})()"
+    }
 
     const val ANIMATION_PATCH_JS: String =
         "(function(){" +
@@ -51,5 +74,6 @@ object JsPatches {
      * round-trip per navigation.  Both patches have their own idempotency
      * guards (__vendroidFw, __vendroidAnimCtrl) so re-running is safe.
      */
-    val STARTUP_PATCHES_JS: String = NETWORK_FIREWALL_JS + ";" + ANIMATION_PATCH_JS
+    val STARTUP_PATCHES_JS: String
+        get() = buildNetworkFirewallJs() + ";" + ANIMATION_PATCH_JS
 }
