@@ -167,8 +167,13 @@ class VencordNative(private val activity: WeakReference<MainActivity>, wv: WebVi
      * Defense-in-depth domain check for sensitive bridge methods. Re-reads the
      * WebView's current URL on the UI thread in addition to the cached
      * [currentHostForBridge], closing the TOCTOU window between a navigation
-     * and the cached host being refreshed. Returns false if either source
-     * disagrees or the live URL is not a Discord domain.
+     * and the cached host being refreshed. Returns false if the live URL is
+     * not a Discord domain.
+     *
+     * The UI-thread read is bounded to 50 ms so a busy UI thread cannot stall
+     * the shared JS bridge thread. If the live read times out, the cached
+     * [currentHostForBridge] (validated by [isOnDiscordDomain] above) is
+     * trusted as the fallback.
      */
     private fun isOnDiscordDomainStrict(): Boolean {
         if (!isOnDiscordDomain()) return false
@@ -184,9 +189,13 @@ class VencordNative(private val activity: WeakReference<MainActivity>, wv: WebVi
                 latch.countDown()
             }
             try {
-                if (!latch.await(2, java.util.concurrent.TimeUnit.SECONDS)) return false
+                // Bounded wait so the bridge thread isn't blocked for seconds.
+                // Fall back to the cached host if the UI thread is busy.
+                if (!latch.await(50, java.util.concurrent.TimeUnit.MILLISECONDS)) {
+                    return true
+                }
             } catch (_: InterruptedException) {
-                return false
+                return true
             }
         }
         return liveHost != null && Constants.isDiscordDomain(liveHost!!)
@@ -373,6 +382,13 @@ class VencordNative(private val activity: WeakReference<MainActivity>, wv: WebVi
                 return
             }
             val sPrefs = settingsPrefs ?: return
+            if (safeId == "clientMod") {
+                // Only the two known mods are valid; reject anything else.
+                if (safeValue != "vencord" && safeValue != "equicord") {
+                    if (com.nin0dev.vendroid.BuildConfig.DEBUG) w("Rejected invalid clientMod value: $safeValue")
+                    return
+                }
+            }
             sPrefs.edit {
                 if (safeId == "clientMod") {
                     // Invalidate the stale bundle so the next launch downloads
@@ -505,6 +521,12 @@ class VencordNative(private val activity: WeakReference<MainActivity>, wv: WebVi
                                     "window.qcssSet?.(${gson.toJson(safeQuickCss)})", null
                                 )
                             } else {
+                                // Fallback when the bundle didn't supply the
+                                // CSS. Vencord stores QuickCSS in IndexedDB, so
+                                // it must be read via the loaded bundle; if
+                                // Vencord isn't ready the editor opens empty.
+                                // In practice the bundle always passes the
+                                // CSS, so this branch is rarely hit.
                                 val mainWv = wvRef.get() ?: return
                                 mainWv.evaluateJavascript("VencordNative.quickCss.get()") { result ->
                                     // result is a JSON-encoded string; pass it to JS via

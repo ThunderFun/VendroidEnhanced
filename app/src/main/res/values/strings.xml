@@ -1,5 +1,6 @@
 <resources>
     <string name="app_name">Vendroid</string>
+    <string name="recovery_launcher_name">Vendroid (Recovery)</string>
     <string name="splashscreen_text">Loading Vendroid&#8230;</string>
     <string name="autocheck_vencord">Automatically update Vencord (Coming soon)</string>
     <string name="autocheck_vendroid">Automatically check for Vendroid updates</string>
@@ -49,4 +50,5 @@
     <string name="link_dialog_cancel">Cancel</string>
     <string name="link_copied">Link copied to clipboard</string>
     <string name="link_blocked_scheme">Cannot open this type of link</string>
+    <string name="link_malformed">This link could not be read</string>
 </resources>

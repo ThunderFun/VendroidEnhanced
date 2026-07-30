@@ -12,9 +12,51 @@ object Constants {
         "git.nin0.dev", "vde-builds.nin0.dev"
     )
 
-    private val domainCache = ConcurrentHashMap<String, Boolean>()
-    private val vencordHostCache = ConcurrentHashMap<String, Boolean>()
-    private val allowedDomainCache = ConcurrentHashMap<String, Boolean>()
+    private val domainCache = BoundedHostCache()
+    private val vencordHostCache = BoundedHostCache()
+    private val allowedDomainCache = BoundedHostCache()
+    private val navigationDomainCache = BoundedHostCache()
+
+    /**
+     * Thread-safe boolean cache with a size cap. On overflow the backing map
+     * is swapped for a fresh one rather than evicting individual entries;
+     * the working set is well under the cap, so wholesale replacement is
+     * cheaper than LRU bookkeeping.
+     */
+    private class BoundedHostCache(private val cap: Int = DEFAULT_CAP) {
+        @Volatile private var map: ConcurrentHashMap<String, Boolean> = ConcurrentHashMap()
+
+        fun computeIfAbsent(key: String, loader: (String) -> Boolean): Boolean {
+            var m = map
+            val existing = m[key]
+            if (existing != null) return existing
+            val v = loader(key)
+            // Racy on overflow; at worst a few extra entries slip in before
+            // the swap, which is acceptable.
+            if (m.size >= cap) {
+                m = ConcurrentHashMap()
+                map = m
+            }
+            m.putIfAbsent(key, v)
+            return v
+        }
+
+        fun clear() { map = ConcurrentHashMap() }
+
+        companion object {
+            private const val DEFAULT_CAP = 2048
+        }
+    }
+
+    // Hosts allowed to load as top-level pages in the WebView. A strict subset
+    // of the firewall allowlist — only Discord-owned domains. Mirrors the
+    // locked DISCORD category in FirewallConfig. Kept hardcoded (not driven
+    // by FirewallConfig) so it cannot be widened by config edits.
+    private val NAVIGATION_ALLOWED_HOSTS = hashSetOf(
+        "discord.com", "discordapp.com", "discord.gg",
+        "discord.media", "discordapp.net",
+        "discordsays.com", "watchanimeattheoffice.com"
+    )
 
     /**
      * WebView domain allowlist. Backed by [FirewallConfig]. Entries use
@@ -42,10 +84,22 @@ object Constants {
                     || h.endsWith(".github.io") || h.endsWith(".codeberg.page")
         } ?: false
 
-    /** Clears the per-host allowlist cache after a config change. Discord
-     *  core and Vencord update host caches are not user-editable, so they
-     *  are preserved. */
+    /** Returns true if [host] may load as a top-level page in the WebView.
+     *  Only Discord-owned domains are permitted; all other hosts route to
+     *  the link popup. This is independent of the firewall allowlist, which
+     *  governs subresource fetches and remains broader. */
+    fun isNavigationAllowedDomain(host: String): Boolean =
+        navigationDomainCache.computeIfAbsent(host) { h ->
+            NAVIGATION_ALLOWED_HOSTS.any { h == it || h.endsWith(".$it") }
+        } ?: false
+
+    /** Clears all per-host caches, keeping them bounded over long sessions.
+     *  Also invalidates the cached JS firewall string in [JsPatches]. */
     fun invalidateFirewallCaches() {
         allowedDomainCache.clear()
+        domainCache.clear()
+        vencordHostCache.clear()
+        navigationDomainCache.clear()
+        JsPatches.invalidateCache()
     }
 }

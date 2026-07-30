@@ -46,6 +46,11 @@ class MainActivity : AppCompatActivity() {
     var currentHostForBridge: String? = null
     @Volatile
     var missedInjection = false
+    /** Deep link received via onNewIntent during onCreate; applied once
+     *  the WebView is initialized so it isn't overwritten by the initial
+     *  URL load. */
+    @Volatile
+    private var pendingDeepLink: String? = null
     private lateinit var chromeClient: VChromeClient
     private lateinit var vencordNative: VencordNative
 
@@ -80,11 +85,18 @@ class MainActivity : AppCompatActivity() {
             "checkAnnouncements",
             sPrefs.getBoolean("checkVendroidUpdates", true)
         )
-        ed.putString(
-            "clientMod",
-            if (sPrefs.getBoolean("equicord", false)) "equicord" else "vencord"
-        )
-        ed.putString("splashScreen", sPrefs.getString("splash", "viggy"));
+        // Derive clientMod from the legacy boolean only if not already set;
+        // re-runs (reinstall/flag wipe) must not clobber an existing choice.
+        if (!sPrefs.contains("clientMod")) {
+            ed.putString(
+                "clientMod",
+                if (sPrefs.getBoolean("equicord", false)) "equicord" else "vencord"
+            )
+        }
+
+        ed.remove("checkVendroidUpdates")
+        ed.remove("equicord")
+        ed.remove("splash")
 
         ed.apply()
     }
@@ -355,6 +367,12 @@ class MainActivity : AppCompatActivity() {
         loadingScreenManager.scheduleTimeout(30000)
 
         wvInitialized = true
+
+        // Apply a deep link stashed by onNewIntent during onCreate.
+        pendingDeepLink?.let { link ->
+            pendingDeepLink = null
+            handleUrl(Uri.parse(link))
+        }
     }
 
     private fun handleUrl(url: Uri?) {
@@ -365,7 +383,9 @@ class MainActivity : AppCompatActivity() {
             currentUrlForBridge = url.toString()
             currentHostForBridge = host
             if (!wvInitialized || wv == null) {
-                wv?.loadUrl(url.toString())
+                // Defer until onCreate finishes; loadUrl now would be
+                // overwritten by the initial-URL load.
+                pendingDeepLink = url.toString()
             } else {
                 wv!!.evaluateJavascript(
                     "Vencord.Webpack.Common.NavigationRouter.transitionTo(${gson.toJson(path)})",

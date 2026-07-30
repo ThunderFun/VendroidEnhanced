@@ -17,6 +17,11 @@ import java.lang.ref.WeakReference
  * which mirrors the typing-indicator toggle pattern in [VWebviewClient]:
  * a `@Volatile` static field, read once at startup and live-updated from
  * `VencordNative.setBool`. Default is `true` (dialog shown).
+ *
+ * The URL is normalized via [UrlNormalizer] before display, launch, copy, and
+ * share so that non-ASCII paths render readably, the host is always shown in
+ * Punycode to defeat homograph attacks, userinfo is stripped to prevent
+ * credential leakage, and the launched Intent receives a fully encoded URI.
  */
 class LinkHandler(context: Context) {
     private val activityRef: WeakReference<Activity> =
@@ -30,17 +35,26 @@ class LinkHandler(context: Context) {
         val activity = activityRef.get()
         if (activity == null || activity.isFinishing || activity.isDestroyed) return
 
-        // Restrict to browser schemes. WebView can invoke shouldOverrideUrlLoading
-        // for arbitrary schemes (content:, intent:, data:); forwarding those to
-        // ACTION_VIEW could launch unintended deep-link targets or leak content URIs.
-        val scheme = url.scheme
+        val n = UrlNormalizer.normalize(url)
+
+        // Restrict to browser schemes. WebView can invoke
+        // shouldOverrideUrlLoading for arbitrary schemes; forwarding those to
+        // ACTION_VIEW could launch unintended deep-link targets or leak
+        // content URIs. A null scheme is rejected explicitly rather than
+        // relying on the inequality check.
+        val scheme = n.scheme
         if (scheme != "http" && scheme != "https") {
             Toast.makeText(activity, R.string.link_blocked_scheme, Toast.LENGTH_SHORT).show()
             return
         }
 
+        if (n.malformed) {
+            Toast.makeText(activity, R.string.link_malformed, Toast.LENGTH_SHORT).show()
+            return
+        }
+
         if (!confirmExternalLinks) {
-            openExternal(activity, url)
+            openExternal(activity, n.launchUri)
             return
         }
 
@@ -52,15 +66,17 @@ class LinkHandler(context: Context) {
         )
         // AlertDialog renders only one of setMessage/setItems/setView; the URL
         // goes in the title so it stays visible alongside the item list.
+        // displayString is already decoded, spoof-resistant, and capped by
+        // UrlNormalizer.
         val dialog = MaterialAlertDialogBuilder(activity)
-            .setTitle(url.toString())
+            .setTitle(n.displayString.ifEmpty { activity.getString(R.string.link_dialog_title) })
             .setCancelable(true)
             .setItems(labels) { d, which ->
                 d.dismiss()
                 when (which) {
-                    0 -> copyToClipboard(activity, url)
-                    1 -> openExternal(activity, url)
-                    2 -> shareLink(activity, url)
+                    0 -> copyToClipboard(activity, n.clipboardString)
+                    1 -> openExternal(activity, n.launchUri)
+                    2 -> shareLink(activity, n.clipboardString)
                     // 3 = Cancel
                 }
             }
@@ -70,24 +86,30 @@ class LinkHandler(context: Context) {
 
     private fun openExternal(activity: Activity, url: Uri) {
         val intent = Intent(Intent.ACTION_VIEW, url)
+            .addCategory(Intent.CATEGORY_BROWSABLE)
+            .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        // Always show a chooser. Counting resolvers is unreliable under
+        // Android 11+ visibility rules and risks auto-launching a spoofing
+        // app that registered for this host.
+        val chooser = Intent.createChooser(intent, null)
             .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
         try {
-            activity.startActivity(intent)
+            activity.startActivity(chooser)
         } catch (_: android.content.ActivityNotFoundException) {
             // No browser installed; shouldOverrideUrlLoading already blocked in-WebView nav.
         }
     }
 
-    private fun copyToClipboard(activity: Activity, url: Uri) {
+    private fun copyToClipboard(activity: Activity, url: String) {
         val clipboard = activity.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
-        clipboard.setPrimaryClip(ClipData.newPlainText("link", url.toString()))
+        clipboard.setPrimaryClip(ClipData.newPlainText("link", url))
         Toast.makeText(activity, R.string.link_copied, Toast.LENGTH_SHORT).show()
     }
 
-    private fun shareLink(activity: Activity, url: Uri) {
+    private fun shareLink(activity: Activity, url: String) {
         val intent = Intent(Intent.ACTION_SEND)
             .setType("text/plain")
-            .putExtra(Intent.EXTRA_TEXT, url.toString())
+            .putExtra(Intent.EXTRA_TEXT, url)
             .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
         try {
             activity.startActivity(Intent.createChooser(intent, null).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
@@ -97,8 +119,8 @@ class LinkHandler(context: Context) {
     }
 
     companion object {
-        // Mirrors blockTypingIndicator in VWebviewClient: @Volatile field read on
-        // the UI thread, set at startup and live-updated from VencordNative.setBool.
+        // Mirrors blockTypingIndicator in VWebviewClient: @Volatile field read
+        // on the UI thread, set at startup and live-updated from VencordNative.
         @Volatile
         private var confirmExternalLinks = true
 

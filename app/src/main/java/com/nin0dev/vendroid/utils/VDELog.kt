@@ -3,7 +3,10 @@ package com.nin0dev.vendroid.utils
 import android.content.Context
 import android.os.Handler
 import android.os.HandlerThread
+import java.io.BufferedWriter
 import java.io.File
+import java.io.FileOutputStream
+import java.io.OutputStreamWriter
 import java.time.Instant
 import java.time.ZoneId
 import java.time.format.DateTimeFormatter
@@ -33,6 +36,11 @@ object VDELog {
 
     private var handler: Handler? = null
     private var logFile: File? = null
+    // Kept open on the handler thread so each log line is a buffered write
+    // instead of an open/write/close syscall. Handler-thread confined only.
+    private var writer: BufferedWriter? = null
+    // Mirrors logFile.length() without a stat() per log line.
+    private var currentFileBytes = 0L
 
     private val initialized = AtomicBoolean(false)
 
@@ -42,14 +50,14 @@ object VDELog {
         val thread = HandlerThread("VDELog-writer", android.os.Process.THREAD_PRIORITY_BACKGROUND)
         thread.start()
         handler = Handler(thread.looper)
-        // Truncate the previous session's file so logs don't persist across launches.
-        try {
-            logFile?.writeText("")
-        } catch (_: Exception) {}
-        try {
-            val header = "--- Session: ${dateFmt.format(Instant.now().atZone(zone))} (PID=${android.os.Process.myPid()}) ---\n"
-            logFile?.appendText(header)
-        } catch (_: Exception) {}
+        // Truncate the previous session's file and write the session header.
+        handler?.post {
+            try {
+                openWriterLocked(append = false)
+                val header = "--- Session: ${dateFmt.format(Instant.now().atZone(zone))} (PID=${android.os.Process.myPid()}) ---\n"
+                writeLineLocked(header)
+            } catch (_: Exception) {}
+        }
     }
 
     fun log(level: Level, tag: String, message: String, throwable: Throwable? = null) {
@@ -94,16 +102,39 @@ object VDELog {
     fun clearLogs() {
         synchronized(buffer) { buffer.clear() }
         handler?.post {
-            try { logFile?.writeText("") } catch (_: Exception) {}
+            try {
+                openWriterLocked(append = false)
+            } catch (_: Exception) {}
         }
     }
 
     fun shutdown() {
-        handler?.looper?.quitSafely()
+        val h = handler
+        if (h != null) {
+            // Flush and close before quitting the looper so buffered bytes survive.
+            h.post {
+                try {
+                    writer?.flush()
+                    writer?.close()
+                } catch (_: Exception) {}
+                writer = null
+            }
+            h.looper.quitSafely()
+        }
         handler = null
     }
 
     fun getLogFileContents(): String {
+        // Flush on the handler thread so the on-disk file is current.
+        val h = handler
+        if (h != null) {
+            val latch = java.util.concurrent.CountDownLatch(1)
+            h.post {
+                try { writer?.flush() } catch (_: Exception) {}
+                latch.countDown()
+            }
+            try { latch.await(2, java.util.concurrent.TimeUnit.SECONDS) } catch (_: InterruptedException) {}
+        }
         return try {
             val f = logFile ?: return "No log file."
             if (f.exists()) f.readText() else "No log file."
@@ -114,7 +145,7 @@ object VDELog {
 
     private fun writeToFile(entry: LogEntry, throwable: Throwable?) {
         try {
-            val f = logFile ?: return
+            if (writer == null) openWriterLocked(append = true)
             val line = buildString(160) {
                 append('[')
                 append(dateFmt.format(Instant.ofEpochMilli(entry.timestamp).atZone(zone)))
@@ -130,17 +161,70 @@ object VDELog {
                 }
                 append('\n')
             }
-            f.appendText(line)
-            rotateIfNeeded(f)
-        } catch (_: Exception) {}
+            writeLineLocked(line)
+            rotateIfNeededLocked()
+        } catch (_: Exception) {
+            // Writer may be in a bad state — force a reopen on the next line.
+            try { writer?.close() } catch (_: Exception) {}
+            writer = null
+        }
     }
 
-    private fun rotateIfNeeded(f: File) {
-        if (f.length() <= MAX_FILE_BYTES) return
+    /** Writes [line] to the writer and advances [currentFileBytes].
+     *  Handler-thread confined. */
+    private fun writeLineLocked(line: String) {
+        val w = writer ?: return
+        val bytes = line.toByteArray(Charsets.UTF_8)
+        w.write(line, 0, line.length)
+        currentFileBytes += bytes.size
+    }
+
+    /** Opens or reopens the file writer. When [append] is false the file is
+     *  truncated and [currentFileBytes] reset; otherwise appended to and
+     *  seeded from the existing file length. Handler-thread confined. */
+    private fun openWriterLocked(append: Boolean) {
         try {
-            val bytes = f.readBytes()
-            val keep = bytes.copyOfRange((bytes.size - TRUNCATE_TARGET.toInt()).coerceAtLeast(0), bytes.size)
-            f.writeBytes(keep)
+            writer?.close()
         } catch (_: Exception) {}
+        writer = null
+        val f = logFile ?: return
+        if (!append) {
+            try { f.writeText("") } catch (_: Exception) {}
+            currentFileBytes = 0
+        } else {
+            currentFileBytes = if (f.exists()) f.length() else 0
+        }
+        writer = BufferedWriter(
+            OutputStreamWriter(FileOutputStream(f, append), Charsets.UTF_8),
+            8192
+        )
+    }
+
+    /** Truncates the file to [TRUNCATE_TARGET] newest bytes when it exceeds
+     *  [MAX_FILE_BYTES], using [currentFileBytes] instead of stat(). */
+    private fun rotateIfNeededLocked() {
+        if (currentFileBytes <= MAX_FILE_BYTES) return
+        try {
+            writer?.flush()
+            writer?.close()
+            writer = null
+            val f = logFile ?: return
+            val bytes = f.readBytes()
+            val keep = bytes.copyOfRange(
+                (bytes.size - TRUNCATE_TARGET.toInt()).coerceAtLeast(0),
+                bytes.size
+            )
+            f.writeBytes(keep)
+            currentFileBytes = keep.size.toLong()
+            writer = BufferedWriter(
+                OutputStreamWriter(FileOutputStream(f, true), Charsets.UTF_8),
+                8192
+            )
+        } catch (_: Exception) {
+            // If rotation failed, reopen in append mode so logging continues.
+            try {
+                openWriterLocked(append = true)
+            } catch (_: Exception) {}
+        }
     }
 }

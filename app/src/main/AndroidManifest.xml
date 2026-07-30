@@ -5,6 +5,16 @@
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
 
+    <!-- Android 11+ package visibility: lets queryIntentActivities() see all
+         browser candidates so LinkHandler can show a chooser rather than
+         silently routing to the default browser. -->
+    <queries>
+        <intent>
+            <action android:name="android.intent.action.VIEW" />
+            <data android:scheme="https" />
+        </intent>
+    </queries>
+
     <application
         android:name=".VendroidApp"
         android:allowBackup="false"
@@ -19,9 +29,15 @@
         tools:targetApi="35">
         <activity
             android:name=".RecoveryActivity"
-            android:exported="false"
+            android:exported="true"
+            android:label="@string/recovery_launcher_name"
             android:launchMode="singleTask"
-            android:theme="@style/AppTheme" />
+            android:theme="@style/AppTheme">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
         <activity
             android:name=".MainActivity"
             android:configChanges="orientation|keyboardHidden|screenSize|layoutDirection|screenLayout|smallestScreenSize"

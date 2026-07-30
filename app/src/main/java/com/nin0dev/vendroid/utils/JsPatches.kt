@@ -13,9 +13,20 @@ object JsPatches {
      *
      * The allowlist array is built from [FirewallConfig] at injection time,
      * so config edits take effect on the next page load without a restart.
+     * The built string is cached and only rebuilt when the firewall config
+     * changes via [invalidateCache].
      */
+    @Volatile
+    private var cachedNetworkFirewallJs: String? = null
+
     val NETWORK_FIREWALL_JS: String
-        get() = buildNetworkFirewallJs()
+        get() = cachedNetworkFirewallJs ?: buildNetworkFirewallJs().also { cachedNetworkFirewallJs = it }
+
+    /** Invalidates the cached firewall JS string. Called from
+     *  [Constants.invalidateFirewallCaches] when the firewall config changes. */
+    fun invalidateCache() {
+        cachedNetworkFirewallJs = null
+    }
 
     /** Builds the JS firewall string from the current [FirewallConfig] snapshot. */
     fun buildNetworkFirewallJs(): String {
@@ -71,9 +82,9 @@ object JsPatches {
     /**
      * Combined firewall + animation patches for onPageStarted injection.
      * Single evaluateJavascript call instead of two, saving one IPC
-     * round-trip per navigation.  Both patches have their own idempotency
+     * round-trip per navigation. Both patches have their own idempotency
      * guards (__vendroidFw, __vendroidAnimCtrl) so re-running is safe.
      */
     val STARTUP_PATCHES_JS: String
-        get() = buildNetworkFirewallJs() + ";" + ANIMATION_PATCH_JS
+        get() = NETWORK_FIREWALL_JS + ";" + ANIMATION_PATCH_JS
 }

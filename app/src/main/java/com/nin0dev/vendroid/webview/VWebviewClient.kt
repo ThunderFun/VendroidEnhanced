@@ -43,21 +43,15 @@ class VWebviewClient(
 
     override fun shouldOverrideUrlLoading(view: WebView, request: WebResourceRequest): Boolean {
         val url = request.url
-        val scheme = url.scheme
-        if (scheme == "about") {
-            return false
+        val n = UrlNormalizer.normalize(url)
+        when (NavigationPolicy.decide(n.scheme, n.asciiHost, request.isForMainFrame)) {
+            NavigationPolicy.Action.LOAD_IN_WEBVIEW -> return false
+            NavigationPolicy.Action.SHOW_POPUP -> {
+                VDELog.d("WV", "External link: ${UrlNormalizer.redactForLog(url.toString())}")
+                linkHandler.showLinkPopup(url)
+                return true
+            }
         }
-        val host = url.host
-        // Whitelisted hosts (Discord, GitHub, etc.) load inside the WebView.
-        if (host != null && Constants.isAllowedDomain(host)) {
-            return false
-        }
-        // Non-allowlisted links go to the link popup (Copy / Open / Share /
-        // Cancel). Returning true cancels in-WebView navigation and prevents the
-        // click from bubbling up to Discord, which would treat it as a message tap.
-        VDELog.d("WV", "External link: $url")
-        linkHandler.showLinkPopup(url)
-        return true
     }
 
     private val disableHighlightCss = "html{-webkit-tap-highlight-color:transparent}a,button,[role=\"button\"],input,textarea,select,[tabindex]:not([tabindex=\"-1\"]){outline:none}"
@@ -139,15 +133,15 @@ class VWebviewClient(
         // for embedded images/CSS.
         val scheme = req.url.scheme
         if (scheme != "https" && scheme != "http" && scheme != "blob" && scheme != "data") {
-            return WebResourceResponse("text/plain", "utf-8", 204, "No Content", emptyMap(), java.io.ByteArrayInputStream(ByteArray(0)))
+            return blockedResponse()
         }
         val host = req.url.host
         if (host != null && !Constants.isAllowedDomain(host)) {
             // Block non-whitelisted subresources (scripts, images, XHR, media, etc.)
-            return WebResourceResponse("text/plain", "utf-8", 204, "No Content", emptyMap(), java.io.ByteArrayInputStream(ByteArray(0)))
+            return blockedResponse()
         }
         if (scheme == "http") {
-            return WebResourceResponse("text/plain", "utf-8", 204, "No Content", emptyMap(), java.io.ByteArrayInputStream(ByteArray(0)))
+            return blockedResponse()
         }
         // Privacy: block Discord telemetry, Sentry, and fingerprinting before
         // the CSP-stripping/fetch path so they never reach the network.
@@ -404,22 +398,28 @@ class VWebviewClient(
             return when {
                 path.endsWith("/science") || path.endsWith("/track") -> {
                     VDELog.d("WV", "Blocked telemetry: $path")
-                    WebResourceResponse("text/plain", "utf-8", 204, "No Content", emptyMap(), java.io.ByteArrayInputStream(ByteArray(0)))
+                    blockedResponse()
                 }
                 path.endsWith("/api.js") || path.startsWith("/cdn-cgi/") -> {
                     VDELog.d("WV", "Blocked fingerprinting: $path")
-                    WebResourceResponse("text/plain", "utf-8", 204, "No Content", emptyMap(), java.io.ByteArrayInputStream(ByteArray(0)))
+                    blockedResponse()
                 }
                 SENTRY_PATTERN.matches(path) -> {
                     VDELog.d("WV", "Blocked Sentry SDK: $path")
-                    WebResourceResponse("text/plain", "utf-8", 204, "No Content", emptyMap(), java.io.ByteArrayInputStream(ByteArray(0)))
+                    blockedResponse()
                 }
                 blockTypingIndicator && path.endsWith("/typing") -> {
                     VDELog.d("WV", "Blocked typing indicator: $path")
-                    WebResourceResponse("text/plain", "utf-8", 204, "No Content", emptyMap(), java.io.ByteArrayInputStream(ByteArray(0)))
+                    blockedResponse()
                 }
                 else -> null
             }
         }
+
+        /** Blocking response: 200 + empty text/plain body. A 204 can let
+         *  Chromium serve a cached copy; a 200 with mismatched MIME makes the
+         *  resource a no-op (no script execution, no CSS application). */
+        private fun blockedResponse(): WebResourceResponse =
+            WebResourceResponse("text/plain", "utf-8", java.io.ByteArrayInputStream(ByteArray(0)))
     }
 }
