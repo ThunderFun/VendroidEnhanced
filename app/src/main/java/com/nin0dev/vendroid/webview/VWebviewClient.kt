@@ -43,8 +43,8 @@ class VWebviewClient(
 
     override fun shouldOverrideUrlLoading(view: WebView, request: WebResourceRequest): Boolean {
         val url = request.url
-        val n = UrlNormalizer.normalize(url)
-        when (NavigationPolicy.decide(n.scheme, n.asciiHost, request.isForMainFrame)) {
+        // Non-allowlisted links go to the link popup (Copy / Open / Share / Cancel).
+        when (NavigationPolicy.decide(url, request.isForMainFrame)) {
             NavigationPolicy.Action.LOAD_IN_WEBVIEW -> return false
             NavigationPolicy.Action.SHOW_POPUP -> {
                 VDELog.d("WV", "External link: ${UrlNormalizer.redactForLog(url.toString())}")

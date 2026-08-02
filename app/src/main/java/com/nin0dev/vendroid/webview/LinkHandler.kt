@@ -17,11 +17,6 @@ import java.lang.ref.WeakReference
  * which mirrors the typing-indicator toggle pattern in [VWebviewClient]:
  * a `@Volatile` static field, read once at startup and live-updated from
  * `VencordNative.setBool`. Default is `true` (dialog shown).
- *
- * The URL is normalized via [UrlNormalizer] before display, launch, copy, and
- * share so that non-ASCII paths render readably, the host is always shown in
- * Punycode to defeat homograph attacks, userinfo is stripped to prevent
- * credential leakage, and the launched Intent receives a fully encoded URI.
  */
 class LinkHandler(context: Context) {
     private val activityRef: WeakReference<Activity> =
@@ -37,11 +32,9 @@ class LinkHandler(context: Context) {
 
         val n = UrlNormalizer.normalize(url)
 
-        // Restrict to browser schemes. WebView can invoke
-        // shouldOverrideUrlLoading for arbitrary schemes; forwarding those to
-        // ACTION_VIEW could launch unintended deep-link targets or leak
-        // content URIs. A null scheme is rejected explicitly rather than
-        // relying on the inequality check.
+        // Restrict to browser schemes. WebView can invoke shouldOverrideUrlLoading
+        // for arbitrary schemes; forwarding those to ACTION_VIEW could launch
+        // unintended deep-link targets or leak content URIs.
         val scheme = n.scheme
         if (scheme != "http" && scheme != "https") {
             Toast.makeText(activity, R.string.link_blocked_scheme, Toast.LENGTH_SHORT).show()
@@ -66,8 +59,6 @@ class LinkHandler(context: Context) {
         )
         // AlertDialog renders only one of setMessage/setItems/setView; the URL
         // goes in the title so it stays visible alongside the item list.
-        // displayString is already decoded, spoof-resistant, and capped by
-        // UrlNormalizer.
         val dialog = MaterialAlertDialogBuilder(activity)
             .setTitle(n.displayString.ifEmpty { activity.getString(R.string.link_dialog_title) })
             .setCancelable(true)

@@ -1447,6 +1447,14 @@
                 return false;
             }
 
+            // Non-channels pages (e.g. /blog/) skip the sidebar block above.
+            // Navigate back in history before exiting, so the user isn't
+            // stranded on a page with no way out.
+            if (window.history.length > 1) {
+                window.history.back();
+                return true;
+            }
+
             return false;
         }
     };

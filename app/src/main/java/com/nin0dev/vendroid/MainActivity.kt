@@ -346,12 +346,14 @@ class MainActivity : AppCompatActivity() {
             val lastUrl = sPrefs.getString("lastUrl", null)
             if (lastUrl != null) {
                 val host = Uri.parse(lastUrl).host
-                if (host != null && Constants.isDiscordDomain(host)) {
+                if (host != null && Constants.isDiscordDomain(host) && isAppResumeUrl(lastUrl)) {
                     wv!!.loadUrl(lastUrl)
                     currentUrlForBridge = lastUrl
                     currentHostForBridge = host
                     lastUrl
                 } else {
+                    // Stale non-app URL (e.g. /blog/...) — fall back to /app
+                    // rather than reloading a page with no history to go back to.
                     wv!!.loadUrl("https://discord.com/app")
                     "https://discord.com/app"
                 }
@@ -395,6 +397,15 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    private fun isAppResumeUrl(url: String): Boolean {
+        val path = Uri.parse(url).path ?: return false
+        return path == "/app" ||
+            path.startsWith("/channels") ||
+            path.startsWith("/library") ||
+            path.startsWith("/store") ||
+            path.startsWith("/friends")
+    }
+
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
         if (intent.action == Intent.ACTION_VIEW) {
@@ -408,7 +419,10 @@ class MainActivity : AppCompatActivity() {
             currentUrlForBridge = url
             currentHostForBridge = Uri.parse(url).host
             val host = currentHostForBridge
-            if (host != null && Constants.isDiscordDomain(host)) {
+            // Only persist URLs the app can resume into (channels, DMs, /app).
+            // Saving a non-app page (e.g. /blog/...) would reload it on restart
+            // with an empty history, hardlocking the user there.
+            if (host != null && Constants.isDiscordDomain(host) && isAppResumeUrl(url)) {
                 getSharedPreferences("settings", Context.MODE_PRIVATE)
                     .edit() { putString("lastUrl", url) }
             }
