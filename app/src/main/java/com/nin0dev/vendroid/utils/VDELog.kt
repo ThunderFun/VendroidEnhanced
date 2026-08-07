@@ -29,31 +29,65 @@ object VDELog {
     private const val TRUNCATE_TARGET = 128 * 1024L   // keep newest 128 KB
 
     private val buffer = ArrayDeque<LogEntry>(64)
-    // DateTimeFormatter is immutable and thread-safe (unlike SimpleDateFormat)
+    // DateTimeFormatter is immutable and thread-safe (unlike SimpleDateFormat).
     private val timeFmt = DateTimeFormatter.ofPattern("HH:mm:ss.SSS", Locale.US)
     private val dateFmt = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss.SSS", Locale.US)
     private val zone = ZoneId.systemDefault()
 
     private var handler: Handler? = null
     private var logFile: File? = null
-    // Kept open on the handler thread so each log line is a buffered write
-    // instead of an open/write/close syscall. Handler-thread confined only.
+    // Kept open on the handler thread so each line is a buffered write rather
+    // than an open/write/close syscall. Handler-thread confined.
     private var writer: BufferedWriter? = null
-    // Mirrors logFile.length() without a stat() per log line.
+    // Mirrors logFile.length() without a stat() per line.
     private var currentFileBytes = 0L
 
     private val initialized = AtomicBoolean(false)
 
-    fun init(context: Context) {
+    // Bounds the file writes queued on the handler thread. The in-memory ring
+    // buffer is capped independently; under a flood (e.g. the report-only CSP
+    // reporter) the ring buffer keeps the last N entries even if the disk sink
+    // is deliberately throttled.
+    private val pendingWrites = java.util.concurrent.atomic.AtomicInteger(0)
+    private const val MAX_PENDING_WRITES = 2000
+
+    fun init(context: Context, persistToFile: Boolean) {
         if (!initialized.compareAndSet(false, true)) return
+        // logFile is always set so reader-only processes (RecoveryActivity in
+        // the main process) can read the file the :web process wrote.
         logFile = File(context.filesDir, "vde_logs.txt")
+        if (!persistToFile) {
+            // Reader-only process: never create the writer handler, so this
+            // process never rotates/truncates/appends to the :web-managed file.
+            // The in-memory ring buffer still works, and getLogFileContents()
+            // can read :web's on-disk file. Eliminates the cross-process
+            // rotation race (both processes used to rotate vde_logs.txt).
+            return
+        }
         val thread = HandlerThread("VDELog-writer", android.os.Process.THREAD_PRIORITY_BACKGROUND)
         thread.start()
         handler = Handler(thread.looper)
-        // Truncate the previous session's file and write the session header.
+        // Rotate the previous session's file aside (rather than truncating it)
+        // so a crash that triggered recovery still has logs available via
+        // vde_logs.prev.txt, then write the new session header.
         handler?.post {
             try {
-                openWriterLocked(append = false)
+                val f = logFile
+                if (f != null && f.exists() && f.length() > 0) {
+                    val prev = File(f.parentFile, "vde_logs.prev.txt")
+                    prev.delete()
+                    if (f.renameTo(prev)) {
+                        // Rename succeeded — safe to start a fresh (truncated) file.
+                        openWriterLocked(append = false)
+                    } else {
+                        // Rename failed; preserve the previous session's log by
+                        // appending instead of truncating it away.
+                        VDELog.d("VDELog", "rotate rename failed; appending to existing log")
+                        openWriterLocked(append = true)
+                    }
+                } else {
+                    openWriterLocked(append = false)
+                }
                 val header = "--- Session: ${dateFmt.format(Instant.now().atZone(zone))} (PID=${android.os.Process.myPid()}) ---\n"
                 writeLineLocked(header)
             } catch (_: Exception) {}
@@ -66,7 +100,22 @@ object VDELog {
             buffer.addLast(entry)
             if (buffer.size > MAX_ENTRIES) buffer.removeFirst()
         }
-        handler?.post { writeToFile(entry, throwable) }
+        // Only touch pendingWrites when the post will actually run. If handler
+        // is null (pre-init or post-shutdown), skip the disk write; the ring
+        // buffer still retains the entry. Otherwise the increment here would
+        // be unbalanced (no task posted to decrement it) and would ratchet
+        // pendingWrites up until every subsequent disk write was dropped
+        // forever.
+        val h = handler
+        if (h == null) return
+        if (pendingWrites.incrementAndGet() > MAX_PENDING_WRITES) {
+            // Drop the disk write under a flood; the ring buffer keeps it.
+            pendingWrites.decrementAndGet()
+            return
+        }
+        h.post {
+            try { writeToFile(entry, throwable) } finally { pendingWrites.decrementAndGet() }
+        }
     }
 
     fun i(tag: String, message: String) = log(Level.INFO, tag, message)
@@ -90,9 +139,9 @@ object VDELog {
             sb.append("] [")
             sb.append(entry.tag)
             sb.append("] ")
-            // Truncate individual entries to prevent bloating the JS bridge return value
+            // Truncate individual entries to prevent bloating the JS bridge return value.
             val msg = if (entry.message.length > 2000) entry.message.substring(0, 2000) + "…" else entry.message
-            // Escape newlines so each entry is one line for parsing
+            // Escape newlines so each entry is one line for parsing.
             sb.append(msg.replace("\n", "\\n"))
             sb.append('\n')
         }
@@ -164,7 +213,7 @@ object VDELog {
             writeLineLocked(line)
             rotateIfNeededLocked()
         } catch (_: Exception) {
-            // Writer may be in a bad state — force a reopen on the next line.
+            // Writer may be in a bad state; force a reopen on the next line.
             try { writer?.close() } catch (_: Exception) {}
             writer = null
         }
@@ -180,8 +229,8 @@ object VDELog {
     }
 
     /** Opens or reopens the file writer. When [append] is false the file is
-     *  truncated and [currentFileBytes] reset; otherwise appended to and
-     *  seeded from the existing file length. Handler-thread confined. */
+     *  truncated and [currentFileBytes] reset; otherwise appended to and seeded
+     *  from the existing file length. Handler-thread confined. */
     private fun openWriterLocked(append: Boolean) {
         try {
             writer?.close()

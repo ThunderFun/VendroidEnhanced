@@ -26,6 +26,7 @@ class VChromeClient(activity: MainActivity) : WebChromeClient() {
     private var customView: View? = null
     private var customViewCallback: CustomViewCallback? = null
     private var originalStatusBarColor: Int = 0
+    private var originalStatusBarContrastEnforced: Boolean = true
     private lateinit var fullscreenContainer: FrameLayout
     private lateinit var webview: WebView
     private var cachedActivityRef: MainActivity? = null
@@ -57,8 +58,16 @@ class VChromeClient(activity: MainActivity) : WebChromeClient() {
 
         // Route [Vendroid] messages to VDELog in all builds (not just DEBUG)
         // to capture vencord_mobile.js diagnostics (webpack capture, plugin
-        // init, Slate fixes, GIF picker) for the in-app log viewer.
+        // init, Slate fixes, GIF picker) for the in-app log viewer. Only accept
+        // them when the committed main frame is a Discord app-origin host, so a
+        // third-party Activity/iframe page cannot forge trusted diagnostics
+        // into the shareable log.
         if (message.startsWith("[Vendroid]") || message.startsWith("[VDE]")) {
+            val host = activityRef.get()?.currentHostForBridge
+            if (host == null || !com.nin0dev.vendroid.utils.Constants.isDiscordAppOrigin(host)) {
+                // Drop without persisting — emitted by a non-app-origin page.
+                return true
+            }
             val level = when (msg.messageLevel()) {
                 MessageLevel.ERROR -> VDELog.Level.ERROR
                 MessageLevel.WARNING -> VDELog.Level.WARN
@@ -106,8 +115,10 @@ class VChromeClient(activity: MainActivity) : WebChromeClient() {
 
     override fun onShowCustomView(view: View, callback: CustomViewCallback) {
         if (customView != null) {
+            // Already fullscreen: reject the NEW request only. Telling the old
+            // callback it was hidden while its view is still on screen would
+            // desync the WebView's fullscreen state.
             callback.onCustomViewHidden()
-            customViewCallback?.onCustomViewHidden()
             return
         }
         val activity = activityRef.get() ?: return
@@ -123,12 +134,14 @@ class VChromeClient(activity: MainActivity) : WebChromeClient() {
         val controller = getInsetsController(activity)
         controller.systemBarsBehavior = WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
         controller.hide(WindowInsetsCompat.Type.navigationBars())
-        // statusBarColor and isStatusBarContrastEnforced are deprecated on API 35
-        // but remain the only way to set bar color on pre-edge-to-edge devices.
+        // statusBarColor and isStatusBarContrastEnforced are deprecated on
+        // API 35 but remain the only way to set bar color on pre-edge-to-edge
+        // devices.
         @Suppress("DEPRECATION")
         run {
             originalStatusBarColor = activity.window.statusBarColor
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.VANILLA_ICE_CREAM) {
+                originalStatusBarContrastEnforced = activity.window.isStatusBarContrastEnforced
                 activity.window.isStatusBarContrastEnforced = false
             }
             activity.window.statusBarColor = Color.BLACK
@@ -163,7 +176,12 @@ class VChromeClient(activity: MainActivity) : WebChromeClient() {
         val controller = getInsetsController(activity)
         controller.show(WindowInsetsCompat.Type.navigationBars())
         @Suppress("DEPRECATION")
-        activity.window.statusBarColor = originalStatusBarColor
+        run {
+            activity.window.statusBarColor = originalStatusBarColor
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.VANILLA_ICE_CREAM) {
+                activity.window.isStatusBarContrastEnforced = originalStatusBarContrastEnforced
+            }
+        }
         localCallback?.onCustomViewHidden()
     }
 

@@ -1,15 +1,29 @@
 <?xml version="1.0" encoding="utf-8"?><!--
-   Sample data extraction rules file; uncomment and customize as necessary.
-   See https://developer.android.com/about/versions/12/backup-restore#xml-changes
-   for details.
+   Data-extraction rules file, wired via android:dataExtractionRules in the
+   manifest. Mirrors backup_rules.xml: excludes sensitive prefs/files from
+   cloud backup and device-to-device transfer. allowBackup is currently false,
+   so these are a safety net for any future enabling of backup.
 -->
 <data-extraction-rules>
     <cloud-backup>
         <exclude domain="sharedpref" path="settings.xml" />
+        <exclude domain="sharedpref" path="css_cache.xml" />
         <exclude domain="sharedpref" path="announcements.xml" />
+        <exclude domain="file" path="vencord.js" />
+        <exclude domain="file" path="vde_logs.txt" />
+        <exclude domain="file" path="main_frame_cache" />
+        <!-- WebView credential store (Cookies.db, Local Storage/, IndexedDB/)
+             lives at data/data/<pkg>/app_webview and is not covered by the
+             "file" excludes. -->
+        <exclude domain="root" path="app_webview" />
     </cloud-backup>
     <device-transfer>
         <exclude domain="sharedpref" path="settings.xml" />
+        <exclude domain="sharedpref" path="css_cache.xml" />
         <exclude domain="sharedpref" path="announcements.xml" />
+        <exclude domain="file" path="vencord.js" />
+        <exclude domain="file" path="vde_logs.txt" />
+        <exclude domain="file" path="main_frame_cache" />
+        <exclude domain="root" path="app_webview" />
     </device-transfer>
 </data-extraction-rules>

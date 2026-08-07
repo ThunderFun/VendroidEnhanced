@@ -7,73 +7,53 @@ import android.view.View
 import android.webkit.WebView
 import com.nin0dev.vendroid.webview.HttpClient
 import com.nin0dev.vendroid.utils.FirewallConfig
-import com.nin0dev.vendroid.utils.Logger.e
 import com.nin0dev.vendroid.utils.VDELog
 import java.io.File
-import java.net.HttpURLConnection
-import java.net.URL
 
 class VendroidApp : Application() {
     override fun onCreate() {
         super.onCreate()
         val isWebProcess = getCurrentProcessName().endsWith(":web")
 
-        if (isWebProcess) {
-            // Initialize in-app logging first — must happen before anything else
-            // so that subsequent init steps are captured even if they crash.
-            VDELog.init(applicationContext)
-            VDELog.i("VDE", "App started (PID=${android.os.Process.myPid()})")
+        // Initialize logging in every process so the file-backed sink is
+        // available anywhere (e.g. RecoveryActivity reads vde_logs.txt). Only
+        // the :web process writes/rotates the file; others read-only.
+        VDELog.init(applicationContext, persistToFile = isWebProcess)
+        VDELog.i("VDE", "App started (PID=${android.os.Process.myPid()})")
 
+        if (isWebProcess) {
             // Initialize the firewall config before any WebView request can
-            // fire. shouldInterceptRequest() reads the snapshot via
-            // Constants.isAllowedDomain(), so it must be built up-front.
+            // fire; shouldInterceptRequest() reads it via
+            // Constants.isAllowedDomain().
             FirewallConfig.init(applicationContext)
             VDELog.i("VDE", "Firewall config initialized")
 
-            // On Android P+, WebView requires a unique data directory suffix
-            // for each non-default process. Without this, creating a WebView in
-            // the :web process crashes with an IllegalStateException.
+            // On Android P+, each non-default process needs a unique WebView
+            // data-directory suffix or WebView creation crashes.
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
                 WebView.setDataDirectorySuffix("web")
             }
 
-            // Pre-warm the Chromium renderer process by creating a WebView.
-            // Keeping the reference alive (instead of destroy()-ing it) ensures
-            // the renderer process stays warm, so MainActivity's WebView
-            // creation is significantly faster (~50-100ms vs ~200-500ms cold).
-            // The pre-warmed WebView can also be reused directly in MainActivity,
-            // eliminating the second WebView creation entirely.
-            try {
-                prewarmedWebView = WebView(this).apply {
-                    setBackgroundColor(android.graphics.Color.parseColor("#121214"))
+            // Pre-warm the Chromium renderer by creating a WebView and keeping
+            // it alive; MainActivity reuses it, making WebView init ~50-100ms
+            // faster (vs ~200-500ms cold). Only do this once the user has
+            // accepted the first-run risk warning; otherwise MainActivity
+            // creates its own WebView.
+            val riskAccepted = getSharedPreferences("settings", Context.MODE_PRIVATE)
+                .getBoolean("riskWarningAccepted", false)
+            if (riskAccepted) {
+                try {
+                    prewarmedWebView = WebView(this).apply {
+                        setBackgroundColor(android.graphics.Color.parseColor("#121214"))
+                    }
+                } catch (e: Exception) {
+                    VDELog.e("VDE", "Failed to create prewarmed WebView", e)
                 }
-            } catch (e: Exception) {
-                e("Failed to create prewarmed WebView", e)
             }
-
-            // Install HTTP response cache for HttpURLConnection-based fetches
-            // (Vencord bundle download, shouldInterceptRequest CSS fetches).
-            // Enables 304 Not Modified responses and avoids re-downloading
-            // unchanged resources.
-            try {
-                val httpCacheDir = File(cacheDir, "http_cache")
-                httpCacheDir.mkdirs()
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-                    android.net.http.HttpResponseCache.install(httpCacheDir, 50L * 1024 * 1024)
-                } else {
-                    val cls = Class.forName("android.net.http.HttpResponseCache")
-                    cls.getMethod("install", File::class.java, Long::class.javaPrimitiveType)
-                        .invoke(null, httpCacheDir, 50L * 1024 * 1024)
-                }
-            } catch (e: Exception) {
-                e("Failed to install HTTP response cache", e)
-            }
-            VDELog.i("VDE", "HTTP response cache installed")
 
             // One-time migration: move CSS cache entries from the shared
-            // "settings" prefs file into a dedicated "css_cache" file.
-            // This keeps the settings file small (faster cold-start parse)
-            // and isolates CSS write churn.
+            // "settings" prefs into a dedicated "css_cache" file so the settings
+            // file stays small (faster cold-start parse).
             Thread {
                 try {
                     val settingsPrefs = getSharedPreferences("settings", Context.MODE_PRIVATE)
@@ -94,13 +74,12 @@ class VendroidApp : Application() {
                     settingsEditor.apply()
                     if (migrated) editor.apply()
                 } catch (ex: Exception) {
-                    e("CSS cache migration failed", ex)
+                    VDELog.e("VDE", "CSS cache migration failed", ex)
                 }
             }.start()
 
-            // Pre-load Vencord runtimes on a background thread so that by the
-            // time MainActivity.onCreate() runs the strings are already in
-            // memory and injection can fire immediately.
+            // Pre-load the Vencord runtimes on a background thread so they are
+            // in memory by the time MainActivity.onCreate() runs.
             Thread {
                 try {
                     // 1. VencordMobile runtime (65 KB raw resource, memory-mapped)
@@ -112,9 +91,8 @@ class VendroidApp : Application() {
                     VDELog.i("VDE", "VencordMobile runtime preloaded")
                     // 2. Vencord runtime (potentially ~1 MB from disk)
                     val vendroidFile = File(filesDir, "vencord.js")
-                    // Don't serve a stale bundle: if a redownload is pending
-                    // (clientMod switch or app version bump), drop the file
-                    // before the preload read so fetchVencord can replace it.
+                    // Drop a stale bundle (clientMod switch or app version bump)
+                    // before the read so fetchVencord can replace it.
                     val sPrefs = getSharedPreferences("settings", Context.MODE_PRIVATE)
                     val needsRedownload = sPrefs.getInt(
                         "lastMajorUpdateThatUserHasUpdatedVencord", 0
@@ -122,90 +100,130 @@ class VendroidApp : Application() {
                     if (needsRedownload) {
                         vendroidFile.delete()
                         HttpClient.vencordBundlePatched = false
-                        sPrefs.edit().remove("vencordEtag").apply()
+                        sPrefs.edit()
+                            .remove("vencordEtag")
+                            .remove(HttpClient.PREF_BUNDLE_PATCHED)
+                            .apply()
                     }
                     if (vendroidFile.exists() && HttpClient.VencordRuntime == null) {
                         try {
                             // The file was written with applyPatches already
-                            // applied during a previous download.  Skip the
-                            // redundant ~1MB regex scan.
+                            // applied during a previous download. Skip the
+                            // redundant ~1MB regex scan by trusting the
+                            // persisted patched flag.
                             HttpClient.setVencordRuntime(
-                                if (HttpClient.vencordBundlePatched) vendroidFile.readText()
-                                else HttpClient.applyPatches(vendroidFile.readText())
+                                HttpClient.readBundleFromDisk(sPrefs, vendroidFile)
                             )
                             VDELog.i("VDE", "Vencord runtime preloaded (${vendroidFile.length()} bytes)")
                         } catch (ex: Exception) {
-                            e("Failed to apply Vencord patches", ex)
+                            VDELog.e("VDE", "Failed to apply Vencord patches", ex)
                             VDELog.e("VDE", "Failed to apply Vencord patches: ${ex.message}", ex)
                         }
                     }
                 } catch (ex: Exception) {
-                    e("Vencord preload failed", ex)
+                    VDELog.e("VDE", "Vencord preload failed", ex)
                     VDELog.e("VDE", "Vencord preload failed: ${ex.message}", ex)
                 }
             }.start()
 
-            // 3. Pre-fetch and cache the Vencord CSS files.  These are injected
-            // by vencord_mobile.js on every page load.  Stashing them in
-            // the dedicated css_cache prefs means JS can skip the network fetch
-            // entirely without churning the main settings XML.
-            Thread {
-                try {
-                    val sPrefs = getSharedPreferences("settings", Context.MODE_PRIVATE)
-                    val cssPrefs = getSharedPreferences("css_cache", Context.MODE_PRIVATE)
-                    val isEquicord = sPrefs.getString("clientMod", "vencord") == "equicord"
-                    val cssUrls = listOf(
-                        if (isEquicord) "https://vde-builds.nin0.dev/equicord/browser.css"
-                        else "https://vde-builds.nin0.dev/vencord/browser.css",
-                        "https://raw.githubusercontent.com/VendroidEnhanced/random-files/refs/heads/main/moreFixes.css"
-                    )
-                    val editor = cssPrefs.edit()
-                    val now = System.currentTimeMillis()
-                    for (url in cssUrls) {
-                        val key = "css_cache_vde_" + url.hashCode()
-                        VDELog.d("VDE", "Prefetching CSS: $url")
-                        // Only re-fetch if missing or older than 12 hours
-                        val ts = cssPrefs.getLong("${key}_ts", 0)
-                        if (cssPrefs.getString(key, null) == null || now - ts > 12 * 60 * 60 * 1000L) {
-                            var conn: HttpURLConnection? = null
+            // 3. Pre-fetch and cache the Vencord CSS files, injected by
+            // vencord_mobile.js on every page load. Stashing them in the
+            // dedicated css_cache prefs lets JS skip the network fetch without
+            // churning the main settings XML. Gated on first-run consent so no
+            // network activity phones home before the user accepts the risk
+            // warning. (Other startup threads are local-only: runtime preload,
+            // cookie-DB warmup, and disk-cache preload touch no network.)
+            if (riskAccepted) {
+                Thread {
+                    try {
+                        val sPrefs = getSharedPreferences("settings", Context.MODE_PRIVATE)
+                        val cssPrefs = getSharedPreferences("css_cache", Context.MODE_PRIVATE)
+                        val isEquicord = sPrefs.getString("clientMod", "vencord") == "equicord"
+                        val cssUrls = listOf(
+                            if (isEquicord) "https://vde-builds.nin0.dev/equicord/browser.css"
+                            else "https://vde-builds.nin0.dev/vencord/browser.css",
+                            "https://raw.githubusercontent.com/VendroidEnhanced/random-files/refs/heads/main/moreFixes.css"
+                        )
+                        val editor = cssPrefs.edit()
+                        val now = System.currentTimeMillis()
+                        for (url in cssUrls) {
+                            val key = "css_cache_vde_" + url.hashCode()
+                            VDELog.d("VDE", "Prefetching CSS: $url")
                             try {
-                                if (!url.startsWith("https://")) {
-                                    VDELog.w("VDE", "CSS prefetch rejected non-HTTPS URL: $url")
-                                    continue
+                                // Staleness check and fetch share one try so a
+                                // type-poisoned entry (e.g. an attacker wrote a
+                                // Boolean under this key) cannot abort the
+                                // prefetch loop. A poisoned read is treated as
+                                // stale, refetched, and repaired by putString.
+                                val ts = try {
+                                    cssPrefs.getLong("${key}_ts", 0)
+                                } catch (e: Exception) {
+                                    0L
                                 }
-                                conn = URL(url).openConnection() as HttpURLConnection
-                                conn.connectTimeout = 15000
-                                conn.readTimeout = 15000
-                                conn.instanceFollowRedirects = false
-                                val code = conn.responseCode
+                                val missingOrPoisoned = try {
+                                    cssPrefs.getString(key, null) == null
+                                } catch (e: Exception) {
+                                    VDELog.w("VDE", "CSS cache key $key type-poisoned, refetching")
+                                true
+                            }
+                            if (!missingOrPoisoned && now - ts <= 12 * 60 * 60 * 1000L) {
+                                continue
+                            }
+                            if (!url.startsWith("https://")) {
+                                VDELog.w("VDE", "CSS prefetch rejected non-HTTPS URL: $url")
+                                continue
+                            }
+                            // Use the shared pooled OkHttp client (reuses
+                            // TCP/TLS sessions) instead of a fresh
+                            // HttpURLConnection. sharedClient never auto-follows
+                            // redirects, so a 3xx surfaces as a code and is
+                            // rejected below, matching the old
+                            // instanceFollowRedirects=false behavior.
+                            HttpClient.sharedClient.newCall(
+                                okhttp3.Request.Builder().url(url).build()
+                            ).execute().use { resp ->
+                                val code = resp.code
                                 if (code in 200..299) {
-                                    val css = HttpClient.readAsText(conn.inputStream)
+                                    val css = HttpClient.readAsText(resp.body.byteStream())
                                     editor.putString(key, css)
                                     editor.putLong("${key}_ts", now)
                                 } else if (code in 300..399) {
                                     VDELog.w("VDE", "CSS prefetch rejected redirect ($code) from $url")
+                                } else {
+                                    VDELog.w("VDE", "CSS prefetch HTTP $code from $url")
                                 }
-                            } catch (ex: Exception) {
-                                e("CSS fetch failed for $url", ex)
-                                VDELog.w("VDE", "CSS fetch failed for $url: ${ex.message}")
-                            } finally {
-                                conn?.disconnect()
                             }
+                        } catch (ex: Exception) {
+                            VDELog.e("VDE", "CSS fetch failed for $url", ex)
+                            VDELog.w("VDE", "CSS fetch failed for $url: ${ex.message}")
                         }
                     }
                     editor.apply()
                 } catch (ex: Exception) {
-                    e("CSS prefetch thread failed", ex)
+                    VDELog.e("VDE", "CSS prefetch thread failed", ex)
                 }
-            }.start()
+                }.start()
+            }
 
-            // 4. Warm up the Chromium cookie DB so MainActivity doesn't pay
+            // 4. Warm up the Chromium cookie DB so MainActivity does not pay
             // the cost on its first CookieManager.getInstance() call.
             Thread {
                 try {
                     android.webkit.CookieManager.getInstance()
                 } catch (ex: Exception) {
-                    e("CookieManager warmup failed", ex)
+                    VDELog.e("VDE", "CookieManager warmup failed", ex)
+                }
+            }.start()
+
+            // 5. Preload the persisted main-frame shell off the UI thread so
+            // the first shouldInterceptRequest doesn't read from disk.
+            Thread {
+                try {
+                    com.nin0dev.vendroid.webview.MainFrameDiskCache.init(applicationContext)
+                    com.nin0dev.vendroid.webview.VWebviewClient.preloadMainFrameCache()
+                    VDELog.i("VDE", "Main-frame disk cache preloaded")
+                } catch (ex: Exception) {
+                    VDELog.e("VDE", "Main-frame disk cache preload failed", ex)
                 }
             }.start()
         }
@@ -217,9 +235,9 @@ class VendroidApp : Application() {
             internal set
 
         /**
-         * Destroys the pre-warmed WebView if it was never consumed by
-         * MainActivity. Call from MainActivity.onDestroy() when
-         * prewarmUsed == false to avoid leaking the renderer process.
+         * Destroys the pre-warmed WebView if MainActivity never consumed it.
+         * Call from MainActivity.onDestroy() when prewarmUsed == false to
+         * avoid leaking the renderer process.
          */
         fun destroyPrewarmedWebViewIfUnused() {
             prewarmedWebView?.destroy()
@@ -238,7 +256,7 @@ class VendroidApp : Application() {
             val end = bytes.indexOf(0.toByte())
             String(bytes, 0, if (end > 0) end else bytes.size)
         } catch (ex: Exception) {
-            e("getCurrentProcessName fallback failed", ex)
+            VDELog.e("VDE", "getCurrentProcessName fallback failed", ex)
             ""
         }
     }

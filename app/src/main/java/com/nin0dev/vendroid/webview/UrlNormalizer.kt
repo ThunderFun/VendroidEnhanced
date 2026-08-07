@@ -21,8 +21,7 @@ import java.net.IDN
  *
  * Pure-string helpers avoid the Android framework so they can be unit-tested
  * on the JVM. Only [normalize] touches [Uri].
- */
-object UrlNormalizer {
+ */object UrlNormalizer {
 
     /** Cap on input length to bound per-char processing cost. */
     private const val MAX_INPUT = 8192
@@ -46,8 +45,7 @@ object UrlNormalizer {
      * Normalize an Android [Uri]. Never throws; on failure returns a
      * [Normalized] with [Normalized.malformed] set so the caller can surface
      * an error toast.
-     */
-    fun normalize(uri: Uri): Normalized {
+     */    fun normalize(uri: Uri): Normalized {
         return try {
             val raw = uri.toString()
             if (raw.isEmpty()) return malformed(uri)
@@ -58,7 +56,11 @@ object UrlNormalizer {
             val port = uri.takeIf { it.port > 0 }?.port ?: -1
             // Opaque (hostless) URIs (about:, mailto:, data:) carry their
             // content in schemeSpecificPart; uri.path returns null for them.
-            val isOpaque = rawHost == null
+            // Use Uri's own opacity check: host == null alone misclassifies
+            // hierarchical URIs with an empty authority (e.g.
+            // file:///path?x=1#f) as opaque, which drops their query and
+            // fragment.
+            val isOpaque = uri.isOpaque
             val rawPath = if (isOpaque) (uri.schemeSpecificPart ?: uri.path.orEmpty()) else uri.path.orEmpty()
             val rawQuery = if (isOpaque) null else uri.query
             val rawFragment = if (isOpaque) null else uri.fragment
@@ -71,7 +73,7 @@ object UrlNormalizer {
             val launchUri = Uri.parse(launchStr)
 
             val display = buildDisplayString(
-                scheme, asciiHost, port, rawPath, rawQuery, rawFragment, cap = MAX_INPUT
+                scheme, asciiHost, rawHost, port, rawPath, rawQuery, rawFragment, cap = MAX_INPUT
             )
 
             Normalized(
@@ -90,8 +92,7 @@ object UrlNormalizer {
     /**
      * Redacted form for log lines: userinfo stripped, common token-like query
      * params masked.
-     */
-    fun redactForLog(rawUrl: String): String {
+     */    fun redactForLog(rawUrl: String): String {
         if (rawUrl.isEmpty()) return ""
         val noUserInfo = stripUserinfo(rawUrl)
         return maskTokenParams(noUserInfo)
@@ -102,19 +103,21 @@ object UrlNormalizer {
     // ------------------------------------------------------------------
 
     /** Converts an IDN host to ASCII (Punycode). Returns null for null/empty
-     *  input; returns the raw host unchanged if [IDN.toASCII] rejects it. */
-    fun toAsciiHost(host: String?): String? {
+     *  input; returns null if [IDN.toASCII] rejects the host, so callers treat
+     *  an invalid IDN as malformed instead of failing open to the raw Unicode
+     *  host (which would defeat the Punycode homograph defense). */    fun toAsciiHost(host: String?): String? {
         if (host.isNullOrEmpty()) return null
         if (host.all { it.code <= 0x7F }) return host
         return try {
-            IDN.toASCII(host)
+            IDN.toASCII(host).ifEmpty { null }
         } catch (_: IllegalArgumentException) {
-            host
+            null
         }
     }
 
     /** Removes the `user:pass@` userinfo segment from a raw URL string.
-     *  Operates on the raw form so it works before Uri parsing. */
+     *  Operates on the raw form so it works before Uri parsing.
+     */
     fun stripUserinfo(rawUrl: String): String {
         val schemeEnd = rawUrl.indexOf("://")
         if (schemeEnd < 0) return rawUrl
@@ -135,8 +138,7 @@ object UrlNormalizer {
      * Incomplete UTF-8 multibyte sequences fall back to the original `%XX`
      * text rather than emitting a replacement character. `+` is not treated
      * as space.
-     */
-    fun percentDecode(s: String): String {
+     */    fun percentDecode(s: String): String {
         if (s.isEmpty()) return s
         val out = StringBuilder(s.length)
         val bytes = ArrayList<Byte>(s.length)
@@ -160,8 +162,7 @@ object UrlNormalizer {
      * Encodes raw non-ASCII characters and unsafe ASCII into `%XX` UTF-8.
      * Already-encoded `%XX` sequences are passed through untouched to avoid
      * double-encoding. [safe] lists ASCII chars to keep verbatim.
-     */
-    fun percentEncode(s: String, safe: String = DEFAULT_SAFE): String {
+     */    fun percentEncode(s: String, safe: String = DEFAULT_SAFE): String {
         if (s.isEmpty()) return s
         val sb = StringBuilder(s.length)
         var i = 0
@@ -192,8 +193,7 @@ object UrlNormalizer {
     }
 
     /** Strips invisible, bidi-override, and control characters that let a URL
-     *  render differently from its logical content. */
-    fun stripInvisible(s: String): String {
+     *  render differently from its logical content. */    fun stripInvisible(s: String): String {
         if (s.isEmpty()) return s
         val sb = StringBuilder(s.length)
         for (c in s) {
@@ -280,6 +280,7 @@ object UrlNormalizer {
     private fun buildDisplayString(
         scheme: String?,
         asciiHost: String?,
+        rawHost: String?,
         port: Int,
         rawPath: String,
         rawQuery: String?,
@@ -289,8 +290,12 @@ object UrlNormalizer {
         if (scheme == null) return ""
         val sb = StringBuilder(64 + rawPath.length)
         // Hostless schemes use scheme-specific syntax, not authority —
-        // emit "scheme:" without "//" to avoid "about://blank".
-        if (asciiHost == null) {
+        // emit "scheme:" without "//" to avoid "about://blank". Only treat it
+        // as hostless when there is genuinely no host; when IDNA rejects a host
+        // (asciiHost == null but rawHost != null) we must still show it,
+        // otherwise the dialog title silently drops the hostname while the
+        // launch URL keeps it.
+        if (asciiHost == null && rawHost == null) {
             sb.append(scheme).append(':')
             if (rawPath.isNotEmpty()) sb.append(decodeForDisplay(rawPath))
             if (rawQuery != null) sb.append('?').append(decodeForDisplay(rawQuery))
@@ -299,9 +304,10 @@ object UrlNormalizer {
             return if (full.length > cap) full.substring(0, cap) else full
         }
         sb.append(scheme).append("://")
-        // The host is always ASCII in the display form — this is the
-        // homograph defense. A Unicode IDN host is never shown.
-        sb.append(asciiHost)
+        // Prefer the ASCII host (homograph defense); fall back to the raw host
+        // only when IDNA rejected it (no ASCII form exists), so display and
+        // launch stay consistent.
+        sb.append(asciiHost ?: rawHost)
         if (port > 0) sb.append(':').append(port)
         sb.append(decodeForDisplay(rawPath))
         if (rawQuery != null) { sb.append('?'); sb.append(decodeForDisplay(rawQuery)) }
@@ -311,7 +317,8 @@ object UrlNormalizer {
     }
 
     /** Decodes and strips invisible chars; re-encodes the segment if the
-     *  result mixes Latin with Cyrillic or Greek to defeat path homographs. */
+     *  result mixes Latin with Cyrillic or Greek to defeat path homographs.
+     */
     private fun decodeForDisplay(raw: String): String {
         if (raw.isEmpty()) return raw
         val decoded = stripInvisible(percentDecode(raw))

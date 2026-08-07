@@ -179,6 +179,14 @@ class UrlNormalizerTest {
         assertNull(UrlNormalizer.toAsciiHost(""))
     }
 
+    @Test fun toAsciiHost_invalidIdnFailsClosedToNull() {
+        // An IDNA-invalid non-ASCII host (e.g. one containing an emoji, which
+        // IDN.toASCII rejects) must fail CLOSED to null rather than returning
+        // the raw Unicode host, which would defeat the Punycode homograph
+        // display defense.
+        assertNull(UrlNormalizer.toAsciiHost("\uD83D\uDE00.com")) // 😀.com
+    }
+
     // ------------------------------------------------------------------
     //  redactForLog
     // ------------------------------------------------------------------

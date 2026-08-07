@@ -145,7 +145,11 @@ object FirewallConfig {
     private const val PREFS_NAME = "firewall"
     private const val KEY_DISABLED_CATEGORIES = "disabled_categories"
 
-    private lateinit var prefs: SharedPreferences
+    // Nullable holder rather than `lateinit var` so any method called before
+    // init() fails safely (returns a default/no-op) instead of throwing
+    // UninitializedPropertyAccessException. The singleton's init requirement
+    // must not couple to an uncaught runtime exception.
+    private var prefs: SharedPreferences? = null
     private val initialized = java.util.concurrent.atomic.AtomicBoolean(false)
     @Volatile private var cachedSnapshot: Set<String> = emptySet()
     @Volatile private var cachedJsSnapshot: Set<String> = emptySet()
@@ -166,19 +170,20 @@ object FirewallConfig {
         Category.GIF_KLIPY.id
     )
 
-    // Categories exposed to the JS firewall. CSS-only forge hosts are filtered
-    // per-domain in rebuildSnapshots() since the native layer handles those.
-    private val jsLayerCategories = setOf(
-        Category.DISCORD.id, Category.GITHUB.id, Category.HCAPTCHA.id,
-        Category.GOOGLE_STORAGE.id, Category.CDN.id,
-        Category.YOUTUBE.id, Category.TWITCH.id, Category.TWITTER.id,
-        Category.SPOTIFY.id, Category.SOUNDCLOUD.id, Category.VIMEO.id,
-        Category.REDDIT.id, Category.STREAMABLE.id, Category.PAYPAL.id,
-        Category.AUDIUS.id, Category.ALGOLIA.id, Category.GIF_KLIPY.id
-    )
+    // Categories exposed to the JS firewall. All categories are exposed to JS;
+    // CSS-only forge hosts are excluded per-domain via [jsExcludedDomains]
+    // since the native layer handles those. Deriving from [Category.entries]
+    // (instead of a hand-maintained id list) keeps the native and JS
+    // allowlists in sync.
+    private val jsLayerCategories: Set<String> =
+        Category.entries.map { it.id }.toSet()
 
-    // GITHUB domains fetched only at the native layer for CSS; omitted from
-    // the JS firewall array to preserve the original native/JS split.
+    // Single exclusion set: forge hosts fetched only at the native layer for
+    // CSS. Excluded from the JS firewall array because the native interceptor
+    // (VWebviewClient.isForgeHost) already governs them; keeping them out
+    // avoids a second, divergent allowlist. Any forge host added to
+    // isForgeHost() must also be reflected here to keep the native/JS split
+    // consistent.
     private val jsExcludedDomains = setOf(
         "github.io", ".github.io",
         "codeberg.page", ".codeberg.page",
@@ -189,8 +194,8 @@ object FirewallConfig {
         if (!initialized.compareAndSet(false, true)) return
         prefs = context.applicationContext.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
         // Seed defaults on first launch.
-        if (!prefs.contains(KEY_DISABLED_CATEGORIES)) {
-            prefs.edit().putStringSet(KEY_DISABLED_CATEGORIES, DEFAULT_DISABLED_CATEGORIES).apply()
+        if (!prefs!!.contains(KEY_DISABLED_CATEGORIES)) {
+            prefs!!.edit().putStringSet(KEY_DISABLED_CATEGORIES, DEFAULT_DISABLED_CATEGORIES).apply()
         }
         rebuildSnapshots()
     }
@@ -200,6 +205,10 @@ object FirewallConfig {
 
     /** Allowed hosts for the JS firewall. Cached after [init]/[save]. */
     fun jsAllowedHosts(): Set<String> = cachedJsSnapshot
+
+    /** True once [init] has been called, letting callers assert the boot-order
+     *  contract explicitly instead of silently reading an empty snapshot. */
+    fun isInitialized(): Boolean = initialized.get()
 
     /**
      * Normalizes a raw category domain entry to leading-dot form
@@ -228,16 +237,18 @@ object FirewallConfig {
     }
 
     fun disabledCategories(): Set<String> {
-        val raw = prefs.getStringSet(KEY_DISABLED_CATEGORIES, emptySet()) ?: emptySet()
+        val p = prefs ?: return emptySet()
+        val raw = p.getStringSet(KEY_DISABLED_CATEGORIES, emptySet()) ?: emptySet()
         // Filter out locked IDs in case a stale/tampered prefs file contains them.
         return raw.filter { Category.fromId(it)?.locked == false }.toSet()
     }
 
     /** Persist a complete config update. Returns false if input was malformed. */
     fun save(disabledCats: Set<String>): Boolean {
+        val p = prefs ?: return false
         // Locked categories can never be disabled — drop any attempt to do so.
         val validCats = disabledCats.filter { Category.fromId(it)?.locked == false }.toSet()
-        prefs.edit()
+        p.edit()
             .putStringSet(KEY_DISABLED_CATEGORIES, validCats)
             .apply()
         rebuildSnapshots()
@@ -246,7 +257,8 @@ object FirewallConfig {
     }
 
     fun resetToDefaults() {
-        prefs.edit()
+        val p = prefs ?: return
+        p.edit()
             .putStringSet(KEY_DISABLED_CATEGORIES, DEFAULT_DISABLED_CATEGORIES)
             .apply()
         rebuildSnapshots()
@@ -254,14 +266,20 @@ object FirewallConfig {
     }
 
     /** JSON for the bridge. Returns a minimal valid JSON object on failure so
-     *  the editor shows an empty state instead of crashing the JS bridge. */
+     *  the editor shows an empty state rather than crashing the JS bridge. */
     fun toJson(): String {
         return try {
             buildJson()
         } catch (t: Throwable) {
-            lastError = t.message ?: t.javaClass.simpleName
+            lastError = sanitizeError(t.message ?: t.javaClass.simpleName)
             "{\"categories\":[],\"error\":\"$lastError\"}"
         }
+    }
+
+    // Bound the error string and keep it JSON-safe for the editor.
+    private fun sanitizeError(raw: String): String {
+        val trimmed = raw.take(200).replace("\\", "\\\\").replace("\"", "\\\"")
+        return trimmed.replace("\n", " ").replace("\r", " ").replace("\t", " ")
     }
 
     @Volatile var lastError: String? = null

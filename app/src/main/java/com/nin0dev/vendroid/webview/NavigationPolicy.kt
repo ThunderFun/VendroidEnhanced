@@ -18,22 +18,18 @@ object NavigationPolicy {
 
     enum class Action { LOAD_IN_WEBVIEW, SHOW_POPUP }
 
-    fun decide(scheme: String?, asciiHost: String?, isForMainFrame: Boolean): Action {
-        if (scheme == "about") return Action.LOAD_IN_WEBVIEW
-        if (!isForMainFrame) return Action.LOAD_IN_WEBVIEW
-        if (asciiHost != null && Constants.isNavigationAllowedDomain(asciiHost)) {
-            return Action.LOAD_IN_WEBVIEW
-        }
-        return Action.SHOW_POPUP
-    }
-
     /**
-     * Main-frame variant that takes the full URL so path-based rules can apply.
-     * Currently routes Discord-owned /blog pages to the popup (see class doc).
+     * Single source of truth for navigation routing. Takes the full URL so
+     * path-based rules can apply (Discord-owned /blog pages route to the popup).
      */
     fun decide(url: Uri, isForMainFrame: Boolean): Action {
         if (!isForMainFrame) return Action.LOAD_IN_WEBVIEW
         if (url.scheme == "about") return Action.LOAD_IN_WEBVIEW
+        // Main frames must load over HTTPS. A cleartext http:// frame would
+        // expose the session/token to a network attacker; do not rely solely
+        // on shouldInterceptRequest to stop it (redirects/service workers
+        // could bypass that callback). Route to the popup instead.
+        if (url.scheme != "https") return Action.SHOW_POPUP
         val host = url.host
         if (host != null && Constants.isNavigationAllowedDomain(host)) {
             val path = url.path ?: ""

@@ -51,4 +51,9 @@
     <string name="link_copied">Link copied to clipboard</string>
     <string name="link_blocked_scheme">Cannot open this type of link</string>
     <string name="link_malformed">This link could not be read</string>
+
+    <!-- First-run security disclosure -->
+    <string name="risk_warning_title">Read before you continue</string>
+    <string name="risk_warning_body">Vendroid is an unofficial, modified Discord client. Before you use it, please understand what you are accepting:\n\n1. Third-party code\nThis app loads and runs the real Discord web app, plus third-party client code (Vencord/Equicord, plugins, themes). That code is trusted but not fully under our control. If its source or update servers are ever compromised, malicious code could run inside your Discord session with access to your account and device.\n\n2. Modified client\nUsing a modified Discord client violates Discord\'s Terms of Service and can result in your account being banned.\n\n3. Not official\nThis is not made or endorsed by Discord. We provide no guarantee or warranty.\n\nBy tapping \"I understand\", you accept these risks. If you are not comfortable with them, uninstall the app instead.</string>
+    <string name="risk_warning_accept">I understand</string>
 </resources>

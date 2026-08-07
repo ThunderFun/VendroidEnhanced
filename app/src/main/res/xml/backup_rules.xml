@@ -1,13 +1,21 @@
 <?xml version="1.0" encoding="utf-8"?><!--
-   Sample backup rules file; uncomment and customize as necessary.
-   See https://developer.android.com/guide/topics/data/autobackup
-   for details.
-   Note: This file is ignored for devices older that API 31
-   See https://developer.android.com/about/versions/12/backup-restore
+   Backup rules file, wired via android:fullBackupContent in the manifest.
+   Even though allowBackup is currently false, these exclusions act as a
+   safety net so that if backup is ever enabled, sensitive data (tokens in
+   settings, the CSS cache, logs, and the disk-cached Discord HTML shell,
+   which can embed token/URL data) is never backed up or device-transferred.
 -->
 <full-backup-content>
     <exclude domain="sharedpref" path="settings.xml" />
+    <exclude domain="sharedpref" path="css_cache.xml" />
     <exclude domain="sharedpref" path="announcements.xml" />
     <exclude domain="file" path="vencord.js" />
     <exclude domain="file" path="vencord-mobile.js" />
+    <exclude domain="file" path="vde_logs.txt" />
+    <exclude domain="file" path="main_frame_cache" />
+    <!-- WebView credential store: Cookies.db (Discord session auth), Local
+         Storage/, IndexedDB/ (Vencord tokens, QuickCSS). Lives at
+         data/data/<pkg>/app_webview, a sibling of files/, and is NOT covered
+         by the "file" excludes above. -->
+    <exclude domain="root" path="app_webview" />
 </full-backup-content>

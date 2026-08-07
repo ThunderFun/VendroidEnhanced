@@ -141,17 +141,26 @@
     try { VencordMobileNative.close(); } catch(e) {}
   });
 
+  function showError(msg) {
+    var body = document.getElementById('body');
+    body.innerHTML = '';                       // clear existing content
+    var div = document.createElement('div');
+    div.className = 'cat-desc';
+    div.textContent = 'Failed to load firewall config: ' + msg; // use textContent, never innerHTML
+    body.appendChild(div);
+  }
+
   // Called from native onPageFinished after the page URL has committed.
   window.vdeFirewallInit = function(raw) {
     try {
       config = JSON.parse(raw);
       if (config && config.error) {
-        document.getElementById('body').innerHTML = '<div class="cat-desc">Failed to load firewall config: ' + config.error + '</div>';
+        showError(config.error);
         return;
       }
       renderCategories(config.categories || []);
     } catch(e) {
-      document.getElementById('body').innerHTML = '<div class="cat-desc">Failed to load firewall config: ' + e.message + '</div>';
+      showError(e.message);
     }
   };
 })();

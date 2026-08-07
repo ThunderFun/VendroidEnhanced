@@ -11,12 +11,15 @@
         android:layout_width="match_parent"
         android:layout_height="match_parent" />
 
-    <WebView
+    <!-- Placeholder only. The real WebView is created programmatically in
+         MainActivity (reusing the pre-warmed renderer when available) and
+         installed here so setContentView doesn't pay the cost of inflating a
+         WebView (Chromium init) before the WebView clients are configured. -->
+    <View
         android:id="@+id/webview"
         android:layout_width="match_parent"
         android:layout_height="match_parent"
-        android:background="#121214"
-        android:visibility="visible" />
+        android:background="#121214" />
 
     <LinearLayout
         android:id="@+id/loading_screen"

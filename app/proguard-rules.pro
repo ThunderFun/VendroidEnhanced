@@ -33,10 +33,6 @@
 -keep class * implements com.google.gson.JsonSerializer
 -keep class * implements com.google.gson.JsonDeserializer
 
-# Keep the app's own serialized model classes (used by Gson reflection)
--keep class com.nin0dev.vendroid.utils.UpdateData { *; }
-
-
 # Suppress warnings for javax.annotation (not on Android)
 -dontwarn javax.annotation.**
 
@@ -76,3 +72,19 @@
     public static int wtf(...);
     public static int e(...);
 }
+
+# OkHttp 5.x + Okio (aggressive R8: -repackageclasses, -allowaccessmodification,
+# -mergeinterfacesaggressively). The AAR bundles its own okhttp3.pro (mostly
+# -dontwarn); these keeps are belt-and-suspenders so the synchronous
+# Call/ConnectionPool subset survives shrinking.
+-keep class okhttp3.** { *; }
+-keep interface okhttp3.** { *; }
+-keep class okio.** { *; }
+
+# OkHttp 5.x Android artifact loads the public-suffix DB from an asset reflectively.
+-keep class okhttp3.internal.publicsuffix.** { *; }
+
+# Platform TLS providers OkHttp probes at runtime (bundled rules also cover these).
+-dontwarn org.conscrypt.**
+-dontwarn org.bouncycastle.**
+-dontwarn org.openjsse.**

@@ -3,6 +3,10 @@
     var _vendroidJsonpCallback = null;
     var _vendroidChunkArr = null;
     var _vendroidCaptureAttempts = 0;
+    // Hot-path input logging (beforeinput/composition, per keystroke) crosses
+    // the renderer→native IPC and lands in a disk-backed log — keep it off
+    // unless actively debugging input issues.
+    var VENDROID_VERBOSE_INPUT = false;
 
     (function setupWebpackInterception() {
         var existing = window.webpackChunkdiscord_app;
@@ -369,40 +373,34 @@
         return null;
     }
 
-    var _vendroidLogsPoll = null;
+    // One shared poll for all four settings-tab rows (logs, firewall, privacy,
+    // link-confirm). Previously four independent 750ms intervals each ran a
+    // full-document querySelectorAll — ~5 full DOM scans/sec for the page
+    // lifetime, even with Settings never opened. Now one scan per tick feeds
+    // all injectors, and ticks are skipped entirely while backgrounded.
+    var _vendroidSettingsPoll = null;
 
-    // Injects a "View logs" row into the VendroidEnhanced Settings tab.
-    //
-    // The plugin renders, per section in settings/settings.tsx:
-    //     <div className={cl("settings-tab")} />
-    //     <section title={section}> ...rows... </section>
-    // cl("settings-tab") → class "vde-settings-tab", the reliable signal
-    // that the Settings tab is mounted.
-    //
-    // The tab mounts/unmounts on navigation, destroying the injected row
-    // each time. We poll every 750ms and (re)inject when .vde-settings-tab
-    // is present and the row is missing — one querySelector per tick, only
-    // while the tab is open.
-    function setupLogsButton() {
-        if (_vendroidLogsPoll) return;
+    function setupSettingsRows() {
+        if (_vendroidSettingsPoll) return;
         try {
-            _vendroidLogsPoll = setInterval(injectLogsRowIfMissing, 750);
-            injectLogsRowIfMissing(); // immediate try in case tab is open
+            _vendroidSettingsPoll = setInterval(injectSettingsRowsIfMissing, 750);
+            injectSettingsRowsIfMissing(); // immediate try in case tab is open
         } catch(e) {
-            console.error('[Vendroid] setupLogsButton error: ' + e.message);
+            console.error('[Vendroid] setupSettingsRows error: ' + e.message);
         }
     }
 
-    function injectLogsRowIfMissing() {
+    function injectSettingsRowsIfMissing() {
         try {
+            if (document.hidden) return;
             // .vde-settings-tab exists only when the Settings tab is mounted.
             // The plugin renders one per section; append into the last so the
-            // row lands at the bottom, next to "Other > Developer settings".
+            // rows land at the bottom, next to "Other > Developer settings".
             var tabContainers = document.querySelectorAll('.vde-settings-tab');
             if (!tabContainers || tabContainers.length === 0) return;
 
             // Markup is <div class="vde-settings-tab"></div><section>…</section>;
-            // the row belongs inside a <section>, so find the last <section>
+            // rows belong inside a <section>, so find the last <section>
             // after the last vde-settings-tab.
             var lastTab = tabContainers[tabContainers.length - 1];
             var section = lastTab.parentElement && lastTab.parentElement.querySelector('section:last-of-type');
@@ -411,6 +409,19 @@
                 section = lastTab;
             }
 
+            injectLogsRowIfMissing(section);
+            injectFirewallRowIfMissing(section);
+            injectPrivacyToggleIfMissing(section);
+            injectLinkConfirmToggleIfMissing(section);
+        } catch(e) {
+            console.error('[Vendroid] injectSettingsRowsIfMissing error: ' + e.message);
+        }
+    }
+
+    // Injects a "View logs" row into the VendroidEnhanced Settings tab.
+    // Called by the shared settings poller with the resolved target <section>.
+    function injectLogsRowIfMissing(section) {
+        try {
             if (section.querySelector('[data-vde-logs-btn]')) return;
 
             var wrap = document.createElement('div');
@@ -434,7 +445,7 @@
             btn.textContent = 'View logs';
             btn.style.cssText = 'display:inline-flex;align-items:center;justify-content:center;padding:8px 16px;background:var(--brand-primary,#5865f2);color:#fff;border:none;border-radius:8px;font-size:14px;font-weight:600;cursor:pointer;-webkit-tap-highlight-color:transparent;';
             btn.addEventListener('click', function() {
-                try { VencordMobileNative.openLogs(); } catch(e) {
+                try { VencordMobileNative.requestNative('openLogs'); } catch(e) {
                     console.error('[Vendroid] openLogs failed: ' + e.message);
                 }
             });
@@ -452,33 +463,10 @@
         }
     }
 
-    var _vendroidFirewallPoll = null;
-
     // Injects a "Firewall" row into the VendroidEnhanced Settings tab.
-    // Uses the same polling/idempotency pattern as injectLogsRowIfMissing,
-    // with its own interval handle so the two injectors are independent.
-    function setupFirewallButton() {
-        if (_vendroidFirewallPoll) return;
+    // Called by the shared settings poller with the resolved target <section>.
+    function injectFirewallRowIfMissing(section) {
         try {
-            _vendroidFirewallPoll = setInterval(injectFirewallRowIfMissing, 750);
-            injectFirewallRowIfMissing(); // immediate try in case tab is open
-        } catch(e) {
-            console.error('[Vendroid] setupFirewallButton error: ' + e.message);
-        }
-    }
-
-    function injectFirewallRowIfMissing() {
-        try {
-            var tabContainers = document.querySelectorAll('.vde-settings-tab');
-            if (!tabContainers || tabContainers.length === 0) return;
-
-            var lastTab = tabContainers[tabContainers.length - 1];
-            var section = lastTab.parentElement && lastTab.parentElement.querySelector('section:last-of-type');
-            if (!section) {
-                // Fallback: use the last tab container itself.
-                section = lastTab;
-            }
-
             if (section.querySelector('[data-vde-firewall-btn]')) return;
 
             var wrap = document.createElement('div');
@@ -502,7 +490,7 @@
             btn.textContent = 'Open firewall editor';
             btn.style.cssText = 'display:inline-flex;align-items:center;justify-content:center;padding:8px 16px;background:var(--brand-primary,#5865f2);color:#fff;border:none;border-radius:8px;font-size:14px;font-weight:600;cursor:pointer;-webkit-tap-highlight-color:transparent;';
             btn.addEventListener('click', function() {
-                try { VencordMobileNative.openFirewallEditor(); } catch(e) {
+                try { VencordMobileNative.requestNative('openFirewallEditor'); } catch(e) {
                     console.error('[Vendroid] openFirewallEditor failed: ' + e.message);
                 }
             });
@@ -520,32 +508,11 @@
         }
     }
 
-    var _vendroidPrivacyPoll = null;
-
     // Injects a "Block typing indicator" toggle into the VendroidEnhanced
-    // Settings tab. Same polling/idempotency pattern as the logs and firewall
-    // injectors, with its own interval handle.
-    function setupPrivacyToggle() {
-        if (_vendroidPrivacyPoll) return;
+    // Settings tab. Called by the shared settings poller with the resolved
+    // target <section>.
+    function injectPrivacyToggleIfMissing(section) {
         try {
-            _vendroidPrivacyPoll = setInterval(injectPrivacyToggleIfMissing, 750);
-            injectPrivacyToggleIfMissing(); // immediate try in case tab is open
-        } catch(e) {
-            console.error('[Vendroid] setupPrivacyToggle error: ' + e.message);
-        }
-    }
-
-    function injectPrivacyToggleIfMissing() {
-        try {
-            var tabContainers = document.querySelectorAll('.vde-settings-tab');
-            if (!tabContainers || tabContainers.length === 0) return;
-
-            var lastTab = tabContainers[tabContainers.length - 1];
-            var section = lastTab.parentElement && lastTab.parentElement.querySelector('section:last-of-type');
-            if (!section) {
-                section = lastTab;
-            }
-
             if (section.querySelector('[data-vde-privacy-toggle]')) return;
 
             var wrap = document.createElement('div');
@@ -647,31 +614,11 @@
         }
     }
 
-    var _vendroidLinkConfirmPoll = null;
-
     // Injects a "Confirm external links" toggle into the VendroidEnhanced
-    // Settings tab. Same polling/idempotency pattern as the privacy toggle.
-    function setupLinkConfirmToggle() {
-        if (_vendroidLinkConfirmPoll) return;
+    // Settings tab. Called by the shared settings poller with the resolved
+    // target <section>.
+    function injectLinkConfirmToggleIfMissing(section) {
         try {
-            _vendroidLinkConfirmPoll = setInterval(injectLinkConfirmToggleIfMissing, 750);
-            injectLinkConfirmToggleIfMissing(); // immediate try in case tab is open
-        } catch(e) {
-            console.error('[Vendroid] setupLinkConfirmToggle error: ' + e.message);
-        }
-    }
-
-    function injectLinkConfirmToggleIfMissing() {
-        try {
-            var tabContainers = document.querySelectorAll('.vde-settings-tab');
-            if (!tabContainers || tabContainers.length === 0) return;
-
-            var lastTab = tabContainers[tabContainers.length - 1];
-            var section = lastTab.parentElement && lastTab.parentElement.querySelector('section:last-of-type');
-            if (!section) {
-                section = lastTab;
-            }
-
             if (section.querySelector('[data-vde-link-confirm-toggle]')) return;
 
             var wrap = document.createElement('div');
@@ -790,10 +737,7 @@
         setupSlateInputFix();
         setupTextCommandDispatcher();
         setupGifPickerButton();
-        setupLogsButton();
-        setupFirewallButton();
-        setupPrivacyToggle();
-        setupLinkConfirmToggle();
+        setupSettingsRows();
 
         setTimeout(() => {
             try { VencordMobileNative.dismissLoadingScreen(); } catch(e) {}
@@ -929,7 +873,7 @@
                     !target.closest("[data-slate-editor]")) return;
                 isComposing = true;
                 composingText = null;
-                console.warn("[Vendroid] compositionstart");
+                if (VENDROID_VERBOSE_INPUT) console.warn("[Vendroid] compositionstart");
             }, true);
 
             document.addEventListener("compositionend", function(e) {
@@ -939,7 +883,8 @@
                     !target.closest("[data-slate-editor]")) return;
                 isComposing = false;
                 composingText = null;
-                console.warn("[Vendroid] compositionend data=" + JSON.stringify(e.data));
+                // Note: do NOT log e.data here — it can contain typed message text.
+                if (VENDROID_VERBOSE_INPUT) console.warn("[Vendroid] compositionend");
             }, true);
 
             document.addEventListener("beforeinput", function(e) {
@@ -951,8 +896,9 @@
                 var inputType = e.inputType;
                 var data = e.data;
 
-                // Log every beforeinput event for the Slate editor
-                console.warn("[Vendroid] beforeinput type=" + inputType + " data=" + JSON.stringify(data) + " composing=" + isComposing);
+                // Log beforeinput metadata for the Slate editor. Do NOT log
+                // `data` — it carries the typed message content.
+                if (VENDROID_VERBOSE_INPUT) console.warn("[Vendroid] beforeinput type=" + inputType + " len=" + (data ? data.length : 0) + " composing=" + isComposing);
 
                 // Only handle types needing manual Slate routing. Skip
                 // insertCompositionText — Discord's Slate plugin has its own
@@ -989,7 +935,7 @@
                             composed: false
                         });
                         target.dispatchEvent(ev);
-                        console.warn("[Vendroid] synthetic input dispatched. type=" + (evType || "insertText") + " editorText=" + JSON.stringify(curEditorText.substring(0, 50)));
+                        if (VENDROID_VERBOSE_INPUT) console.warn("[Vendroid] synthetic input dispatched. type=" + (evType || "insertText"));
                     } catch(e) {
                         console.error("[Vendroid] synthetic input error: " + e.message);
                     }
@@ -1019,7 +965,7 @@
                     e.stopPropagation();
                     try {
                         editor.insertText(data || "");
-                        console.warn("[Vendroid] insertText done. editorText=" + JSON.stringify(getEditorText().substring(0, 50)));
+                        if (VENDROID_VERBOSE_INPUT) console.warn("[Vendroid] insertText done.");
                     } catch(err) {
                         console.error("[Vendroid] Slate insertText error: " + err.message);
                     }
@@ -1038,7 +984,8 @@
                         } else if (composingText && composingText.length > 0) {
                             delLen = composingText.length;
                         }
-                        console.warn("[Vendroid] insertReplacementText delLen=" + delLen + " data=" + JSON.stringify(data));
+                        // Do NOT log `data` here — it's the replacement text.
+                        if (VENDROID_VERBOSE_INPUT) console.warn("[Vendroid] insertReplacementText delLen=" + delLen);
                         for (var r = 0; r < delLen; r++) {
                             editor.deleteBackward("character");
                         }
@@ -1217,9 +1164,46 @@
             }
             console.warn("[Vendroid] GIF: core modules resolved (Fr=" + PlatformUtils.Fr + ")");
 
-            // Find a module by scanning webpack factory source for a unique
-            // code signature (findByCode may not exist in all Vencord builds).
-            function findModuleByCode(signature) {
+            // Resolve the expression-picker overlay module by code signature.
+            // `patterns` may be a single string/RegExp or an array; the first
+            // match wins. Prefer Vencord's findModuleId (scans the factory
+            // registry, so it finds lazily-loaded modules), then findByCode,
+            // then a manual factory scan as a last resort.
+            function findModuleByCode(patterns) {
+                if (!Array.isArray(patterns)) patterns = [patterns];
+                // findModuleId matches the raw factory source, so it works for
+                // lazily-loaded modules absent from the instantiated cache.
+                if (typeof Vencord.Webpack.findModuleId === "function") {
+                    for (var pi = 0; pi < patterns.length; pi++) {
+                        try {
+                            var mid = Vencord.Webpack.findModuleId(patterns[pi]);
+                            if (mid != null && typeof Vencord.Webpack.wreq === "function") {
+                                var mod = Vencord.Webpack.wreq(mid);
+                                if (mod) {
+                                    console.warn("[Vendroid] GIF: found module id=" + mid + " via findModuleId (pattern " + pi + ")");
+                                    return mod;
+                                }
+                            }
+                        } catch(e) {
+                            console.error("[Vendroid] GIF: findModuleId(pattern " + pi + ") failed: " + e.message);
+                        }
+                    }
+                }
+                // Fallback: Vencord's findByCode (works for already-loaded modules).
+                if (typeof Vencord.Webpack.findByCode === "function") {
+                    for (var pi2 = 0; pi2 < patterns.length; pi2++) {
+                        try {
+                            var mod2 = Vencord.Webpack.findByCode(patterns[pi2]);
+                            if (mod2) {
+                                console.warn("[Vendroid] GIF: found module via findByCode (pattern " + pi2 + ")");
+                                return mod2;
+                            }
+                        } catch(e) {
+                            console.error("[Vendroid] GIF: findByCode(pattern " + pi2 + ") failed: " + e.message);
+                        }
+                    }
+                }
+                // Fallback: manual scan of the webpack factory source.
                 var wreq = Vencord.Webpack.wreq;
                 if (!wreq || !wreq.m) return null;
                 var factories = wreq.m;
@@ -1228,13 +1212,20 @@
                     for (var i = 0; i < ids.length; i++) {
                         var id = ids[i];
                         if (typeof factories[id] !== "function") continue;
-                        if (factories[id].toString().indexOf(signature) !== -1) {
-                            try {
-                                var exports = wreq(id);
-                                console.warn("[Vendroid] GIF: found module by code -> id=" + id);
-                                return exports;
-                            } catch(e) {
-                                console.error("[Vendroid] GIF: wreq(" + id + ") failed: " + e.message);
+                        var src = factories[id].toString();
+                        for (var fi = 0; fi < patterns.length; fi++) {
+                            var pat = patterns[fi];
+                            var hit = (typeof pat === "string")
+                                ? (src.indexOf(pat) !== -1)
+                                : pat.test(src);
+                            if (hit) {
+                                try {
+                                    var exports = wreq(id);
+                                    console.warn("[Vendroid] GIF: found module by code -> id=" + id + " (pattern " + fi + ")");
+                                    return exports;
+                                } catch(e) {
+                                    console.error("[Vendroid] GIF: wreq(" + id + ") failed: " + e.message);
+                                }
                             }
                         }
                     }
@@ -1247,9 +1238,13 @@
             // Patch the overlay: flip Fr->false only during its render call.
             // Only needed on mobile (Fr===true); desktop already shows GIF.
             if (PlatformUtils.Fr === true && !_vendroidGifOverlayPatched) {
-                var OverlayModule = findModuleByCode(
-                    "onSelectGIF:a,onSelectEmoji:l,onSelectSticker:A,onSelectSound:v,onSelectKaomoji:b"
-                );
+                var OverlayModule = findModuleByCode([
+                    // Match stable handler prop names; tolerates Discord
+                    // re-minifying the per-build value letters.
+                    /onSelectGIF:[A-Za-z0-9_$],onSelectEmoji:[A-Za-z0-9_$],onSelectSticker:[A-Za-z0-9_$],onSelectSound:[A-Za-z0-9_$]/,
+                    // Fallback: exact current minified signature.
+                    "onSelectGIF:a,onSelectEmoji:l,onSelectSticker:A,onSelectSound:v,channel:b"
+                ]);
                 var overlayTypeFn = null;
                 if (OverlayModule && OverlayModule.A) {
                     // React.memo: the render fn is at .type, not the memo object.
@@ -2537,11 +2532,11 @@ video {
                     fetchedCssBuffer[idx] = css;
                     fetchedCssCount++;
                     flushFetchedCss();
-                    try {
-                        if (window.VencordMobileNative && window.VencordMobileNative.setString) {
-                            window.VencordMobileNative.setString(cssCacheKey(url), css);
-                        }
-                    } catch(e) {}
+                    // Note: the CSS cache is populated only by the native
+                    // prefetch (VendroidApp). JS must NOT write css_cache_*
+                    // keys — allowing that would let Discord-origin script
+                    // poison the cache with attacker CSS or exhaust app
+                    // storage via the predictable key scheme.
                 })
                 .catch(() => {
                     var link = Object.assign(document.createElement("link"), {

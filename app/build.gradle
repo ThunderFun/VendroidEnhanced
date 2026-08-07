@@ -10,7 +10,7 @@ if (keystorePropertiesFile.exists()) {
 
 android {
     namespace 'com.nin0dev.vendroid'
-    compileSdk 35
+    compileSdk 36
 
     defaultConfig {
         applicationId "com.nin0dev.vendroid"
@@ -41,6 +41,8 @@ android {
         debug {
             applicationIdSuffix ".debug"
             buildConfigField "boolean", "ALLOW_WEBVIEW_DEBUGGING", "true"
+            // Keep the strict CSP report-only in debug for violation triage.
+            buildConfigField "boolean", "ENFORCE_STRICT_CSP", "false"
         }
 
         dev {
@@ -50,6 +52,8 @@ android {
             signingConfig signingConfigs.debug
             proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
             buildConfigField "boolean", "ALLOW_WEBVIEW_DEBUGGING", "false"
+            // Enforce the strict CSP in dev to shake out breakage before release.
+            buildConfigField "boolean", "ENFORCE_STRICT_CSP", "true"
         }
 
         release {
@@ -58,6 +62,8 @@ android {
             signingConfig signingConfigs.release
             proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
             buildConfigField "boolean", "ALLOW_WEBVIEW_DEBUGGING", "false"
+            // Enforce the strict CSP in release once validated.
+            buildConfigField "boolean", "ENFORCE_STRICT_CSP", "true"
         }
     }
     compileOptions {
@@ -77,7 +83,7 @@ dependencies {
     implementation 'androidx.activity:activity-ktx:1.9.3'
     implementation 'com.google.code.gson:gson:2.12.1'
     implementation 'androidx.webkit:webkit:1.12.1'
-    implementation 'androidx.constraintlayout:constraintlayout:2.2.0'
+    implementation 'com.squareup.okhttp3:okhttp:5.4.0'
 
     testImplementation 'junit:junit:4.13.2'
     testImplementation 'org.robolectric:robolectric:4.14.1'

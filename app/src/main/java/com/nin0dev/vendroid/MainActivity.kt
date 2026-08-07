@@ -5,6 +5,7 @@ import android.content.Context
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.view.WindowCompat
 import android.content.Intent
+import android.content.SharedPreferences
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
@@ -14,12 +15,10 @@ import android.webkit.ValueCallback
 import android.webkit.WebView
 import android.webkit.WebChromeClient
 import android.widget.Toast
-import com.google.android.material.color.DynamicColors
 import com.google.gson.Gson
 import com.nin0dev.vendroid.utils.Constants
-import com.nin0dev.vendroid.utils.JsPatches
-import com.nin0dev.vendroid.utils.Logger.e
 import com.nin0dev.vendroid.utils.VDELog
+import com.nin0dev.vendroid.ui.LoadingScreenManager
 import com.nin0dev.vendroid.webview.HttpClient
 import com.nin0dev.vendroid.webview.HttpClient.fetchVencord
 import com.nin0dev.vendroid.webview.VChromeClient
@@ -37,18 +36,20 @@ class MainActivity : AppCompatActivity() {
     private var prewarmUsed = false
     private var wv: WebView? = null
 
-    /** Cached URL for bridge-thread safety.  Updated on the UI thread in
-     *  WebViewClient callbacks and onPause.  Bridge methods read this
-     *  instead of calling wv.url directly. */
+    /** Cached URL for bridge-thread safety: updated on the UI thread and read
+     *  off-thread instead of calling wv.url directly. */
     @Volatile
     var currentUrlForBridge: String? = null
     @Volatile
     var currentHostForBridge: String? = null
+    /** True between a main-frame commit and onPageFinished. Lets the bridge's
+     *  strict domain check skip the UI-thread round trip in steady state. */
+    @Volatile
+    var navigationInProgress = false
     @Volatile
     var missedInjection = false
-    /** Deep link received via onNewIntent during onCreate; applied once
-     *  the WebView is initialized so it isn't overwritten by the initial
-     *  URL load. */
+    /** Deep link received via onNewIntent during onCreate; applied once the
+     *  WebView is initialized so the initial load does not overwrite it. */
     @Volatile
     private var pendingDeepLink: String? = null
     private lateinit var chromeClient: VChromeClient
@@ -72,6 +73,11 @@ class MainActivity : AppCompatActivity() {
     }
 
     private lateinit var loadingScreenManager: LoadingScreenManager
+
+    /** Public so the WebView/JS layers can schedule/dismiss the loading screen
+     *  directly without a pass-through facade on the activity. */
+    val loadingScreen: LoadingScreenManager get() = loadingScreenManager
+
     private val fetchExecutor = Executors.newSingleThreadExecutor()
 
     private fun migrateSettings() {
@@ -81,12 +87,15 @@ class MainActivity : AppCompatActivity() {
         ed.putBoolean("migratedSettings", true);
 
         ed.putBoolean("checkVDEUpdates", sPrefs.getBoolean("checkVendroidUpdates", true))
+        // Both toggles were historically controlled by the single legacy
+        // checkVendroidUpdates flag; keep them in sync during migration so an
+        // existing user does not silently lose one.
         ed.putBoolean(
             "checkAnnouncements",
             sPrefs.getBoolean("checkVendroidUpdates", true)
         )
-        // Derive clientMod from the legacy boolean only if not already set;
-        // re-runs (reinstall/flag wipe) must not clobber an existing choice.
+        // Derive clientMod from the legacy boolean only if unset; re-runs
+        // (reinstall/flag wipe) must not clobber an existing choice.
         if (!sPrefs.contains("clientMod")) {
             ed.putString(
                 "clientMod",
@@ -101,31 +110,86 @@ class MainActivity : AppCompatActivity() {
         ed.apply()
     }
 
-    fun dismissLoadingScreen() = loadingScreenManager.dismiss()
-    fun scheduleLoadingScreenDismiss(delayMs: Long) = loadingScreenManager.scheduleDismiss(delayMs)
-
     @SuppressLint("SetJavaScriptEnabled")
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         VDELog.i("Main", "onCreate()")
-        if (!getSharedPreferences("settings", Context.MODE_PRIVATE).getBoolean("migratedSettings", false)) {
+        // Load settings once and reuse throughout onCreate.
+        val sPrefs = getSharedPreferences("settings", Context.MODE_PRIVATE)
+        if (!sPrefs.getBoolean("migratedSettings", false)) {
             migrateSettings()
         }
-        android.os.Handler(android.os.Looper.getMainLooper()).postDelayed({
-            DynamicColors.applyToActivitiesIfAvailable(application)
-        }, 2000)
 
+        // First-run security disclosure. Do not load Discord, the WebView, or
+        // any injected code until the user accepts the risks of a modified
+        // Discord client running third-party code.
+        if (!sPrefs.getBoolean("riskWarningAccepted", false)) {
+            showFirstRunWarning(sPrefs)
+            return
+        }
+        proceedWithStartup(sPrefs)
+    }
+
+    /**
+     * Shows the first-run security warning. Blocks app startup until the user
+     * explicitly accepts the risks; declining (back/dismiss) closes the app.
+     * Persists acceptance so this only shows once.
+     */
+    private fun showFirstRunWarning(sPrefs: SharedPreferences) {
+        val dialog = android.app.AlertDialog.Builder(this)
+            .setTitle(R.string.risk_warning_title)
+            .setMessage(R.string.risk_warning_body)
+            .setCancelable(false) // block bypass via outside tap / back
+            .setPositiveButton(R.string.risk_warning_accept) { _, _ ->
+                sPrefs.edit().putBoolean("riskWarningAccepted", true).apply()
+                proceedWithStartup(sPrefs)
+            }
+            .setNegativeButton(android.R.string.cancel) { _, _ -> finish() }
+            .create()
+        dialog.setOnDismissListener { if (!sPrefs.getBoolean("riskWarningAccepted", false)) finish() }
+        dialog.show()
+    }
+
+    /** The body of the original onCreate, run only after the risk warning is
+     *  accepted. */
+    private fun proceedWithStartup(sPrefs: SharedPreferences) {
         window.setFormat(android.graphics.PixelFormat.OPAQUE)
 
-        val sPrefs = getSharedPreferences("settings", Context.MODE_PRIVATE)
         val editor = sPrefs.edit()
 
-        // WebView debugging exposes the page (cookies, token, JS context) to any
-        // attached debugger. Gate it behind an explicit build flag; never in dev/release.
+        // WebView debugging exposes the page (cookies, token, JS context) to
+        // any attached debugger. Gate it behind an explicit build flag.
         WebView.setWebContentsDebuggingEnabled(BuildConfig.ALLOW_WEBVIEW_DEBUGGING)
         setContentView(R.layout.activity_main)
         WindowCompat.setDecorFitsSystemWindows(window, true)
 
+        setupBackPress()
+
+        loadingScreenManager = LoadingScreenManager(this, findViewById(R.id.loading_screen))
+        // Start the animation now so the splash does not freeze during WebView setup.
+        loadingScreenManager.start()
+        loadingScreenManager.scheduleTimeout(30000)
+
+        installWebView(sPrefs)
+        syncFeatureToggles(sPrefs)
+        configureServiceWorker()
+
+        loadVencordRuntimes(sPrefs, editor)
+
+        val initialUrl = resolveInitialUrl(sPrefs, intent)
+        currentUrlForBridge = initialUrl
+
+        wvInitialized = true
+
+        // Apply a deep link stashed by onNewIntent during onCreate.
+        pendingDeepLink?.let { link ->
+            pendingDeepLink = null
+            handleUrl(Uri.parse(link))
+        }
+    }
+
+    /** Registers the back-press handler that proxies to the Discord JS app. */
+    private fun setupBackPress() {
         onBackPressedDispatcher.addCallback(this, object : androidx.activity.OnBackPressedCallback(true) {
             override fun handleOnBackPressed() {
                 if (wv != null) {
@@ -134,8 +198,12 @@ class MainActivity : AppCompatActivity() {
                         chromeClient.hideCustomView()
                         return
                     }
-                    wv!!.evaluateJavascript("VencordMobile.onBackPress()") { r: String ->
-                        if ("false" == r) {
+                    wv!!.evaluateJavascript("VencordMobile.onBackPress()") { r ->
+                        // "true" = JS handled it (closed a modal etc.). Anything
+                        // else (null on a JS error in safe mode or before the
+                        // runtime loads) falls through to the default back
+                        // action so the user is never stuck.
+                        if ("true" != r) {
                             isEnabled = false
                             onBackPressedDispatcher.onBackPressed()
                             isEnabled = true
@@ -148,89 +216,37 @@ class MainActivity : AppCompatActivity() {
                 isEnabled = true
             }
         })
+    }
 
-        loadingScreenManager = LoadingScreenManager(this, findViewById(R.id.loading_screen))
-
-        // Use the pre-warmed WebView from VendroidApp if available — it already
-        // has the Chromium renderer process initialized, eliminating ~200-500ms
-        // of cold-start latency. Otherwise fall back to the layout-inflated one.
+    /** Installs the real WebView and wires the WebView/Chrome clients and
+     *  settings. */
+    private fun installWebView(sPrefs: SharedPreferences) {
+        // The layout's @id/webview is a plain View placeholder so setContentView
+        // does not inflate a WebView (Chromium init) before clients are wired up.
+        val placeholder = findViewById<View>(R.id.webview)
+        val parent = placeholder?.parent as? android.view.ViewGroup
+        val params = placeholder?.layoutParams
+        val index = if (parent != null) parent.indexOfChild(placeholder) else -1
         val prewarmed = VendroidApp.prewarmedWebView
-        if (prewarmed != null) {
-            val xmlWv = findViewById<WebView>(R.id.webview)
-            val parent = xmlWv?.parent as? android.view.ViewGroup
-            val params = xmlWv?.layoutParams
-            if (parent != null && params != null) {
-                val index = parent.indexOfChild(xmlWv)
-                parent.removeView(xmlWv)
-                prewarmed.id = R.id.webview
-                prewarmUsed = true
-                // The pre-warmed WebView has no layout params yet — carry over
-                // the same width/height/background from the XML definition.
-                prewarmed.setBackgroundColor(android.graphics.Color.parseColor("#121214"))
-                parent.addView(prewarmed, index, params)
-            }
-            VendroidApp.prewarmedWebView = null
-            wv = prewarmed
+        wv = if (prewarmed != null) {
+            prewarmUsed = true
+            prewarmed
         } else {
-            wv = findViewById(R.id.webview)!!
+            WebView(this)
         }
+        wv!!.setBackgroundColor(android.graphics.Color.parseColor("#121214"))
+        // Keep the id so VChromeClient / VencordNative still find the WebView.
+        wv!!.id = R.id.webview
+        if (parent != null && params != null && index >= 0) {
+            parent.removeView(placeholder)
+            parent.addView(wv, index, params)
+        }
+        VendroidApp.prewarmedWebView = null
 
         chromeClient = VChromeClient(this)
         val webViewClient = VWebviewClient(this)
         wv!!.setWebViewClient(webViewClient)
         wv!!.setWebChromeClient(chromeClient)
-
-        // Sync the typing indicator toggle to the WebView client. Read once
-        // at startup into a @Volatile field; shouldInterceptRequest reads
-        // that field instead of SharedPreferences per request.
-        val blockTyping = sPrefs.getBoolean("vendroid_blockTypingIndicator", false)
-        VWebviewClient.updateTypingBlock(blockTyping)
-
-        // Sync the external-link confirmation toggle to the link popup.
-        val confirmLinks = sPrefs.getBoolean("vendroid_confirmExternalLinks", true)
-        com.nin0dev.vendroid.webview.LinkHandler.updateConfirmExternalLinks(confirmLinks)
-
-        // Intercept Service Worker fetch events (API 24+) — they bypass
-        // WebViewClient.shouldInterceptRequest entirely.
-        if (androidx.webkit.WebViewFeature.isFeatureSupported(
-                androidx.webkit.WebViewFeature.SERVICE_WORKER_BASIC_USAGE)) {
-            androidx.webkit.ServiceWorkerControllerCompat.getInstance()
-                .setServiceWorkerClient(
-                    object : androidx.webkit.ServiceWorkerClientCompat() {
-                        @androidx.annotation.RequiresApi(android.os.Build.VERSION_CODES.LOLLIPOP)
-                        override fun shouldInterceptRequest(request: android.webkit.WebResourceRequest): android.webkit.WebResourceResponse? {
-                            // Restrict to browser/inline schemes; data:, file:,
-                            // and custom schemes have a null host and would
-                            // otherwise bypass the domain allowlist.
-                            val scheme = request.url.scheme
-                            if (scheme != "https" && scheme != "http" && scheme != "blob" && scheme != "data") {
-                                return android.webkit.WebResourceResponse(
-                                    "text/plain", "utf-8",
-                                    java.io.ByteArrayInputStream(ByteArray(0))
-                                )
-                            }
-                            if (scheme == "http") {
-                                return android.webkit.WebResourceResponse(
-                                    "text/plain", "utf-8",
-                                    java.io.ByteArrayInputStream(ByteArray(0))
-                                )
-                            }
-                            val host = request.url.host
-                            if (host != null && !Constants.isAllowedDomain(host)) {
-                                return android.webkit.WebResourceResponse(
-                                    "text/plain", "utf-8",
-                                    java.io.ByteArrayInputStream(ByteArray(0))
-                                )
-                            }
-                            // Apply the same privacy path filter as
-                            // VWebviewClient so SW-fetched telemetry/Sentry
-                            // requests can't bypass it.
-                            VWebviewClient.shouldBlockForPrivacy(host, request.url.path)?.let { return it }
-                            return null
-                        }
-                    }
-                )
-        }
 
         if (sPrefs.getBoolean("desktopMode", false)) {
             wv!!.settings.userAgentString =
@@ -249,24 +265,23 @@ class MainActivity : AppCompatActivity() {
         s.setUseWideViewPort(true)
         s.setLoadWithOverviewMode(true)
         s.textZoom = 100
+        // Pre-rasterize offscreen tiles during scroll/fling so new content
+        // appears painted when scrolled into view. Modest GPU memory cost,
+        // visibly smoother scrolling on long message lists.
+        s.offscreenPreRaster = true
 
         wv!!.overScrollMode = View.OVER_SCROLL_NEVER
-
         wv!!.isVerticalScrollBarEnabled = false
         wv!!.isHorizontalScrollBarEnabled = false
-
         wv!!.isLongClickable = false
-
         wv!!.isHapticFeedbackEnabled = false
-
         wv!!.isScrollContainer = true
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             wv!!.defaultFocusHighlightEnabled = false
         }
 
         // Keep the Chromium renderer at IMPORTANT priority and never waive it
-        // when the WebView is not visible. This prevents the OS from killing
-        // or throttling the renderer process, keeping touch response fast.
+        // when hidden, so the OS cannot kill or throttle it and touch stays fast.
         wv!!.setRendererPriorityPolicy(WebView.RENDERER_PRIORITY_IMPORTANT, false)
 
         // Disable Safe Browsing
@@ -275,14 +290,49 @@ class MainActivity : AppCompatActivity() {
         }
 
         android.webkit.CookieManager.getInstance().setAcceptThirdPartyCookies(wv!!, false)
+    }
 
+    /** Syncs the feature-toggle flags (read once at startup) to the live
+     *  seams. */
+    private fun syncFeatureToggles(sPrefs: SharedPreferences) {
+        // Read into a @Volatile field so shouldInterceptRequest does not hit
+        // SharedPreferences per request.
+        val blockTyping = sPrefs.getBoolean("vendroid_blockTypingIndicator", false)
+        VWebviewClient.updateTypingBlock(blockTyping)
+
+        // Sync the external-link confirmation toggle to the link popup.
+        val confirmLinks = sPrefs.getBoolean("vendroid_confirmExternalLinks", true)
+        com.nin0dev.vendroid.webview.LinkHandler.updateConfirmExternalLinks(confirmLinks)
+    }
+
+    /** Intercepts Service Worker fetch events (API 24+), which bypass
+     *  WebViewClient.shouldInterceptRequest entirely. */
+    private fun configureServiceWorker() {
+        if (androidx.webkit.WebViewFeature.isFeatureSupported(
+                androidx.webkit.WebViewFeature.SERVICE_WORKER_BASIC_USAGE)) {
+            androidx.webkit.ServiceWorkerControllerCompat.getInstance()
+                .setServiceWorkerClient(
+                    object : androidx.webkit.ServiceWorkerClientCompat() {
+                        @androidx.annotation.RequiresApi(android.os.Build.VERSION_CODES.LOLLIPOP)
+                        override fun shouldInterceptRequest(request: android.webkit.WebResourceRequest): android.webkit.WebResourceResponse? {
+                            // Reuse the shared gate so the SW path cannot drift
+                            // from the WebView client.
+                            return VWebviewClient.shouldBlockForRequest(request)
+                        }
+                    }
+                )
+        }
+    }
+
+    /** Loads the Vencord runtimes (bridge + JS bundle) unless safe mode is
+     *  on. */
+    private fun loadVencordRuntimes(sPrefs: SharedPreferences, editor: SharedPreferences.Editor) {
         if (!sPrefs.getBoolean("safeMode", false)) {
             vencordNative = VencordNative(WeakReference(this), wv!!)
             wv?.addJavascriptInterface(vencordNative, "VencordMobileNative")
-            // These reads are now NO-OPs in the happy path because
-            // VendroidApp.onCreate() already loaded them on a background
-            // thread.  They remain here as a safety net for process-death
-            // paths where the Application object is recreated.
+            // These reads are usually no-ops because VendroidApp.onCreate()
+            // already loaded them on a background thread. They remain a safety
+            // net for process-death paths where the Application is recreated.
             if (HttpClient.VencordMobileRuntime == null) {
                 resources.openRawResource(R.raw.vencord_mobile).use { inputStream ->
                     HttpClient.setVencordMobileRuntime(HttpClient.readAsText(inputStream))
@@ -293,24 +343,22 @@ class MainActivity : AppCompatActivity() {
                 val needsRedownload = sPrefs.getInt("lastMajorUpdateThatUserHasUpdatedVencord", 0) < BuildConfig.VERSION_CODE
                 if (needsRedownload) {
                     vendroidFile.delete()
+                    sPrefs.edit().remove(HttpClient.PREF_BUNDLE_PATCHED).apply()
                     null
                 } else if (vendroidFile.exists()) {
-                    try { vendroidFile.readText() } catch (e: Exception) { e("Failed to read vendroidFile", e); null }
+                    try { HttpClient.readBundleFromDisk(sPrefs, vendroidFile) }
+                    catch (e: Exception) { VDELog.e("Main", "Failed to read vendroidFile", e); null }
                 } else null
             } else null
             fileContent?.let {
                 synchronized(vencordRuntimeLock) {
+                    // readBundleFromDisk already applied patches if needed, so
+                    // this is just a synchronized publish of the ready bundle.
                     if (HttpClient.VencordRuntime == null) {
                         try {
-                            // The file was written with applyPatches already
-                            // applied during a previous download.  Skip the
-                            // redundant ~1MB regex scan.
-                            HttpClient.setVencordRuntime(
-                                if (HttpClient.vencordBundlePatched) it
-                                else HttpClient.applyPatches(it)
-                            )
+                            HttpClient.setVencordRuntime(it)
                         } catch (e: Exception) {
-                            e("applyPatches failed", e)
+                            VDELog.e("Main", "publishing Vencord runtime failed", e)
                         }
                     }
                 }
@@ -322,7 +370,7 @@ class MainActivity : AppCompatActivity() {
                 try {
                     fetchVencord(act)
                 } catch (e: IOException) {
-                    e("fetchVencord failed", e)
+                    VDELog.e("Main", "fetchVencord failed", e)
                 }
             }
         } else {
@@ -332,49 +380,54 @@ class MainActivity : AppCompatActivity() {
             editor.putBoolean("safeMode", false)
             editor.apply()
         }
+    }
 
-        val intent = intent
-        val initialUrl: String = if (intent.action == Intent.ACTION_VIEW) {
+    /** Resolves the initial URL from a deep link intent or the last resume
+     *  URL. */
+    private fun resolveInitialUrl(sPrefs: SharedPreferences, intent: Intent): String {
+        if (intent.action == Intent.ACTION_VIEW) {
             val data = intent.data
-            if (data != null) {
-                handleUrl(intent.data)
-                data.toString()
-            } else {
-                "https://discord.com/app"
-            }
-        } else {
-            val lastUrl = sPrefs.getString("lastUrl", null)
-            if (lastUrl != null) {
-                val host = Uri.parse(lastUrl).host
-                if (host != null && Constants.isDiscordDomain(host) && isAppResumeUrl(lastUrl)) {
-                    wv!!.loadUrl(lastUrl)
-                    currentUrlForBridge = lastUrl
+            val host = data?.host
+            if (host != null && Constants.isDiscordDomain(host)) {
+                val target = data.toString()
+                // Route through NavigationPolicy so path rules (e.g. /blog ->
+                // popup) apply to deep links like in-WebView navigations,
+                // instead of bypassing them via a direct loadUrl.
+                if (com.nin0dev.vendroid.webview.NavigationPolicy.decide(data, true)
+                    == com.nin0dev.vendroid.webview.NavigationPolicy.Action.LOAD_IN_WEBVIEW) {
+                    wv!!.loadUrl(target)
+                    currentUrlForBridge = target
                     currentHostForBridge = host
-                    lastUrl
-                } else {
-                    // Stale non-app URL (e.g. /blog/...) — fall back to /app
-                    // rather than reloading a page with no history to go back to.
-                    wv!!.loadUrl("https://discord.com/app")
-                    "https://discord.com/app"
+                    return target
                 }
-            } else {
+                // Path/domain rule triggered (e.g. /blog or a CDN host): route
+                // to the link popup and land on the app shell.
+                com.nin0dev.vendroid.webview.LinkHandler(this).showLinkPopup(data)
+                currentUrlForBridge = "https://discord.com/app"
+                currentHostForBridge = "discord.com"
                 wv!!.loadUrl("https://discord.com/app")
-                "https://discord.com/app"
+                return "https://discord.com/app"
             }
+            // Non-Discord deep link (or no data): load the default app shell.
+            wv!!.loadUrl("https://discord.com/app")
+            return "https://discord.com/app"
         }
-        currentUrlForBridge = initialUrl
-
-
-        loadingScreenManager.start()
-        loadingScreenManager.scheduleTimeout(30000)
-
-        wvInitialized = true
-
-        // Apply a deep link stashed by onNewIntent during onCreate.
-        pendingDeepLink?.let { link ->
-            pendingDeepLink = null
-            handleUrl(Uri.parse(link))
+        val lastUrl = sPrefs.getString("lastUrl", null)
+        if (lastUrl != null) {
+            val host = Uri.parse(lastUrl).host
+            if (host != null && Constants.isDiscordDomain(host) && isAppResumeUrl(lastUrl)) {
+                wv!!.loadUrl(lastUrl)
+                currentUrlForBridge = lastUrl
+                currentHostForBridge = host
+                return lastUrl
+            }
+            // Stale non-app URL (e.g. /blog/...): fall back to /app rather
+            // than reloading a page with no back history.
+            wv!!.loadUrl("https://discord.com/app")
+            return "https://discord.com/app"
         }
+        wv!!.loadUrl("https://discord.com/app")
+        return "https://discord.com/app"
     }
 
     private fun handleUrl(url: Uri?) {
@@ -388,9 +441,17 @@ class MainActivity : AppCompatActivity() {
                 // Defer until onCreate finishes; loadUrl now would be
                 // overwritten by the initial-URL load.
                 pendingDeepLink = url.toString()
+            } else if (HttpClient.VencordMobileRuntime == null) {
+                // Runtime not injected into this page yet; transitionTo would
+                // no-op against a page without Vencord. Defer until the
+                // runtimes are injected (see injectVencordIfReady).
+                pendingDeepLink = url.toString()
             } else {
+                // Guarded so a page without Vencord (safe mode / failed load)
+                // fails silently instead of throwing a ReferenceError.
                 wv!!.evaluateJavascript(
-                    "Vencord.Webpack.Common.NavigationRouter.transitionTo(${gson.toJson(path)})",
+                    "if(window.Vencord&&Vencord.Webpack&&Vencord.Webpack.Common)" +
+                        "{Vencord.Webpack.Common.NavigationRouter.transitionTo(${gson.toJson(path)})}",
                     null
                 )
             }
@@ -400,7 +461,9 @@ class MainActivity : AppCompatActivity() {
     private fun isAppResumeUrl(url: String): Boolean {
         val path = Uri.parse(url).path ?: return false
         return path == "/app" ||
-            path.startsWith("/channels") ||
+            // "/channels" must match "/channels" and "/channels/..." but not
+            // "/channelssomething" (mirrors MainFrameDiskCache.isCacheableRoute).
+            path == "/channels" || path.startsWith("/channels/") ||
             path.startsWith("/library") ||
             path.startsWith("/store") ||
             path.startsWith("/friends")
@@ -421,7 +484,7 @@ class MainActivity : AppCompatActivity() {
             val host = currentHostForBridge
             // Only persist URLs the app can resume into (channels, DMs, /app).
             // Saving a non-app page (e.g. /blog/...) would reload it on restart
-            // with an empty history, hardlocking the user there.
+            // with empty history, hardlocking the user there.
             if (host != null && Constants.isDiscordDomain(host) && isAppResumeUrl(url)) {
                 getSharedPreferences("settings", Context.MODE_PRIVATE)
                     .edit() { putString("lastUrl", url) }
@@ -429,10 +492,9 @@ class MainActivity : AppCompatActivity() {
         }
         wv?.onPause()
         wv?.pauseTimers()
-        // When backgrounded, spoof document.hidden and pause all CSS animations
-        // so Discord's React app throttles itself and the compositor stops
-        // doing useless GPU work.  Combined with pauseTimers() this eliminates
-        // the vast majority of background CPU/GPU churn.
+        // When backgrounded, spoof document.hidden and pause CSS animations so
+        // Discord's React app throttles and the compositor stops wasted GPU
+        // work. With pauseTimers() this removes most background CPU/GPU churn.
         wv?.evaluateJavascript(
             "if(window.__vendroidSetVisibility)window.__vendroidSetVisibility('hidden');" +
             "if(window.__vendroidPauseAnimations)window.__vendroidPauseAnimations()",
@@ -455,7 +517,10 @@ class MainActivity : AppCompatActivity() {
     }
 
     override fun onDestroy() {
-        loadingScreenManager.cleanup()
+        // loadingScreenManager is set only once startup passes the first-run
+        // risk warning. If the user declines, or the activity is destroyed
+        // while the warning is shown, it is never set and must not be touched.
+        if (::loadingScreenManager.isInitialized) loadingScreenManager.cleanup()
         wv?.onPause()
         wv?.pauseTimers()
         wv?.stopLoading()
@@ -484,24 +549,38 @@ class MainActivity : AppCompatActivity() {
                 missedInjection = false
                 VDELog.w("Main", "Missed injection, scheduling reload")
                 val url = currentUrlForBridge
-                if (url != null && Constants.isDiscordDomain(Uri.parse(url).host ?: "")) {
+                if (url != null && Constants.isDiscordAppOrigin(Uri.parse(url).host ?: "")) {
                     wv?.reload()
                     return
                 }
             }
             // Only inject on Discord pages; the runtimes are designed for
-            // Discord and should not run on whitelisted non-Discord pages.
+            // Discord and must not run on whitelisted non-Discord pages.
             val url = currentUrlForBridge
-            if (url == null || !Constants.isDiscordDomain(Uri.parse(url).host ?: "")) return
+            if (url == null || !Constants.isDiscordAppOrigin(Uri.parse(url).host ?: "")) return
+            // Capability-token bootstrap must run first so the token is in
+            // scope (closure-captured, not a window global) before the runtimes
+            // call the bridge.
+            wv?.evaluateJavascript(VencordNative.bridgeBootstrapJs() + ";", null)
             wv?.evaluateJavascript(runtime + ";", null)
             wv?.evaluateJavascript(mobileRuntime + ";", null)
+            // Route any deep link that arrived before the runtime was ready.
+            pendingDeepLink?.let { link ->
+                pendingDeepLink = null
+                handleUrl(Uri.parse(link))
+            }
         }
     }
 
+    /** True while a video/movie is in fullscreen custom view, so the overlay's
+     *  status-bar color management can skip and avoid clobbering fullscreen. */
+    fun isVideoFullscreen(): Boolean =
+        ::chromeClient.isInitialized && chromeClient.isFullscreen
+
     fun showDiscordToast(message: String, type: String) {
         // message is JSON-encoded via gson.toJson before interpolation, but type
-        // is concatenated raw. Keep the allowList strict; widening it would allow
-        // JS injection via the unencoded type value.
+        // is concatenated raw. Keep the allowList strict; widening it would
+        // allow JS injection via the unencoded type.
         val allowedTypes = setOf("SUCCESS", "ERROR", "INFO", "WARN")
         val safeType = if (type in allowedTypes) type else "INFO"
         wv?.post(Runnable {
