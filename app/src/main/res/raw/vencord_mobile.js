@@ -3,6 +3,11 @@
     var _vendroidJsonpCallback = null;
     var _vendroidChunkArr = null;
     var _vendroidCaptureAttempts = 0;
+    // Bound the fake-chunk capture loop. Each attempt registers a new module
+    // id in Discord's webpack registry; without a cap this runs for the page
+    // lifetime if capture never succeeds. 40 x 500ms ~= 20s.
+    var _vendroidCaptureMaxAttempts = 40;
+    var _vendroidGiveUpLogged = false;
     // Hot-path input logging (beforeinput/composition, per keystroke) crosses
     // the renderer→native IPC and lands in a disk-backed log — keep it off
     // unless actively debugging input issues.
@@ -57,6 +62,13 @@
     function vendroidTryCaptureWreq() {
         if (_vendroidCapturedWreq) return;
         if (!_vendroidJsonpCallback) return;
+        if (_vendroidCaptureAttempts >= _vendroidCaptureMaxAttempts) {
+            if (!_vendroidGiveUpLogged) {
+                _vendroidGiveUpLogged = true;
+                console.error("[Vendroid] Gave up capturing __webpack_require__ after " + _vendroidCaptureAttempts + " attempts; runtime patches will not apply");
+            }
+            return;
+        }
 
         _vendroidCaptureAttempts++;
         var captured = null;
@@ -1246,10 +1258,12 @@
                     "onSelectGIF:a,onSelectEmoji:l,onSelectSticker:A,onSelectSound:v,channel:b"
                 ]);
                 var overlayTypeFn = null;
+                var overlayIsMemo = false;
                 if (OverlayModule && OverlayModule.A) {
                     // React.memo: the render fn is at .type, not the memo object.
                     if (typeof OverlayModule.A.type === "function") {
                         overlayTypeFn = OverlayModule.A.type;
+                        overlayIsMemo = true;
                     } else if (typeof OverlayModule.A === "function") {
                         overlayTypeFn = OverlayModule.A;
                     }
@@ -1280,7 +1294,7 @@
                         } catch(e) {}
                     }
 
-                    OverlayModule.A.type = function() {
+                    var patchedOverlay = function() {
                         var savedFr = PlatformUtils.Fr;
                         flipFrForRender();
                         var res;
@@ -1291,7 +1305,32 @@
                         }
                         return res;
                     };
-                    console.warn("[Vendroid] GIF: patched overlay (Fr scoped to render only)");
+                    try {
+                        if (overlayIsMemo) {
+                            OverlayModule.A.type = patchedOverlay;
+                            // A getter-only .type would silently ignore the
+                            // assignment; verify it took so the catch below
+                            // clears the patched flag and retries on the next
+                            // overlay open.
+                            if (OverlayModule.A.type !== patchedOverlay) throw new Error("memo .type is read-only");
+                        } else {
+                            // Plain function component: React calls A(props)
+                            // directly, so .type is a no-op. Replace the export
+                            // itself, copying statics (propTypes, displayName).
+                            for (var k in origOverlayRender) patchedOverlay[k] = origOverlayRender[k];
+                            OverlayModule.A = patchedOverlay;
+                            // Harmony exports expose A as a get-only property;
+                            // the assignment can silently no-op in sloppy mode,
+                            // so verify it actually took.
+                            if (OverlayModule.A !== patchedOverlay) throw new Error("export A is read-only");
+                        }
+                        console.warn("[Vendroid] GIF: patched overlay (Fr scoped to render only)");
+                    } catch(e) {
+                        // Leave unpatched so a later overlay open retries
+                        // instead of being masked by the patched flag.
+                        _vendroidGifOverlayPatched = false;
+                        console.error("[Vendroid] GIF: overlay patch failed: " + e.message);
+                    }
                 } else {
                     console.error("[Vendroid] GIF: overlay not found (A type=" + (OverlayModule ? typeof OverlayModule.A : "null") + ")");
                 }
@@ -1395,7 +1434,7 @@
             if (!initialized) {
                 try {
                     var path = window.location.pathname;
-                    isSidebarOpen = !/\/channels\/[^\/]+\/[^\/]+/.test(path);
+                    isSidebarOpen = !/^\/channels\/[^\/]+\/[^\/]+$/.test(path);
                 } catch(e) {}
             }
 
@@ -1454,8 +1493,9 @@
         }
     };
 
+    // This runs during the IIFE, before Vencord is guaranteed ready; guard it.
     const cssUrls = [
-        Vencord.Api.isEquicord
+        (typeof Vencord !== "undefined" && Vencord.Api && Vencord.Api.isEquicord)
             ? "https://vde-builds.nin0.dev/equicord/browser.css"
             : "https://vde-builds.nin0.dev/vencord/browser.css",
         "https://raw.githubusercontent.com/VendroidEnhanced/random-files/refs/heads/main/moreFixes.css"
@@ -1588,8 +1628,10 @@ video {
 
     function exitVideoFullscreen() {
         if (!vfsState) return;
-        const { video, overlay, originalParent, originalNextSibling, originalStyles, hadControls } = vfsState;
+        const { video, overlay, originalParent, originalNextSibling, originalStyles, hadControls, cleanup } = vfsState;
         video.pause();
+        // Remove listeners from the persistent <video> before clearing state.
+        if (typeof cleanup === "function") cleanup();
         if (originalNextSibling && originalNextSibling.parentNode === originalParent) {
             originalParent.insertBefore(video, originalNextSibling);
         } else {
@@ -1600,7 +1642,9 @@ video {
         overlay.remove();
         vfsState = null;
         try {
-            Object.defineProperty(document, 'fullscreenElement', { get() { return null; }, configurable: true });
+            // Remove our own-property override so the inherited prototype
+            // getter (the real native fullscreen state) is restored.
+            delete document.fullscreenElement;
         } catch(e) {}
         try { document.dispatchEvent(new Event("fullscreenchange")); } catch(e) {}
         notifyOverlayState();
@@ -1670,15 +1714,18 @@ video {
         seekBar.addEventListener("input", e => { e.stopPropagation(); if (video.duration) { video.currentTime = (seekBar.value / 100) * video.duration; seekBar.style.setProperty("--vfs-progress", seekBar.value + "%"); } });
 
         function updatePlayBtn() { playBtn.innerHTML = video.paused ? svgPlay : svgPause; }
-        video.addEventListener("play", updatePlayBtn);
-        video.addEventListener("pause", updatePlayBtn);
-        video.addEventListener("timeupdate", () => {
+        // Named refs so exitVideoFullscreen can remove them. The <video>
+        // persists in Discord's DOM; anon arrows would stack per session.
+        const onTimeUpdate = () => {
             if (video.duration && !seekBar._dragging) {
                 seekBar.value = (video.currentTime / video.duration) * 100;
                 seekBar.style.setProperty("--vfs-progress", (seekBar.value) + "%");
                 timeLabel.textContent = formatTime(video.currentTime) + " / " + formatTime(video.duration);
             }
-        });
+        };
+        video.addEventListener("play", updatePlayBtn);
+        video.addEventListener("pause", updatePlayBtn);
+        video.addEventListener("timeupdate", onTimeUpdate);
         seekBar.addEventListener("mousedown", () => { seekBar._dragging = true; });
         seekBar.addEventListener("touchstart", () => { seekBar._dragging = true; }, { passive: true });
         seekBar.addEventListener("mouseup", () => { seekBar._dragging = false; });
@@ -1713,11 +1760,12 @@ video {
                 else { showControls(); }
             }
         });
-        video.addEventListener("click", e => {
+        const onVideoClick = e => {
             e.stopPropagation();
             if (controlsVisible) { hideControls(); }
             else { showControls(); }
-        });
+        };
+        video.addEventListener("click", onVideoClick);
 
         overlay.appendChild(video);
         overlay.appendChild(controlsBg);
@@ -1735,7 +1783,13 @@ video {
             });
         }
 
-        vfsState = { video, overlay, controlsBg, controls, originalParent, originalNextSibling, originalStyles, hadControls };
+        const cleanupVideoListeners = () => {
+            video.removeEventListener("play", updatePlayBtn);
+            video.removeEventListener("pause", updatePlayBtn);
+            video.removeEventListener("timeupdate", onTimeUpdate);
+            video.removeEventListener("click", onVideoClick);
+        };
+        vfsState = { video, overlay, controlsBg, controls, originalParent, originalNextSibling, originalStyles, hadControls, cleanup: cleanupVideoListeners };
         updatePlayBtn();
         showControls();
 
@@ -1896,7 +1950,6 @@ video {
         const overlay = document.createElement("div");
         overlay.style.cssText = "position:fixed;top:0;left:0;width:100vw;height:100vh;background:rgba(0,0,0,0.95);display:flex;align-items:center;justify-content:center;z-index:2147483646;outline:none;overflow:hidden;";
         overlay.setAttribute("tabindex", "-1");
-        overlay.focus({ preventScroll: true });
 
         const img = isVideo ? document.createElement("video") : document.createElement("img");
         if (isVideo) {
@@ -2037,6 +2090,8 @@ video {
         overlay.appendChild(img);
         overlay.appendChild(closeBtn);
         document.body.appendChild(overlay);
+        // Focus after insertion; focus() on a detached element is a no-op.
+        overlay.focus({ preventScroll: true });
         imgOverlay = overlay;
         imgOverlayOpenTime = Date.now();
 
@@ -2545,6 +2600,10 @@ video {
                         href: url
                     });
                     document.documentElement.appendChild(link);
+                    // Count the failure so the successful CSS still injects.
+                    fetchedCssBuffer[idx] = "";
+                    fetchedCssCount++;
+                    flushFetchedCss();
                 });
         });
     }

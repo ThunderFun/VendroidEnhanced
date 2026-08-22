@@ -33,7 +33,7 @@ object NavigationPolicy {
         val host = url.host
         if (host != null && Constants.isNavigationAllowedDomain(host)) {
             val path = url.path ?: ""
-            if (path.startsWith("/blog")) return Action.SHOW_POPUP
+            if (path == "/blog" || path.startsWith("/blog/")) return Action.SHOW_POPUP
             return Action.LOAD_IN_WEBVIEW
         }
         return Action.SHOW_POPUP

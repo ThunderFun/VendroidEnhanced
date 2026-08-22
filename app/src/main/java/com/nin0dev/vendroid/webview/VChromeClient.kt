@@ -121,7 +121,11 @@ class VChromeClient(activity: MainActivity) : WebChromeClient() {
             callback.onCustomViewHidden()
             return
         }
-        val activity = activityRef.get() ?: return
+        val activity = activityRef.get() ?: run {
+            // Reject the request so the WebView doesn't leave it pending.
+            callback.onCustomViewHidden()
+            return
+        }
         ensureViewsInitialized(activity)
         customView = view
         customViewCallback = callback

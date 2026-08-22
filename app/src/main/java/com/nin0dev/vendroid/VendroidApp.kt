@@ -91,37 +91,27 @@ class VendroidApp : Application() {
                     VDELog.i("VDE", "VencordMobile runtime preloaded")
                     // 2. Vencord runtime (potentially ~1 MB from disk)
                     val vendroidFile = File(filesDir, "vencord.js")
-                    // Drop a stale bundle (clientMod switch or app version bump)
-                    // before the read so fetchVencord can replace it.
                     val sPrefs = getSharedPreferences("settings", Context.MODE_PRIVATE)
-                    val needsRedownload = sPrefs.getInt(
-                        "lastMajorUpdateThatUserHasUpdatedVencord", 0
-                    ) < com.nin0dev.vendroid.BuildConfig.VERSION_CODE
-                    if (needsRedownload) {
-                        vendroidFile.delete()
-                        HttpClient.vencordBundlePatched = false
-                        sPrefs.edit()
-                            .remove("vencordEtag")
-                            .remove(HttpClient.PREF_BUNDLE_PATCHED)
-                            .apply()
-                    }
-                    if (vendroidFile.exists() && HttpClient.VencordRuntime == null) {
+                    // Skip the preload while a redownload is pending so the
+                    // stale bundle is never published. The file is kept on disk
+                    // as fetchVencord's offline fallback; deleting it here would
+                    // brick Vencord on an offline launch.
+                    val needsRedownload = HttpClient.needsBundleRedownload(sPrefs)
+                    if (!needsRedownload && vendroidFile.exists() && HttpClient.VencordRuntime == null) {
                         try {
                             // The file was written with applyPatches already
                             // applied during a previous download. Skip the
                             // redundant ~1MB regex scan by trusting the
-                            // persisted patched flag.
+                            // persisted patched flag + patch-set key.
                             HttpClient.setVencordRuntime(
                                 HttpClient.readBundleFromDisk(sPrefs, vendroidFile)
                             )
                             VDELog.i("VDE", "Vencord runtime preloaded (${vendroidFile.length()} bytes)")
                         } catch (ex: Exception) {
-                            VDELog.e("VDE", "Failed to apply Vencord patches", ex)
                             VDELog.e("VDE", "Failed to apply Vencord patches: ${ex.message}", ex)
                         }
                     }
                 } catch (ex: Exception) {
-                    VDELog.e("VDE", "Vencord preload failed", ex)
                     VDELog.e("VDE", "Vencord preload failed: ${ex.message}", ex)
                 }
             }.start()

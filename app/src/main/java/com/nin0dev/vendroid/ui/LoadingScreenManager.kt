@@ -63,6 +63,20 @@ class LoadingScreenManager(
         runnable.run()
     }
 
+    /** Stops the animation loop to avoid background CPU churn. */
+    fun pause() {
+        if (dismissed) return
+        animRunnable?.let { handler.removeCallbacks(it) }
+    }
+
+    /** Resumes the animation loop after [pause]. */
+    fun resume() {
+        if (dismissed) return
+        // Remove before posting so a resume without a prior pause (e.g. the
+        // initial onResume) doesn't start a second concurrent loop.
+        animRunnable?.let { handler.removeCallbacks(it); handler.post(it) }
+    }
+
     fun scheduleTimeout(delayMs: Long) {
         timeoutRunnable = Runnable {
             if (!dismissed) dismiss()

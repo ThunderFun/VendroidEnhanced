@@ -140,6 +140,8 @@ import kotlin.concurrent.withLock
             metaTmp.writeText(sb.toString())
             if (!metaTmp.renameTo(meta)) {
                 metaTmp.delete()
+                // Clean up the now-orphaned body file; no meta references it.
+                bodyFile.delete()
                 return false
             }
 

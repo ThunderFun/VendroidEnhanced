@@ -22,28 +22,35 @@ class RecoveryActivity : AppCompatActivity() {
 
         findViewById<MaterialCardView>(R.id.start_normally).setOnClickListener {
             it.isClickable = false
+            // Kill before commit (see killWebProcess), then clear a stale
+            // safeMode flag so "Start normally" boots normally.
+            killWebProcess()
+            val sPrefs = getSharedPreferences("settings", Context.MODE_PRIVATE)
+            sPrefs.edit().putBoolean("safeMode", false).commit()
             startActivity(Intent(this, MainActivity::class.java))
             finish()
         }
         findViewById<MaterialCardView>(R.id.safe_mode).setOnClickListener {
             it.isClickable = false
-            val sPrefs = getSharedPreferences("settings", Context.MODE_PRIVATE)
-            // commit() (synchronous) so the flag is on disk before the :web
-            // process is killed and restarted to read it.
-            sPrefs.edit().putBoolean("safeMode", true).commit()
+            // Kill before commit (see killWebProcess).
             killWebProcess()
+            val sPrefs = getSharedPreferences("settings", Context.MODE_PRIVATE)
+            sPrefs.edit().putBoolean("safeMode", true).commit()
             startActivity(Intent(this, MainActivity::class.java))
             finish()
         }
         findViewById<MaterialCardView>(R.id.force_update).setOnClickListener {
             it.isClickable = false
+            // Kill before commit (see killWebProcess).
+            killWebProcess()
             val sPrefs = getSharedPreferences("settings", Context.MODE_PRIVATE)
             sPrefs.edit().putInt("lastMajorUpdateThatUserHasUpdatedVencord", 0).commit()
-            killWebProcess()
             startActivity(Intent(this, MainActivity::class.java))
             finish()
         }
         findViewById<MaterialCardView>(R.id.view_logs).setOnClickListener {
+            it.isClickable = false
+            val logCard = it
             val logFile = File(filesDir, "vde_logs.txt")
             val prevLogFile = File(filesDir, "vde_logs.prev.txt")
             // Read the logs off the main thread to avoid jank/ANR on large
@@ -69,13 +76,15 @@ class RecoveryActivity : AppCompatActivity() {
                 } catch (_: Exception) {
                     "Failed to read logs."
                 }
-                withContext(Dispatchers.Main) { showLogDialog(text) }
+                withContext(Dispatchers.Main) {
+                    showLogDialog(text).setOnDismissListener { logCard.isClickable = true }
+                }
             }
         }
 
     }
 
-    private fun showLogDialog(text: String) {
+    private fun showLogDialog(text: String): androidx.appcompat.app.AlertDialog {
         val scrollView = android.widget.ScrollView(this).apply {
             setPadding(48, 32, 48, 32)
         }
@@ -86,7 +95,7 @@ class RecoveryActivity : AppCompatActivity() {
             textSize = 12f
         }
         scrollView.addView(textView)
-        androidx.appcompat.app.AlertDialog.Builder(this)
+        return androidx.appcompat.app.AlertDialog.Builder(this)
             .setTitle("VendroidEnhanced Logs")
             .setView(scrollView)
             .setPositiveButton("Close", null)
@@ -109,6 +118,12 @@ class RecoveryActivity : AppCompatActivity() {
      * the settings prefs from disk. Without this, a warm :web process keeps
      * its stale in-memory SharedPreferences and never honors recovery changes
      * (the singleTask activity also gets onNewIntent, not onCreate).
+     *
+     * Callers must invoke this BEFORE committing any pref write. A queued
+     * apply() flush from :web rewrites the full XML from its stale in-memory
+     * map and would clobber a preceding commit; killing first closes that
+     * race, and commit() being synchronous makes the write durable before
+     * MainActivity restarts.
      */
     private fun killWebProcess() {
         try {

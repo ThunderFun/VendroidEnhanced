@@ -52,12 +52,20 @@ object HttpClient {
         private set
 
     /**
-     * True when the on-disk `vencord.js` is known to contain the patched
-     * content (i.e. [applyPatches] already ran at download time). Checked by
-     * the load paths to skip a redundant ~1MB regex scan on every cold start.
+     * True once a bundle fetch or revalidation has completed in this process
+     * (via [fetchVencord] or the JS-bridge update path). The warm-navigation
+     * fast path keys on this rather than `VencordRuntime != null`, which the
+     * disk preloads also set and which says nothing about freshness.
      */
     @Volatile
-    var vencordBundlePatched = false
+    private var bundleCheckedThisSession = false
+
+    /**
+     * Serializes bundle file and prefs writes between the startup path and
+     * the JS-bridge update path, so the file, ETag, and patch flags always
+     * describe the same download.
+     */
+    private val bundleWriteLock = Any()
 
     @JvmStatic
     fun setVencordRuntime(value: String?) { VencordRuntime = value }
@@ -87,11 +95,79 @@ object HttpClient {
     /** SharedPreferences key recording that the on-disk bundle is already patched. */
     const val PREF_BUNDLE_PATCHED = "vencordBundlePatched"
 
+    /** SharedPreferences key recording which patch set the on-disk bundle carries. */
+    const val PREF_BUNDLE_PATCH_SET = "vencordBundlePatchSet"
+
+    /** SharedPreferences key of the stored bundle ETag. */
+    const val PREF_ETAG = "vencordEtag"
+
+    /** SharedPreferences key of the bundle URL the stored ETag belongs to. */
+    const val PREF_ETAG_LOCATION = "vencordEtagLocation"
+
+    /** SharedPreferences key of the app version that last fetched the bundle. */
+    const val PREF_LAST_BUNDLE_UPDATE = "lastMajorUpdateThatUserHasUpdatedVencord"
+
+    /**
+     * Identity of the current patch list, persisted alongside
+     * [PREF_BUNDLE_PATCHED]. Derived from the patch definitions so editing
+     * [vencordRuntimePatches] without a versionCode bump still invalidates
+     * the flag and re-patches the on-disk bundle.
+     */
+    private val bundlePatchSetKey: String =
+        vencordRuntimePatches.joinToString("|") { it.pattern.pattern + "->" + it.replacement }
+            .hashCode().toString()
+
+    /** True when the persisted patched flag covers the current patch set. */
+    private fun isPersistedPatchCurrent(sPrefs: SharedPreferences): Boolean =
+        sPrefs.getBoolean(PREF_BUNDLE_PATCHED, false) &&
+            sPrefs.getString(PREF_BUNDLE_PATCH_SET, null) == bundlePatchSetKey
+
+    /** Resolves the effective bundle URL from prefs, honoring clientMod. */
+    fun resolveBundleLocation(sPrefs: SharedPreferences): String {
+        val defaultUrl = if (sPrefs.getString("clientMod", "vencord") == "equicord") {
+            Constants.EQUICORD_BUNDLE_URL
+        } else {
+            Constants.JS_BUNDLE_URL
+        }
+        // Normalize so trivial variants of a known URL (whitespace, trailing
+        // slash) do not count as a custom location.
+        return sPrefs.getString("vencordLocation", null)
+            ?.trim()?.removeSuffix("/")
+            ?.takeIf { it.isNotEmpty() }
+            ?: defaultUrl
+    }
+
+    private fun isCustomBundleLocation(location: String): Boolean =
+        !location.equals(Constants.JS_BUNDLE_URL, ignoreCase = true) &&
+            !location.equals(Constants.EQUICORD_BUNDLE_URL, ignoreCase = true)
+
+    /**
+     * Single definition of "the cached bundle must not be reused as-is": app
+     * version bump, custom bundle URL, or debug build. Fetch, preload, and
+     * activity code all consult this so the paths cannot drift apart.
+     */
+    fun needsBundleRedownload(sPrefs: SharedPreferences): Boolean =
+        sPrefs.getInt(PREF_LAST_BUNDLE_UPDATE, 0) < BuildConfig.VERSION_CODE ||
+            isCustomBundleLocation(resolveBundleLocation(sPrefs)) ||
+            BuildConfig.DEBUG
+
+    /** Invalidates the bundle's freshness bookkeeping while keeping the file
+     *  on disk as the offline fallback. */
+    private fun invalidateBundleCache(sPrefs: SharedPreferences) {
+        sPrefs.edit()
+            .remove(PREF_ETAG)
+            .remove(PREF_ETAG_LOCATION)
+            .remove(PREF_BUNDLE_PATCHED)
+            .remove(PREF_BUNDLE_PATCH_SET)
+            .apply()
+    }
+
     /**
      * Loads the on-disk bundle, applying patches only when the persisted
-     * patched-flag indicates they have not been applied. Reads the flag from
-     * prefs (not the in-memory volatile) so a cold start in a fresh process
-     * skips the ~1MB regex scan on the already-patched file.
+     * patched flag does not cover the current patch set. When the file turns
+     * out to carry every marker already (stale flag, e.g. a forced redownload
+     * that never completed), the flag is re-persisted so later cold starts
+     * skip the ~1MB regex scan.
      */
     @JvmStatic
     fun readBundleFromDisk(
@@ -99,16 +175,24 @@ object HttpClient {
         vendroidFile: File
     ): String {
         val raw = vendroidFile.readText()
-        return if (sPrefs.getBoolean(PREF_BUNDLE_PATCHED, false)) raw
-        else applyPatches(raw)
+        if (isPersistedPatchCurrent(sPrefs)) return raw
+        val patched = applyPatches(raw)
+        // Content that actually got patched here is patched in memory only;
+        // only a full marker set proves the on-disk file is current.
+        if (vencordRuntimePatches.all { raw.contains(it.marker) }) {
+            sPrefs.edit()
+                .putBoolean(PREF_BUNDLE_PATCHED, true)
+                .putString(PREF_BUNDLE_PATCH_SET, bundlePatchSetKey)
+                .apply()
+        }
+        return patched
     }
 
     @JvmStatic
     @Throws(IOException::class)
     fun fetchVencord(activity: Activity) {
         val sPrefs = activity.getSharedPreferences("settings", Context.MODE_PRIVATE)
-        val bundleURLToUse = if(sPrefs.getString("clientMod", "vencord") == "equicord") Constants.EQUICORD_BUNDLE_URL else Constants.JS_BUNDLE_URL
-        val vencordLocation = sPrefs.getString("vencordLocation", bundleURLToUse) ?: bundleURLToUse
+        val vencordLocation = resolveBundleLocation(sPrefs)
         val vencordHost = Uri.parse(vencordLocation).host
         // Log only the host, not the full URL (a custom URL could carry a token
         // in a query string, which would leak into the shareable log).
@@ -127,53 +211,41 @@ object HttpClient {
         if (vendroidFile.exists() && vendroidFile.length() == 0L) {
             VDELog.w("HTTP", "Cached vencord.js is empty, discarding")
             vendroidFile.delete()
-            vencordBundlePatched = false
-            sPrefs.edit()
-                .remove("vencordEtag")
-                .remove(PREF_BUNDLE_PATCHED)
-                .apply()
+            invalidateBundleCache(sPrefs)
         }
 
-        // Forced redownload on app version bump, custom bundle URL, or debug
-        // builds. Runs before any cache short-circuit so a pre-load can't skip
-        // it; deletes the cached file to force a full download below.
-        val needsRedownload = sPrefs.getInt("lastMajorUpdateThatUserHasUpdatedVencord", 0) < BuildConfig.VERSION_CODE
-                || (vencordLocation != Constants.JS_BUNDLE_URL && vencordLocation != Constants.EQUICORD_BUNDLE_URL)
-                || BuildConfig.DEBUG
+        // App version bumps invalidate the cache (patch definitions may have
+        // changed). Custom URLs and debug builds keep the ETag so an unchanged
+        // bundle costs a 304, not ~1MB. The cached file stays on disk as the
+        // offline fallback; downloadStoreAndSync overwrites it atomically.
+        val versionBump = sPrefs.getInt(PREF_LAST_BUNDLE_UPDATE, 0) < BuildConfig.VERSION_CODE
+        val customUrl = isCustomBundleLocation(vencordLocation)
+        val needsRedownload = versionBump || customUrl || BuildConfig.DEBUG
 
         if (needsRedownload) {
-            val versionBump = sPrefs.getInt("lastMajorUpdateThatUserHasUpdatedVencord", 0) < BuildConfig.VERSION_CODE
-            val customUrl = vencordLocation != Constants.JS_BUNDLE_URL && vencordLocation != Constants.EQUICORD_BUNDLE_URL
-            // Original behavior: toast when a custom URL is set (any build) or
-            // on DEBUG builds; a pure release version-bump showed no toast.
-            // Preserve that while fixing the double-toast the two independent
-            // `if` branches produced on a fresh DEBUG install.
             if (customUrl || BuildConfig.DEBUG) {
-                val msg = when {
-                    customUrl -> "Debugging app or Vencord, bundle will be redownloaded. Avoid using on limited networks"
-                    versionBump -> "Just updated app version, redownloading Vencord"
-                    else -> "Debugging app, bundle will be redownloaded. Avoid using on limited networks"
+                val msg = if (customUrl) {
+                    "Debugging app or Vencord, bundle will be revalidated. Avoid using on limited networks"
+                } else {
+                    "Debugging app, bundle will be revalidated. Avoid using on limited networks"
                 }
                 activity.runOnUiThread { Toast.makeText(activity, msg, Toast.LENGTH_LONG).show() }
             }
-            vendroidFile.delete()
-            vencordBundlePatched = false
-            sPrefs.edit()
-                .remove("vencordEtag")
-                .remove(PREF_BUNDLE_PATCHED)
-                .apply()
+            if (versionBump) invalidateBundleCache(sPrefs)
         }
 
-        // Warm-navigation fast path: skip the network round-trip when the
-        // bundle is already in memory and no forced redownload is pending. The
-        // on-disk file alone is not sufficient — it may be stale, so the
-        // ETag-conditional GET below handles that case (304 when current).
-        if (VencordRuntime != null && !needsRedownload) {
-            VDELog.d("HTTP", "Bundle already in memory and cache valid, skipping fetch")
+        // Warm-navigation fast path: skip the network round-trip only when a
+        // fetch or revalidation already completed in this session. A runtime
+        // preloaded from disk is not a freshness proof.
+        if (VencordRuntime != null && !needsRedownload && bundleCheckedThisSession) {
+            VDELog.d("HTTP", "Bundle already verified this session, skipping fetch")
             return
         }
 
-        val storedEtag = sPrefs.getString("vencordEtag", null)
+        // Ignore a stored ETag from a different bundle URL: after a location
+        // change it would produce spurious 304s against the new endpoint.
+        val storedEtag = sPrefs.getString(PREF_ETAG, null)
+            ?.takeIf { sPrefs.getString(PREF_ETAG_LOCATION, null) == vencordLocation }
         var resp: Response? = null
         try {
             // ETag-conditional GET: 304 keeps the cache (cheap), 200 swaps in
@@ -188,10 +260,11 @@ object HttpClient {
                     if (VencordRuntime == null) {
                         VencordRuntime = readBundleFromDisk(sPrefs, vendroidFile)
                     }
+                    bundleCheckedThisSession = true
                 }
 
                 responseCode == HttpURLConnection.HTTP_NOT_MODIFIED -> {
-                    // 304 with no local file — re-request unconditionally,
+                    // 304 with no local file; re-request unconditionally,
                     // following one validated redirect like the primary path.
                     resp?.close()
                     resp = executeVencordGetResolvingRedirect(vencordLocation, null)
@@ -199,11 +272,11 @@ object HttpClient {
                     if (responseCode !in 200..299) {
                         throw IOException("HTTP $responseCode fetching Vencord bundle from $vencordLocation")
                     }
-                    downloadAndStore(resp, vendroidFile, sPrefs)
+                    downloadStoreAndSync(resp, vendroidFile, sPrefs, publishToRuntime = true, bundleLocation = vencordLocation)
                 }
 
                 responseCode in 200..299 -> {
-                    downloadAndStore(resp, vendroidFile, sPrefs)
+                    downloadStoreAndSync(resp, vendroidFile, sPrefs, publishToRuntime = true, bundleLocation = vencordLocation)
                 }
 
                 else -> {
@@ -212,6 +285,7 @@ object HttpClient {
                     if (vendroidFile.exists() && VencordRuntime == null) {
                         VDELog.w("HTTP", "HTTP $responseCode; falling back to cached bundle")
                         VencordRuntime = readBundleFromDisk(sPrefs, vendroidFile)
+                        bundleCheckedThisSession = true
                     } else {
                         throw IOException("HTTP $responseCode fetching Vencord bundle from $vencordLocation")
                     }
@@ -223,6 +297,7 @@ object HttpClient {
             if (vendroidFile.exists() && VencordRuntime == null) {
                 VDELog.w("HTTP", "Network error during version check; using cached bundle: ${io.message}")
                 VencordRuntime = readBundleFromDisk(sPrefs, vendroidFile)
+                bundleCheckedThisSession = true
             } else {
                 throw io
             }
@@ -247,14 +322,14 @@ object HttpClient {
     }
 
     /**
-     * Executes a conditional GET for the Vencord bundle, resolving a single
-     * redirect hop against the HTTPS + host allowlist. Redirects are never
-     * auto-followed by the client config, so the hop is validated here to keep
-     * the allowlist a hard gate. Used by both the primary path and the
-     * 304-with-no-local-file re-request so their redirect handling stays in
-     * sync.
+     * Executes a conditional GET, resolving one redirect hop against the HTTPS
+     * + host allowlist (redirects are never auto-followed by the client).
+     *
+     * Precondition: the caller validated the initial [url]; only redirect
+     * targets are validated here.
      */
-    private fun executeVencordGetResolvingRedirect(url: String, etag: String?): Response {
+    @Throws(IOException::class)
+    fun executeVencordGetResolvingRedirect(url: String, etag: String?): Response {
         val resp = executeVencordGet(url, etag)
         if (resp.code !in 300..399) return resp
         val location = resp.header("Location")
@@ -277,57 +352,88 @@ object HttpClient {
     }
 
     /**
-     * Downloads, patches, and atomically writes the Vencord bundle, and
-     * updates the [VencordRuntime] / [vencordBundlePatched] / `vencordEtag` /
-     * `lastMajorUpdateThatUserHasUpdatedVencord` bookkeeping.
+     * Single writer for the Vencord bundle: sanity-checks and patches the
+     * response body, atomically installs it, and syncs the ETag / patch flag /
+     * patch-set / last-update bookkeeping under the bundle write lock. Shared
+     * by the startup path and the JS-bridge update path so their post-write
+     * state cannot drift apart.
      *
-     * Shared by the startup path so the post-write state stays consistent and
-     * the next launch doesn't re-download a fresh bundle. Caller must have
-     * validated HTTPS + host whitelist.
+     * Caller must have validated HTTPS + host allowlist and owns closing
+     * [resp].
+     *
+     * @param publishToRuntime when true, the in-memory runtime is replaced
+     *   immediately (startup path). The JS-bridge update path passes false so
+     *   the running bundle stays until the user restarts.
      */
     @Throws(IOException::class)
-    private fun downloadAndStore(
+    fun downloadStoreAndSync(
         resp: Response,
         vendroidFile: File,
-        sPrefs: SharedPreferences
+        sPrefs: SharedPreferences,
+        publishToRuntime: Boolean,
+        bundleLocation: String
     ) {
+        if (resp.code !in 200..299) {
+            throw IOException("HTTP ${resp.code} while storing Vencord bundle")
+        }
         // Clamp the declared Content-Length before toInt(): a malicious host
         // could send a huge Long that wraps to a large positive Int, causing an
         // eager oversized pre-allocation in ByteArrayOutputStream before any
         // byte is read. Clamping to the read cap bounds that pre-allocation.
         val initialSize = resp.body.contentLength().coerceIn(8192L, MAX_READ_BYTES.toLong()).toInt()
         val content = readAsText(resp.body.byteStream(), initialSize)
+        if (!looksLikeBundle(content)) {
+            // Refuse to install: the cached bundle stays intact and the
+            // caller's fallback logic handles the failure.
+            throw IOException("Refusing to store bundle failing sanity check (${content.length} chars)")
+        }
         VDELog.i("HTTP", "Bundle downloaded (${content.length} chars), applying patches...")
         val patched = applyPatches(content)
-        // Unique temp name: VencordNative.updateVencord writes the same bundle
-        // on a different executor, and a shared "vencord.js.tmp" let one
-        // writer's rename install the other's truncated file.
-        val tmpFile = File(vendroidFile.parent, "${vendroidFile.name}.${System.nanoTime()}.tmp")
-        try {
-            tmpFile.writeText(patched)
-            if (!tmpFile.renameTo(vendroidFile)) {
-                throw IOException("Failed to rename ${tmpFile.name} to ${vendroidFile.name}")
+        synchronized(bundleWriteLock) {
+            // Unique temp name: startup and the JS-bridge update path write the
+            // same bundle on different executors, and a shared "vencord.js.tmp"
+            // let one writer's rename install the other's truncated file.
+            val tmpFile = File(vendroidFile.parent, "${vendroidFile.name}.${System.nanoTime()}.tmp")
+            try {
+                tmpFile.writeText(patched)
+                if (!tmpFile.renameTo(vendroidFile)) {
+                    throw IOException("Failed to rename ${tmpFile.name} to ${vendroidFile.name}")
+                }
+            } finally {
+                // No-op after a successful rename; removes a partial temp file
+                // on failure (unique names would otherwise leak files).
+                tmpFile.delete()
             }
-        } finally {
-            // No-op after a successful rename; removes a partial temp file on
-            // failure (unique names would otherwise leak files on write
-            // errors).
-            tmpFile.delete()
+            val e = sPrefs.edit()
+            val responseEtag = resp.header("ETag")
+            if (responseEtag != null) {
+                e.putString(PREF_ETAG, responseEtag)
+                e.putString(PREF_ETAG_LOCATION, bundleLocation)
+            } else {
+                // A server that stops sending ETags must not leave a stale one
+                // behind.
+                e.remove(PREF_ETAG)
+                e.remove(PREF_ETAG_LOCATION)
+            }
+            e.putInt(PREF_LAST_BUNDLE_UPDATE, BuildConfig.VERSION_CODE)
+            // Persist the patch state so a later cold start skips the ~1MB
+            // regex scan instead of re-running applyPatches.
+            e.putBoolean(PREF_BUNDLE_PATCHED, true)
+            e.putString(PREF_BUNDLE_PATCH_SET, bundlePatchSetKey)
+            e.apply()
+            if (publishToRuntime) VencordRuntime = patched
+            bundleCheckedThisSession = true
+            VDELog.i("HTTP", "Bundle patched and saved to disk")
         }
-        val responseEtag = resp.header("ETag")
-        val e = sPrefs.edit()
-        if (responseEtag != null) {
-            e.putString("vencordEtag", responseEtag)
-        }
-        e.putInt("lastMajorUpdateThatUserHasUpdatedVencord", BuildConfig.VERSION_CODE)
-        // Persist the patched flag so a later cold start skips the ~1MB regex
-        // scan instead of re-running applyPatches on the already-patched file.
-        e.putBoolean(PREF_BUNDLE_PATCHED, true)
-        e.apply()
-        VencordRuntime = patched
-        vencordBundlePatched = true
-        VDELog.i("HTTP", "Bundle patched and saved to disk")
     }
+
+    /**
+     * Cheap shape check to avoid installing a captive-portal page or an HTML
+     * error page over a known-good cached bundle. Real bundles are ~1MB of
+     * JavaScript; HTML starts with '<'.
+     */
+    private fun looksLikeBundle(content: String): Boolean =
+        content.length >= 64 * 1024 && !content.trimStart().startsWith("<")
 
     @JvmStatic
     fun applyPatches(content: String): String {
@@ -342,7 +448,17 @@ object HttpClient {
             // Skip already-patched content so a re-apply (e.g. the persisted
             // flag was cleared) never double-suffixes the replacement.
             if (result.contains(patch.marker)) continue
-            result = patch.pattern.replace(result, patch.replacement)
+            var matchCount = 0
+            // Lambda replacement: the returned string is inserted literally,
+            // so '$' or '\' in a replacement (common in minified JS) is never
+            // interpreted as a group reference.
+            result = patch.pattern.replace(result) {
+                matchCount++
+                patch.replacement
+            }
+            if (matchCount == 0) {
+                VDELog.w("HTTP", "Patch matched nothing; upstream bundle may have changed: ${patch.marker}")
+            }
         }
         return result
     }

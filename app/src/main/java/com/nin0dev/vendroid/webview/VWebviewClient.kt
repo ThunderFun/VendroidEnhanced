@@ -113,7 +113,7 @@ class VWebviewClient(
         urlString: String,
         isDiscordMainFrame: Boolean
     ): String? {
-        val headIdx = text.indexOf("</head>", ignoreCase = true)
+        val headIdx = findHeadCloseIndex(text)
         if (headIdx < 0) return null
         val runtime = HttpClient.VencordRuntime
         val mobileRuntime = HttpClient.VencordMobileRuntime
@@ -183,6 +183,34 @@ class VWebviewClient(
     /** True when both Vencord runtimes are in memory. Shared by the network path,
      *  the disk-serve path, and [onPageStarted] so they agree on readiness. */    private fun isMainFrameRuntimeReady(): Boolean =
         HttpClient.VencordRuntime != null && HttpClient.VencordMobileRuntime != null
+
+    /**
+     * Finds the real closing `</head>`, skipping matches inside raw-text
+     * elements (script, style, textarea, title) or HTML comments, where the
+     * literal text may legally appear. Returns -1 when none is found, in
+     * which case callers degrade to bridge injection in onPageStarted.
+     */
+    private fun findHeadCloseIndex(text: String): Int {
+        val rawTextOpeners = arrayOf("<script", "<style", "<textarea", "<title")
+        val rawTextClosers = arrayOf("</script", "</style", "</textarea", "</title")
+        var from = 0
+        while (true) {
+            val headIdx = text.indexOf("</head>", from, ignoreCase = true)
+            if (headIdx < 0) return -1
+            var hidden = false
+            for (i in rawTextOpeners.indices) {
+                val open = text.lastIndexOf(rawTextOpeners[i], headIdx, ignoreCase = true)
+                if (open < 0) continue
+                val close = text.lastIndexOf(rawTextClosers[i], headIdx, ignoreCase = true)
+                if (close < open) { hidden = true; break }
+            }
+            val commentOpen = text.lastIndexOf("<!--", headIdx)
+            val commentClose = text.lastIndexOf("-->", headIdx)
+            if (commentOpen > commentClose) hidden = true
+            if (!hidden) return headIdx
+            from = headIdx + 1
+        }
+    }
 
     override fun onPageStarted(view: WebView, url: String, favicon: Bitmap?) {
         val activity = activityRef.get()
@@ -468,7 +496,7 @@ class VWebviewClient(
             if (!Constants.isNavigationAllowedDomain(resolvedHost)) return null
             // Mirror NavigationPolicy: Discord /blog pages route to the popup.
             val path = resolved.encodedPath ?: ""
-            if (path.startsWith("/blog")) return null
+            if (path == "/blog" || path.startsWith("/blog/")) return null
         } else {
             if (shouldBlockUri(resolved.scheme, resolvedHost, resolved.encodedPath)) return null
         }

@@ -481,10 +481,7 @@ class VencordNative(private val activity: WeakReference<MainActivity>, wv: WebVi
         // Resolve and validate the bundle location before scheduling any
         // network work, so a misconfigured vencordLocation fails fast.
         val sPrefs = settingsPrefs ?: return
-        val defaultUrl = if (
-            sPrefs.getString("clientMod", "vencord") == "equicord"
-        ) Constants.EQUICORD_BUNDLE_URL else Constants.JS_BUNDLE_URL
-        val vencordLocation = sPrefs.getString("vencordLocation", defaultUrl) ?: defaultUrl
+        val vencordLocation = HttpClient.resolveBundleLocation(sPrefs)
         // Enforce HTTPS here (as fetchVencord does) so a clear-text bundle
         // download cannot be MITM-ed regardless of HttpClient.fetch's check.
         if (!vencordLocation.startsWith("https://")) {
@@ -498,44 +495,28 @@ class VencordNative(private val activity: WeakReference<MainActivity>, wv: WebVi
         }
         safeExecute {
             var resp: Response? = null
-            var vendroidTmpFile: File? = null
             try {
                 val act = activity.get() ?: return@safeExecute
                 val vendroidFile = File(act.filesDir, "vencord.js")
-                // Unique temp name: the startup path
-                // (HttpClient.downloadAndStore) writes the same bundle on a
-                // different executor, and a shared "vencord.js.tmp" let one
-                // writer's rename install the other's truncated file.
-                vendroidTmpFile = File(act.filesDir, "vencord.js.${System.nanoTime()}.tmp")
-                resp = HttpClient.fetch(vencordLocation)
-                val content = HttpClient.readAsText(resp.body.byteStream())
-                val patched = HttpClient.applyPatches(content)
-                vendroidTmpFile.writeText(patched)
-                if (!vendroidTmpFile.renameTo(vendroidFile)) {
-                    vendroidTmpFile.delete()
-                    throw IOException("Failed to rename ${vendroidTmpFile.name} to ${vendroidFile.name}")
+                resp = HttpClient.executeVencordGetResolvingRedirect(vencordLocation, null)
+                if (resp.code !in 200..299) {
+                    throw IOException("HTTP ${resp.code} updating Vencord bundle")
                 }
-                // Sync ETag/patched-flag with the startup path so the next
-                // launch's conditional GET returns 304. VencordRuntime is left
-                // untouched; the user is prompted to restart.
-                val responseEtag = resp.header("ETag")
-                val editor = sPrefs.edit()
-                if (responseEtag != null) {
-                    editor.putString("vencordEtag", responseEtag)
-                }
-                editor.putInt("lastMajorUpdateThatUserHasUpdatedVencord", com.nin0dev.vendroid.BuildConfig.VERSION_CODE)
-                // Persist the patched flag so the next cold start skips the
-                // redundant ~1MB regex scan (matches downloadAndStore).
-                editor.putBoolean(HttpClient.PREF_BUNDLE_PATCHED, true)
-                editor.apply()
-                HttpClient.vencordBundlePatched = true
+                // The shared writer handles sanity checks, patching, the
+                // atomic install, and the ETag / patch bookkeeping.
+                // VencordRuntime intentionally stays stale; the new bundle
+                // applies on restart.
+                HttpClient.downloadStoreAndSync(
+                    resp, vendroidFile, sPrefs,
+                    publishToRuntime = false,
+                    bundleLocation = vencordLocation
+                )
                 act.runOnUiThread {
                     act.showDiscordToast("Updated Vencord, restart to apply changes!", "SUCCESS")
                 }
             } catch (ex: Exception) {
                 activity.get()?.let { VDELog.e("VN", "Failed to update Vencord", ex) }
             } finally {
-                vendroidTmpFile?.delete()
                 // Close to return the pooled connection (not disconnect()).
                 resp?.close()
             }
@@ -645,10 +626,11 @@ class VencordNative(private val activity: WeakReference<MainActivity>, wv: WebVi
                 // (from preload) and new (from fetchVencord) runtimes.
                 prefs.edit {
                     putInt("lastMajorUpdateThatUserHasUpdatedVencord", 0)
-                    remove("vencordEtag")
+                    remove(HttpClient.PREF_ETAG)
+                    remove(HttpClient.PREF_ETAG_LOCATION)
                     remove(HttpClient.PREF_BUNDLE_PATCHED)
+                    remove(HttpClient.PREF_BUNDLE_PATCH_SET)
                     activity.get()?.filesDir?.let { File(it, "vencord.js").delete() }
-                    HttpClient.vencordBundlePatched = false
                     HttpClient.setVencordRuntime(null)
                 }
             }

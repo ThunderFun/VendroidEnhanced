@@ -340,12 +340,11 @@ class MainActivity : AppCompatActivity() {
             }
             val vendroidFile = File(filesDir, "vencord.js")
             val fileContent: String? = if (HttpClient.VencordRuntime == null) {
-                val needsRedownload = sPrefs.getInt("lastMajorUpdateThatUserHasUpdatedVencord", 0) < BuildConfig.VERSION_CODE
-                if (needsRedownload) {
-                    vendroidFile.delete()
-                    sPrefs.edit().remove(HttpClient.PREF_BUNDLE_PATCHED).apply()
-                    null
-                } else if (vendroidFile.exists()) {
+                // Skip the cached file while a redownload is pending so the
+                // stale bundle is never published; fetchVencord installs a
+                // fresh one or loads this file from its own offline fallback.
+                // Freshness bookkeeping lives in HttpClient alone.
+                if (!HttpClient.needsBundleRedownload(sPrefs) && vendroidFile.exists()) {
                     try { HttpClient.readBundleFromDisk(sPrefs, vendroidFile) }
                     catch (e: Exception) { VDELog.e("Main", "Failed to read vendroidFile", e); null }
                 } else null
@@ -410,6 +409,7 @@ class MainActivity : AppCompatActivity() {
             }
             // Non-Discord deep link (or no data): load the default app shell.
             wv!!.loadUrl("https://discord.com/app")
+            currentHostForBridge = "discord.com"
             return "https://discord.com/app"
         }
         val lastUrl = sPrefs.getString("lastUrl", null)
@@ -424,9 +424,11 @@ class MainActivity : AppCompatActivity() {
             // Stale non-app URL (e.g. /blog/...): fall back to /app rather
             // than reloading a page with no back history.
             wv!!.loadUrl("https://discord.com/app")
+            currentHostForBridge = "discord.com"
             return "https://discord.com/app"
         }
         wv!!.loadUrl("https://discord.com/app")
+        currentHostForBridge = "discord.com"
         return "https://discord.com/app"
     }
 
@@ -442,10 +444,21 @@ class MainActivity : AppCompatActivity() {
                 // overwritten by the initial-URL load.
                 pendingDeepLink = url.toString()
             } else if (HttpClient.VencordMobileRuntime == null) {
-                // Runtime not injected into this page yet; transitionTo would
-                // no-op against a page without Vencord. Defer until the
-                // runtimes are injected (see injectVencordIfReady).
-                pendingDeepLink = url.toString()
+                if (getSharedPreferences("settings", Context.MODE_PRIVATE)
+                        .getBoolean("safeMode", false)) {
+                    // Safe mode never loads runtimes, so a deferred link would
+                    // never be consumed. Load it directly via NavigationPolicy.
+                    VDELog.w("Main", "Safe mode active; loading deep link directly: $url")
+                    if (com.nin0dev.vendroid.webview.NavigationPolicy.decide(url, true)
+                        == com.nin0dev.vendroid.webview.NavigationPolicy.Action.LOAD_IN_WEBVIEW) {
+                        wv?.loadUrl(url.toString())
+                    }
+                } else {
+                    // Runtime not injected into this page yet; transitionTo would
+                    // no-op against a page without Vencord. Defer until the
+                    // runtimes are injected (see injectVencordIfReady).
+                    pendingDeepLink = url.toString()
+                }
             } else {
                 // Guarded so a page without Vencord (safe mode / failed load)
                 // fails silently instead of throwing a ReferenceError.
@@ -492,6 +505,8 @@ class MainActivity : AppCompatActivity() {
         }
         wv?.onPause()
         wv?.pauseTimers()
+        // Stop the loading animation loop while backgrounded.
+        if (::loadingScreenManager.isInitialized) loadingScreenManager.pause()
         // When backgrounded, spoof document.hidden and pause CSS animations so
         // Discord's React app throttles and the compositor stops wasted GPU
         // work. With pauseTimers() this removes most background CPU/GPU churn.
@@ -514,6 +529,8 @@ class MainActivity : AppCompatActivity() {
         )
         wv?.onResume()
         wv?.resumeTimers()
+        // Resume the loading animation loop if still showing.
+        if (::loadingScreenManager.isInitialized) loadingScreenManager.resume()
     }
 
     override fun onDestroy() {
@@ -543,32 +560,76 @@ class MainActivity : AppCompatActivity() {
             runtime = HttpClient.VencordRuntime
             mobileRuntime = HttpClient.VencordMobileRuntime
         }
-        VDELog.i("Main", "Injecting Vencord runtime (${runtime?.length ?: 0} chars, mobile=${mobileRuntime?.length ?: 0} chars)")
-        if (wv != null && runtime != null && mobileRuntime != null) {
-            if (missedInjection) {
-                missedInjection = false
-                VDELog.w("Main", "Missed injection, scheduling reload")
-                val url = currentUrlForBridge
-                if (url != null && Constants.isDiscordAppOrigin(Uri.parse(url).host ?: "")) {
-                    wv?.reload()
-                    return
+        if (wv == null || runtime == null || mobileRuntime == null) return
+        // Only inject on Discord pages; the runtimes are designed for Discord
+        // and must not run on whitelisted non-Discord pages.
+        val url = currentUrlForBridge ?: return
+        if (!Constants.isDiscordAppOrigin(Uri.parse(url).host ?: "")) return
+        injectVencordAttempt(runtime, mobileRuntime, 0)
+    }
+
+    /**
+     * Injects whichever runtime parts the current document is missing. The
+     * decision waits for parsing to finish (readyState past "loading"): before
+     * that, an embedded <script> block may not have executed yet and typeof
+     * checks would report a false "absent", causing a double injection. A
+     * document already running Vencord is never re-evaluated; a bundle
+     * downloaded mid-session applies on the next navigation instead.
+     */
+    private fun injectVencordAttempt(runtime: String, mobileRuntime: String, attempt: Int) {
+        val w = wv ?: return
+        w.evaluateJavascript(
+            "(document.readyState==='loading'?'L'" +
+            ":(typeof Vencord!=='undefined'" +
+                "?(typeof VencordMobile!=='undefined'?'B':'V')" +
+                ":'N'))"
+        ) { raw ->
+            when (raw?.trim('"')) {
+                "L" -> {
+                    // Parser still running; retry briefly, then give up on this
+                    // document (the next navigation restarts the flow).
+                    if (attempt < INJECT_POLL_MAX_ATTEMPTS) {
+                        w.postDelayed({ injectVencordAttempt(runtime, mobileRuntime, attempt + 1) }, 100)
+                    }
+                }
+                "B" -> routePendingDeepLink()
+                "V" -> {
+                    // Main runtime present but the mobile runtime missing (the
+                    // embed's shared script tag aborted partway). Inject only
+                    // the missing part.
+                    try { w.evaluateJavascript(mobileRuntime + ";", null) }
+                    catch (_: IllegalStateException) {}
+                    routePendingDeepLink()
+                }
+                else -> {
+                    if (missedInjection) {
+                        missedInjection = false
+                        VDELog.w("Main", "Missed injection, scheduling reload")
+                        w.reload()
+                        return@evaluateJavascript
+                    }
+                    VDELog.i("Main", "Injecting Vencord runtime (${runtime.length} chars, mobile=${mobileRuntime.length} chars)")
+                    try {
+                        // Capability-token bootstrap must run first so the token
+                        // is in scope before the runtimes call the bridge. It is
+                        // idempotent if the document already ran it.
+                        w.evaluateJavascript(VencordNative.bridgeBootstrapJs() + ";", null)
+                        w.evaluateJavascript(runtime + ";", null)
+                        w.evaluateJavascript(mobileRuntime + ";", null)
+                    } catch (_: IllegalStateException) {
+                        // WebView destroyed between the checks and these calls.
+                    }
+                    routePendingDeepLink()
                 }
             }
-            // Only inject on Discord pages; the runtimes are designed for
-            // Discord and must not run on whitelisted non-Discord pages.
-            val url = currentUrlForBridge
-            if (url == null || !Constants.isDiscordAppOrigin(Uri.parse(url).host ?: "")) return
-            // Capability-token bootstrap must run first so the token is in
-            // scope (closure-captured, not a window global) before the runtimes
-            // call the bridge.
-            wv?.evaluateJavascript(VencordNative.bridgeBootstrapJs() + ";", null)
-            wv?.evaluateJavascript(runtime + ";", null)
-            wv?.evaluateJavascript(mobileRuntime + ";", null)
-            // Route any deep link that arrived before the runtime was ready.
-            pendingDeepLink?.let { link ->
-                pendingDeepLink = null
-                handleUrl(Uri.parse(link))
-            }
+        }
+    }
+
+    /** Routes a deep link that arrived before the runtime was ready. */
+    private fun routePendingDeepLink() {
+        pendingDeepLink?.let { link ->
+            pendingDeepLink = null
+            handleUrl(Uri.parse(link))
         }
     }
 
@@ -594,5 +655,8 @@ class MainActivity : AppCompatActivity() {
     companion object {
         private val gson = Gson()
         private val vencordRuntimeLock = Any()
+
+        /** Bound on the parse-completion retries in injectVencordAttempt (100ms apart). */
+        private const val INJECT_POLL_MAX_ATTEMPTS = 20
     }
 }

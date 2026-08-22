@@ -244,6 +244,18 @@ import java.net.IDN
         "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~!$&'()*+,;=:/@?#%"
     private val HEX = "0123456789ABCDEF".toCharArray()
 
+    /** Truncates without splitting a %XX escape or a UTF-16 surrogate pair. */
+    private fun safeTruncate(s: String, cap: Int): String {
+        if (s.length <= cap) return s
+        var end = cap
+        // Don't cut through a percent-encoded triplet.
+        if (end >= 2 && s[end - 2] == '%') end -= 2
+        else if (end >= 1 && s[end - 1] == '%') end -= 1
+        // Don't leave a dangling high surrogate.
+        if (end > 0 && Character.isHighSurrogate(s[end - 1])) end -= 1
+        return s.substring(0, end)
+    }
+
     private fun buildEncodedUrl(
         scheme: String?,
         asciiHost: String?,
@@ -263,7 +275,7 @@ import java.net.IDN
             if (rawPath.isNotEmpty()) sb.append(percentEncode(rawPath))
             if (rawQuery != null) sb.append('?').append(percentEncode(rawQuery))
             if (rawFragment != null) sb.append('#').append(percentEncode(rawFragment))
-            return if (sb.length > cap) sb.substring(0, cap) else sb.toString()
+            return safeTruncate(sb.toString(), cap)
         }
         sb.append(scheme).append("://")
         // Prefer the ASCII host; fall back to encoded raw host so the
@@ -274,7 +286,7 @@ import java.net.IDN
         if (rawPath.isNotEmpty()) sb.append(percentEncode(rawPath))
         if (rawQuery != null) sb.append('?').append(percentEncode(rawQuery))
         if (rawFragment != null) sb.append('#').append(percentEncode(rawFragment))
-        return if (sb.length > cap) sb.substring(0, cap) else sb.toString()
+        return safeTruncate(sb.toString(), cap)
     }
 
     private fun buildDisplayString(
@@ -301,7 +313,7 @@ import java.net.IDN
             if (rawQuery != null) sb.append('?').append(decodeForDisplay(rawQuery))
             if (rawFragment != null) sb.append('#').append(decodeForDisplay(rawFragment))
             val full = sb.toString()
-            return if (full.length > cap) full.substring(0, cap) else full
+            return safeTruncate(full, cap)
         }
         sb.append(scheme).append("://")
         // Prefer the ASCII host (homograph defense); fall back to the raw host
@@ -313,7 +325,7 @@ import java.net.IDN
         if (rawQuery != null) { sb.append('?'); sb.append(decodeForDisplay(rawQuery)) }
         if (rawFragment != null) { sb.append('#'); sb.append(decodeForDisplay(rawFragment)) }
         val full = sb.toString()
-        return if (full.length > cap) full.substring(0, cap) else full
+        return safeTruncate(full, cap)
     }
 
     /** Decodes and strips invisible chars; re-encodes the segment if the
