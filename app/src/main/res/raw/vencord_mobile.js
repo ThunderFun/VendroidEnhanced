@@ -1623,7 +1623,7 @@ video {
     const svgPause = '<svg viewBox="0 0 24 24" fill="#fff" stroke="none"><rect x="6" y="4" width="4" height="16"/><rect x="14" y="4" width="4" height="16"/></svg>';
     const svgSpeaker = '<svg viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M11 5L6 9H2v6h4l5 4V5z"/><path d="M19.07 4.93a10 10 0 010 14.14"/><path d="M15.54 8.46a5 5 0 010 7.07"/></svg>';
     const svgMuted = '<svg viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M11 5L6 9H2v6h4l5 4V5z"/><line x1="23" y1="9" x2="17" y2="15"/><line x1="17" y1="9" x2="23" y2="15"/></svg>';
-    const svgClose = '<svg viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>';
+    const svgClose = '<svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>';
     const svgFullscreen = '<svg viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M8 3H5a2 2 0 00-2 2v3m18 0V5a2 2 0 00-2-2h-3m0 18h3a2 2 0 002-2v-3M3 16v3a2 2 0 002 2h3"/></svg>';
 
     function exitVideoFullscreen() {
@@ -1948,7 +1948,9 @@ video {
         closeImageOverlay();
         src = toFullResUrl(src);
         const overlay = document.createElement("div");
-        overlay.style.cssText = "position:fixed;top:0;left:0;width:100vw;height:100vh;background:rgba(0,0,0,0.95);display:flex;align-items:center;justify-content:center;z-index:2147483646;outline:none;overflow:hidden;";
+        // touch-action:none lets the viewer own all gestures; Chromium cannot
+        // claim a drag for native scroll/overscroll.
+        overlay.style.cssText = "position:fixed;top:0;left:0;width:100vw;height:100vh;background:rgba(0,0,0,0.95);display:flex;align-items:center;justify-content:center;z-index:2147483646;outline:none;overflow:hidden;touch-action:none;";
         overlay.setAttribute("tabindex", "-1");
 
         const img = isVideo ? document.createElement("video") : document.createElement("img");
@@ -2018,7 +2020,9 @@ video {
 
         overlay._resetImgTransform = resetImgTransform;
 
-        overlay.addEventListener("touchstart", e => {
+        // These handlers are dispatched from the window-level capture-phase
+        // gesture shield in hookImageClick(), not attached to the element.
+        overlay._onTouchStart = e => {
             if (e.touches.length === 2) {
                 e.preventDefault();
                 const dx = e.touches[0].clientX - e.touches[1].clientX;
@@ -2042,11 +2046,13 @@ video {
                 panStartTy = imgTy;
                 activeTouches = 1;
             }
-        }, { passive: false });
+        };
 
-        overlay.addEventListener("touchmove", e => {
+        overlay._onTouchMove = e => {
+            // Always claim the gesture, not only while zoomed. Unprevented
+            // moves let Chromium and page-level swipe detectors take it.
+            if (e.cancelable) e.preventDefault();
             if (e.touches.length === 2 && activeTouches === 2) {
-                e.preventDefault();
                 const dx = e.touches[0].clientX - e.touches[1].clientX;
                 const dy = e.touches[0].clientY - e.touches[1].clientY;
                 const dist = Math.sqrt(dx * dx + dy * dy);
@@ -2059,16 +2065,15 @@ video {
                 imgTy = curMidY - pinchLayoutTop - (pinchMidY - pinchLayoutTop - pinchStartTy) * scaleDelta;
                 updateImgTransform();
             } else if (e.touches.length === 1 && activeTouches === 1 && imgScale > 1) {
-                e.preventDefault();
                 const dx = e.touches[0].clientX - panStartX;
                 const dy = e.touches[0].clientY - panStartY;
                 imgTx = panStartTx + dx;
                 imgTy = panStartTy + dy;
                 updateImgTransform();
             }
-        }, { passive: false });
+        };
 
-        overlay.addEventListener("touchend", e => {
+        overlay._onTouchEnd = e => {
             if (e.touches.length === 0) {
                 activeTouches = 0;
                 if (imgScale <= 1.02) resetImgTransform();
@@ -2079,12 +2084,15 @@ video {
                 panStartTy = imgTy;
                 activeTouches = 1;
             }
-        });
+        };
 
         const closeBtn = document.createElement("div");
         closeBtn.innerHTML = svgClose;
         closeBtn.setAttribute("tabindex", "-1");
-        closeBtn.style.cssText = "position:absolute;top:16px;right:16px;background:rgba(255,255,255,0.2);border:none;color:#fff;padding:8px;width:40px;height:40px;display:flex;align-items:center;justify-content:center;border-radius:4px;cursor:pointer;z-index:1;";
+        // Bare icon without a painted chip; the viewer backdrop supplies
+        // contrast. Drop shadow keeps the icon legible over bright images;
+        // padding keeps the 48px touch target.
+        closeBtn.style.cssText = "position:absolute;top:16px;right:16px;background:none;border:none;color:#fff;padding:12px;width:24px;height:24px;display:flex;align-items:center;justify-content:center;cursor:pointer;z-index:1;box-sizing:content-box;filter:drop-shadow(0 1px 4px rgba(0,0,0,0.7));-webkit-tap-highlight-color:transparent;";
         closeBtn.addEventListener("click", e => { e.preventDefault(); e.stopPropagation(); closeImageOverlay(); });
 
         overlay.appendChild(img);
@@ -2280,6 +2288,37 @@ video {
     }
 
     function hookImageClick() {
+
+        // Capture-phase shield. While either viewer is open, hide its gestures
+        // from Discord's swipe-back detector. Image-viewer handlers dispatch
+        // from here; the video viewer just blocks propagation. Video controls
+        // are excluded so the seek bar still works. Registered at injection,
+        // before Discord's own listeners attach.
+        function activeOverlayFor(e) {
+            if (imgOverlay && imgOverlay.contains(e.target)) return imgOverlay;
+            if (vfsState && vfsState.overlay && vfsState.overlay.contains(e.target) &&
+                !(vfsState.controls && vfsState.controls.contains(e.target))) return vfsState.overlay;
+            return null;
+        }
+        ["touchstart", "touchmove", "touchend", "touchcancel"].forEach(type =>
+            window.addEventListener(type, e => {
+                const o = activeOverlayFor(e);
+                if (!o) return;
+                if (o === imgOverlay) {
+                    if (type === "touchmove" && o._onTouchMove) o._onTouchMove(e);
+                    else if (type === "touchstart" && o._onTouchStart) o._onTouchStart(e);
+                    else if (o._onTouchEnd) o._onTouchEnd(e);
+                }
+                e.stopImmediatePropagation();
+            }, { capture: true, passive: false }));
+
+        // Same shield for pointer events; neither viewer consumes them.
+        ["pointerdown", "pointermove", "pointerup", "pointercancel"].forEach(type =>
+            window.addEventListener(type, e => {
+                if (!activeOverlayFor(e)) return;
+                e.stopImmediatePropagation();
+            }, { capture: true, passive: false }));
+
 
         function onPointerDown(x, y, target) {
             if (imgOverlay) return;
