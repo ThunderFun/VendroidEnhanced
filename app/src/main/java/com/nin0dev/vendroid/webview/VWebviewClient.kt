@@ -126,7 +126,9 @@ class VWebviewClient(
             sb.append("<script>")
                 .append(escapeScriptTagContent(VencordNative.bridgeBootstrapJs()))
                 .append("</script>")
-                .append("<script>").append(escapedRuntimeOf(runtime!!)).append(';')
+                // Env shim must precede the bundle (see VENCORD_PRELUDE_JS).
+                .append("<script>").append(JsPatches.VENCORD_PRELUDE_JS).append(';')
+                .append(escapedRuntimeOf(runtime!!)).append(';')
                 .append(escapedMobileRuntimeOf(mobileRuntime!!)).append(";</script>")
         }
         sb.append(text, headIdx, text.length)
@@ -220,6 +222,7 @@ class VWebviewClient(
             it.navigationInProgress = true
         }
         VDELog.i("WV", "Page started: ${UrlNormalizer.redactForLog(url)}")
+        VChromeClient.resetPageErrorQuota()
 
         // If shouldInterceptRequest already embedded the firewall (and possibly
         // the runtimes) into this URL's HTML, skip the evaluateJavascript
@@ -257,11 +260,14 @@ class VWebviewClient(
                 // before the runtimes call the bridge.
                 try {
                     view.evaluateJavascript(VencordNative.bridgeBootstrapJs() + ";", null)
-                    view.evaluateJavascript(runtime + ";", null)
+                    view.evaluateJavascript(JsPatches.VENCORD_PRELUDE_JS + ";" + runtime + ";", null)
                     view.evaluateJavascript(mobileRuntime + ";", null)
                 } catch (_: IllegalStateException) {
                     // WebView was destroyed between the liveness check and these calls.
-                }            } else {
+                }
+                VDELog.i("WV", "Runtime injected via bridge for ${UrlNormalizer.redactForLog(url)}")
+                activity.scheduleBootVerify("page-start-eval")
+            } else {
                 activity.missedInjection = true
             }
         }
@@ -280,6 +286,7 @@ class VWebviewClient(
         if (activity != null && !activity.isFinishing && !activity.isDestroyed) {
             (activity as? com.nin0dev.vendroid.MainActivity)?.loadingScreen?.scheduleDismiss(500)
         }
+        (activity as? com.nin0dev.vendroid.MainActivity)?.scheduleBootVerify("page-finished")
     }
 
     /**
@@ -341,6 +348,7 @@ class VWebviewClient(
         if (runtimeEmbedded) {
             if (runtimeEmbeddedUrls.size >= MAX_RUNTIME_TRACKED) runtimeEmbeddedUrls.clear()
             runtimeEmbeddedUrls.add(urlString)
+            VDELog.i("WV", "Embedded Vencord runtime into stale main frame: ${UrlNormalizer.redactForLog(urlString)}")
         }
         // Background revalidate; skip if one is already in flight for this URL.
         if (revalidatingUrls.add(urlString)) {

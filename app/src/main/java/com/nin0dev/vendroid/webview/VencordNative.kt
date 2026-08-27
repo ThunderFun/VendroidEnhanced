@@ -131,6 +131,25 @@ class VencordNative(private val activity: WeakReference<MainActivity>, wv: WebVi
             val tokenLiteral = gson.toJson(t)
             return ("(function(){" +
                 "'use strict';" +
+                // Capture uncaught errors so bundle boot crashes are visible
+                // in the logs (otherwise "Vencord undefined" is the only
+                // symptom). Idempotent; throttled to avoid spam.
+                "if(!window.__vdeUncaughtHook){" +
+                "window.__vdeUncaughtHook=true;" +
+                "if(!Array.isArray(window.__vdeUncaught))window.__vdeUncaught=[];" +
+                "var vdeEmit=function(m,s,l){if(window.__vdeUncaught.length<10)window.__vdeUncaught.push(m+'@'+s+':'+l);" +
+                "if(m!==window.__vdeLastUncaught||Date.now()-(window.__vdeLastUncaughtAt||0)>2000){" +
+                "console.error('[Vendroid][Uncaught] '+m+' @ '+s+':'+l);" +
+                "window.__vdeLastUncaught=m;window.__vdeLastUncaughtAt=Date.now();}};" +
+                "window.addEventListener('error',function(ev){" +
+                "var m=(ev&&ev.message)?String(ev.message):'error';" +
+                "var s=(ev&&ev.filename)?ev.filename:'?';" +
+                "var ln=(ev&&ev.lineno)?ev.lineno:0;" +
+                "vdeEmit(m,s,ln);},true);" +
+                "window.addEventListener('unhandledrejection',function(ev){" +
+                "var r=(ev&&ev.reason)?ev.reason:ev;" +
+                "var m=(r&&r.message)?String(r.message):String(r);" +
+                "vdeEmit('unhandledrejection: '+m,'?',0);});}" +
                 "if(window.__vendroidBootstrapped)return;" +
                 "window.__vendroidBootstrapped=true;" +
                 "var vendroidToken=$tokenLiteral;" +

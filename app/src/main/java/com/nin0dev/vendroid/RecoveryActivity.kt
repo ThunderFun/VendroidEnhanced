@@ -20,6 +20,18 @@ class RecoveryActivity : AppCompatActivity() {
 
         setContentView(R.layout.activity_recovery)
 
+        // Show last-boot state from the boot-verify probe, if available.
+        findViewById<android.widget.TextView>(R.id.last_boot_state).apply {
+            val state = getSharedPreferences("settings", Context.MODE_PRIVATE)
+                .getString(MainActivity.PREF_LAST_BOOT_STATE, null)
+            if (state.isNullOrEmpty()) {
+                visibility = android.view.View.GONE
+            } else {
+                visibility = android.view.View.VISIBLE
+                text = "Last boot: $state"
+            }
+        }
+
         findViewById<MaterialCardView>(R.id.start_normally).setOnClickListener {
             it.isClickable = false
             // Kill before commit (see killWebProcess), then clear a stale

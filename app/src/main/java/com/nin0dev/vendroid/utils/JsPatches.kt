@@ -118,4 +118,54 @@ object JsPatches {
      */
     val STARTUP_PATCHES_JS: String
         get() = NETWORK_FIREWALL_JS + ";" + ANIMATION_PATCH_JS + ";" + CSP_VIOLATION_REPORTER_JS
+
+    /**
+     * Environment prelude that must run BEFORE the Vencord bundle on every
+     * injection path (HTML embed and evaluateJavascript).
+     *
+     * The bundle's ScreenShare plugin executes `navigator.mediaDevices
+     * .getDisplayMedia.bind(...)` at init time; getDisplayMedia does not exist
+     * on Android Chromium, so the TypeError aborts the bundle's single
+     * synchronous IIFE before window.Vencord is assigned. A rejecting stub
+     * satisfies the eager `.bind`; the plugin's start() replaces it with its
+     * own modal-based implementation afterwards.
+     *
+     * Also installs an in-memory localStorage fallback when window.localStorage
+     * is unusable (the bundle destructures it once at line 46, so a later
+     * recovery cannot help). Engage state is logged so device reports show it.
+     *
+     * Idempotent (__vdeEnvShim guard). Must contain no "</script" / "<!--"
+     * because callers concatenate it raw inside <script> tags.
+     */
+    const val VENCORD_PRELUDE_JS: String =
+        "(function(){" +
+            "'use strict';" +
+            "if(window.__vdeEnvShim)return;" +
+            "window.__vdeEnvShim=1;" +
+            // Android Chromium lacks getDisplayMedia (desktop-only)
+            "try{" +
+                "if(!window.navigator.mediaDevices)" +
+                    "Object.defineProperty(window.navigator,'mediaDevices',{value:{},configurable:true});" +
+                "if(typeof window.navigator.mediaDevices.getDisplayMedia!=='function'){" +
+                    "var rej=function(){return Promise.reject(new DOMException('Screen sharing is not supported in Vendroid','NotSupportedError'));};" +
+                    "Object.defineProperty(window.navigator.mediaDevices,'getDisplayMedia',{value:rej,configurable:true,writable:true});" +
+                "}" +
+            "}catch(e){console.warn('[Vendroid] env shim mediaDevices failed:',e)}" +
+            // In-memory fallback only when storage looks broken
+            "try{" +
+                "var ls=null;try{ls=window.localStorage}catch(_){ls=undefined}" +
+                "if(!ls||typeof ls.getItem!=='function'||typeof ls.setItem!=='function'){" +
+                    "var mem={};" +
+                    "var store={getItem:function(k){return Object.prototype.hasOwnProperty.call(mem,k)?mem[k]:null;}," +
+                        "setItem:function(k,v){k=String(k);mem[k]=String(v);try{var n=0;for(var q in mem)n++;if(n>128)delete mem[Object.keys(mem)[0]]}catch(_){}}," +
+                        "removeItem:function(k){delete mem[k];}," +
+                        "key:function(i){var ks=Object.keys(mem);return i<ks.length?ks[i]:null;}," +
+                        "clear:function(){mem={};}};" +
+                    "Object.defineProperty(store,'length',{get:function(){return Object.keys(mem).length}});" +
+                    "try{Object.defineProperty(window,'localStorage',{value:store,configurable:true,writable:true});" +
+                        "console.warn('[Vendroid] window.localStorage unavailable; installed in-memory fallback')}catch(e2){" +
+                        "console.warn('[Vendroid] window.localStorage unavailable and could not be shimmed:',e2)}" +
+                "}" +
+            "}catch(e){}" +
+        "})()"
 }

@@ -21,6 +21,19 @@ class VendroidApp : Application() {
         VDELog.init(applicationContext, persistToFile = isWebProcess)
         VDELog.i("VDE", "App started (PID=${android.os.Process.myPid()})")
 
+        // Log app + WebView versions for incident reports.
+        try {
+            @Suppress("NewApi")
+            val wvPkg = android.webkit.WebView.getCurrentWebViewPackage()
+            VDELog.i(
+                "VDE",
+                "Session: app=${BuildConfig.VERSION_NAME}(${BuildConfig.VERSION_CODE}) " +
+                    "webview=${wvPkg?.versionName ?: "unknown"}"
+            )
+        } catch (_: Throwable) {
+            VDELog.i("VDE", "Session: app=${BuildConfig.VERSION_NAME}(${BuildConfig.VERSION_CODE}) webview=unknown")
+        }
+
         if (isWebProcess) {
             // Initialize the firewall config before any WebView request can
             // fire; shouldInterceptRequest() reads it via

@@ -36,8 +36,8 @@ object VDELog {
 
     private var handler: Handler? = null
     private var logFile: File? = null
-    // Kept open on the handler thread so each line is a buffered write rather
-    // than an open/write/close syscall. Handler-thread confined.
+    // Kept open on the handler thread. Flushed per line (see writeLineLocked)
+    // so recovery mode always sees the current session. Handler-thread confined.
     private var writer: BufferedWriter? = null
     // Mirrors logFile.length() without a stat() per line.
     private var currentFileBytes = 0L
@@ -225,6 +225,10 @@ object VDELog {
         val w = writer ?: return
         val bytes = line.toByteArray(Charsets.UTF_8)
         w.write(line, 0, line.length)
+        // Flush per line so the current session is always on disk.
+        // RecoveryActivity reads the file from a different process and
+        // cannot flush this writer.
+        w.flush()
         currentFileBytes += bytes.size
     }
 

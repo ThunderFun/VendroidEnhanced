@@ -17,10 +17,12 @@ import android.webkit.WebChromeClient
 import android.widget.Toast
 import com.google.gson.Gson
 import com.nin0dev.vendroid.utils.Constants
+import com.nin0dev.vendroid.utils.JsPatches
 import com.nin0dev.vendroid.utils.VDELog
 import com.nin0dev.vendroid.ui.LoadingScreenManager
 import com.nin0dev.vendroid.webview.HttpClient
 import com.nin0dev.vendroid.webview.HttpClient.fetchVencord
+import com.nin0dev.vendroid.webview.UrlNormalizer
 import com.nin0dev.vendroid.webview.VChromeClient
 import com.nin0dev.vendroid.webview.VWebviewClient
 import com.nin0dev.vendroid.webview.VencordNative
@@ -614,11 +616,15 @@ class MainActivity : AppCompatActivity() {
                         // is in scope before the runtimes call the bridge. It is
                         // idempotent if the document already ran it.
                         w.evaluateJavascript(VencordNative.bridgeBootstrapJs() + ";", null)
-                        w.evaluateJavascript(runtime + ";", null)
+                        // Env shim precedes the bundle (see VENCORD_PRELUDE_JS).
+                        w.evaluateJavascript(JsPatches.VENCORD_PRELUDE_JS + ";" + runtime + ";", null)
                         w.evaluateJavascript(mobileRuntime + ";", null)
                     } catch (_: IllegalStateException) {
                         // WebView destroyed between the checks and these calls.
                     }
+                    // Verify the runtimes actually booted (separate eval so it
+                    // runs even if the bundle eval died mid-script).
+                    scheduleBootVerify("eval-inject")
                     routePendingDeepLink()
                 }
             }
@@ -631,6 +637,64 @@ class MainActivity : AppCompatActivity() {
             pendingDeepLink = null
             handleUrl(Uri.parse(link))
         }
+    }
+
+    // Boot-verify probe: checks for Vencord/VencordMobile globals and any
+    // uncaught errors. Runs as a separate eval so it fires even when the
+    // bundle died mid-script.
+    //
+    // __vdeUncaught entries are pre-formatted strings ("msg@src:line" from
+    // VencordNative.bridgeBootstrapJs), so they are joined raw.
+    private val BOOT_VERIFY_JS =
+            "(function(){try{" +
+                "var u=(window.__vdeUncaught||[]).slice(0,5).join(' | ');" +
+                "var ls=(function(){try{var x=window.localStorage;return (x&&typeof x.getItem==='function')?'ok':'BROKEN('+typeof x+')'}catch(e){return 'THROWS'}})();" +
+                "var w=(typeof Vencord!=='undefined'&&Vencord&&Vencord.Webpack)?(Vencord.Webpack.wreq?'wreq-ok':'no-wreq'):'none';" +
+                "return 'vencord='+typeof Vencord+'|webpack='+w+'|mobile='+typeof VencordMobile+'|localStorage='+ls+'|uncaught=['+u+']';" +
+                "}catch(e){return 'probe-failed:'+e.message}})()"
+
+    /**
+     * Schedules a boot-verify probe after the runtimes have had time to boot.
+     * Called from injection paths and [VWebviewClient.onPageFinished].
+     */
+    fun scheduleBootVerify(source: String, delayMs: Long = 2000) {
+        val w = wv ?: return
+        w.postDelayed({ bootVerify(source) }, delayMs)
+    }
+
+    private fun bootVerify(source: String) {
+        val w = wv ?: return
+        if (isFinishing || isDestroyed) return
+        val url = currentUrlForBridge ?: return
+        val host = Uri.parse(url).host ?: return
+        if (!Constants.isDiscordAppOrigin(host)) return
+        w.evaluateJavascript(BOOT_VERIFY_JS) { raw ->
+            val verdict = raw?.let { unquoteJsResult(it) } ?: "no-result"
+            val ok = verdict.startsWith("vencord=object") && verdict.contains("|mobile=object")
+            val safe = UrlNormalizer.redactForLog(verdict)
+            if (ok) VDELog.i("Main", "Boot verify ($source): OK | $safe")
+            else VDELog.e("Main", "Boot verify ($source): FAILED | $safe")
+            persistBootState(ok, verdict)
+        }
+    }
+
+    /** Un-quotes the JSON string returned by evaluateJavascript. */
+    private fun unquoteJsResult(raw: String): String =
+        try {
+            org.json.JSONArray("[$raw]").getString(0)
+        } catch (_: Exception) {
+            raw.trim('"')
+        }
+
+    /** Persists a short human-readable boot summary for the recovery screen. */
+    private fun persistBootState(ok: Boolean, verdict: String) {
+        try {
+            val sPrefs = getSharedPreferences("settings", Context.MODE_PRIVATE)
+            val build = sPrefs.getString(HttpClient.PREF_BUNDLE_BUILD, null) ?: "unknown-build"
+            val state = (if (ok) "ok" else "fail") + " $build | " + verdict.take(140)
+            if (sPrefs.getString(PREF_LAST_BOOT_STATE, null) == state) return
+            sPrefs.edit().putString(PREF_LAST_BOOT_STATE, state).apply()
+        } catch (_: Exception) {}
     }
 
     /** True while a video/movie is in fullscreen custom view, so the overlay's
@@ -655,6 +719,9 @@ class MainActivity : AppCompatActivity() {
     companion object {
         private val gson = Gson()
         private val vencordRuntimeLock = Any()
+
+        /** SharedPreferences key for the last boot state summary (recovery screen). */
+        const val PREF_LAST_BOOT_STATE = "lastBootState"
 
         /** Bound on the parse-completion retries in injectVencordAttempt (100ms apart). */
         private const val INJECT_POLL_MAX_ATTEMPTS = 20

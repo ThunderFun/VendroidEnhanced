@@ -84,11 +84,36 @@ object HttpClient {
         val replacement: String,
         val marker: String
     )
+
+    /**
+     * The bundle's `//# sourceURL=file:///VencordWeb` pragma makes Chromium
+     * treat bundle code as cross-origin on the evaluateJavascript path, so
+     * uncaught errors are masked to "Script error." with lineno 0. Relabeling
+     * to a same-origin URL keeps attribution while disabling the masking.
+     * Comment-only tokens: no semantic effect. The dynamic per-module pragmas
+     * are relabeled for the same reason.
+     */
+    private const val SAME_ORIGIN_SOURCE_URL = "https://discord.com/vencord-web.js"
     private val vencordRuntimePatches: List<BundlePatch> = listOf(
         BundlePatch(
             Regex.escape("\"chat input type must be set\"").toRegex(),
             "\"chat input type must be set__VENDROID_DISABLED\"",
             "chat input type must be set__VENDROID_DISABLED"
+        ),
+        BundlePatch(
+            Regex.escape("//# sourceURL=file:///VencordWeb").toRegex(),
+            "//# sourceURL=$SAME_ORIGIN_SOURCE_URL",
+            SAME_ORIGIN_SOURCE_URL
+        ),
+        BundlePatch(
+            Regex.escape("//# sourceURL=file:///ExtractedWebpackModule").toRegex(),
+            "//# sourceURL=https://discord.com/vencord-ext-module",
+            "https://discord.com/vencord-ext-module"
+        ),
+        BundlePatch(
+            Regex.escape("//# sourceURL=file:///WebpackModule").toRegex(),
+            "//# sourceURL=https://discord.com/vencord-module",
+            "https://discord.com/vencord-module"
         )
     )
 
@@ -103,6 +128,12 @@ object HttpClient {
 
     /** SharedPreferences key of the bundle URL the stored ETag belongs to. */
     const val PREF_ETAG_LOCATION = "vencordEtagLocation"
+
+    /** SharedPreferences key of the bundle build tag (e.g. "Vencord@ada5cfe"). */
+    const val PREF_BUNDLE_BUILD = "vencordBundleBuild"
+
+    /** SharedPreferences key of the bundle SHA-256 (first 12 hex chars). */
+    const val PREF_BUNDLE_HASH = "vencordBundleHash"
 
     /** SharedPreferences key of the app version that last fetched the bundle. */
     const val PREF_LAST_BUNDLE_UPDATE = "lastMajorUpdateThatUserHasUpdatedVencord"
@@ -157,9 +188,45 @@ object HttpClient {
         sPrefs.edit()
             .remove(PREF_ETAG)
             .remove(PREF_ETAG_LOCATION)
+            .remove(PREF_BUNDLE_BUILD)
+            .remove(PREF_BUNDLE_HASH)
             .remove(PREF_BUNDLE_PATCHED)
             .remove(PREF_BUNDLE_PATCH_SET)
             .apply()
+    }
+
+    /**
+     * Extract the build tag from the bundle's leading comment header
+     * (e.g. "// Vencord a1b2c3d" -> "Vencord@a1b2c3d").
+     */
+    private val buildTagRegex = Regex("^//\\s*(Vencord|Equicord)\\s+([A-Za-z0-9._-]+)")
+    private fun extractBuildTag(content: String): String? {
+        for (line in content.lineSequence().take(4)) {
+            val m = buildTagRegex.find(line)
+            if (m != null) return m.groupValues[1] + "@" + m.groupValues[2]
+        }
+        return null
+    }
+
+    /** First 12 hex chars of the content's SHA-256; "unknown" on failure. */
+    private fun shortSha256(content: String): String =
+        try {
+            java.security.MessageDigest.getInstance("SHA-256")
+                .digest(content.toByteArray(Charsets.UTF_8))
+                .joinToString("") { "%02x".format(it.toInt() and 0xFF) }
+                .take(12)
+        } catch (_: Exception) {
+            "unknown"
+        }
+
+    /** Logs the on-disk bundle's identity once per process. */
+    @Volatile
+    private var bundleIdentityLogged = false
+    private fun logBundleIdentity(logLabel: String, content: String) {
+        if (bundleIdentityLogged) return
+        bundleIdentityLogged = true
+        val tag = extractBuildTag(content) ?: "unknown"
+        VDELog.i("HTTP", "$logLabel build=$tag sha256=${shortSha256(content)} size=${content.length}")
     }
 
     /**
@@ -175,6 +242,7 @@ object HttpClient {
         vendroidFile: File
     ): String {
         val raw = vendroidFile.readText()
+        logBundleIdentity("Cached bundle", raw)
         if (isPersistedPatchCurrent(sPrefs)) return raw
         val patched = applyPatches(raw)
         // Content that actually got patched here is patched in memory only;
@@ -253,10 +321,16 @@ object HttpClient {
             // data.
             resp = executeVencordGetResolvingRedirect(vencordLocation, storedEtag)
             var responseCode = resp.code
+            val responseEtag = resp.header("ETag")
+            VDELog.i(
+                "HTTP",
+                "Bundle check: branch=preflight code=$responseCode " +
+                    "etagSent=${storedEtag != null} etagRecv=${responseEtag != null}"
+            )
 
             when {
                 responseCode == HttpURLConnection.HTTP_NOT_MODIFIED && vendroidFile.exists() -> {
-                    VDELog.i("HTTP", "Bundle not modified (304), using cache")
+                    VDELog.i("HTTP", "Bundle branch: 304 (cache hit, fresh)")
                     if (VencordRuntime == null) {
                         VencordRuntime = readBundleFromDisk(sPrefs, vendroidFile)
                     }
@@ -283,7 +357,7 @@ object HttpClient {
                     // Fall back to the cached bundle on transient server errors
                     // so startup doesn't break; otherwise surface the failure.
                     if (vendroidFile.exists() && VencordRuntime == null) {
-                        VDELog.w("HTTP", "HTTP $responseCode; falling back to cached bundle")
+                        VDELog.e("HTTP", "Bundle branch: fallback-cache (HTTP $responseCode)")
                         VencordRuntime = readBundleFromDisk(sPrefs, vendroidFile)
                         bundleCheckedThisSession = true
                     } else {
@@ -295,7 +369,7 @@ object HttpClient {
             // Network failure during the version check must not brick startup
             // when a cached bundle exists; only the no-cache case propagates.
             if (vendroidFile.exists() && VencordRuntime == null) {
-                VDELog.w("HTTP", "Network error during version check; using cached bundle: ${io.message}")
+                VDELog.e("HTTP", "Bundle branch: fallback-cache (network error: ${io.message})")
                 VencordRuntime = readBundleFromDisk(sPrefs, vendroidFile)
                 bundleCheckedThisSession = true
             } else {
@@ -331,6 +405,10 @@ object HttpClient {
     @Throws(IOException::class)
     fun executeVencordGetResolvingRedirect(url: String, etag: String?): Response {
         val resp = executeVencordGet(url, etag)
+        // 304 is a cache hit, not a redirect. Without this, 304 responses
+        // (which have no Location header) throw and permanently pin the app
+        // to the cached bundle once an ETag is stored.
+        if (resp.code == HttpURLConnection.HTTP_NOT_MODIFIED) return resp
         if (resp.code !in 300..399) return resp
         val location = resp.header("Location")
             ?: run {
@@ -387,7 +465,9 @@ object HttpClient {
             // caller's fallback logic handles the failure.
             throw IOException("Refusing to store bundle failing sanity check (${content.length} chars)")
         }
-        VDELog.i("HTTP", "Bundle downloaded (${content.length} chars), applying patches...")
+        val buildTag = extractBuildTag(content)
+        val hash = shortSha256(content)
+        VDELog.i("HTTP", "Bundle downloaded (${content.length} chars) build=${buildTag ?: "unknown"} sha256=$hash, applying patches...")
         val patched = applyPatches(content)
         synchronized(bundleWriteLock) {
             // Unique temp name: startup and the JS-bridge update path write the
@@ -416,6 +496,8 @@ object HttpClient {
                 e.remove(PREF_ETAG_LOCATION)
             }
             e.putInt(PREF_LAST_BUNDLE_UPDATE, BuildConfig.VERSION_CODE)
+            if (buildTag != null) e.putString(PREF_BUNDLE_BUILD, buildTag) else e.remove(PREF_BUNDLE_BUILD)
+            e.putString(PREF_BUNDLE_HASH, hash)
             // Persist the patch state so a later cold start skips the ~1MB
             // regex scan instead of re-running applyPatches.
             e.putBoolean(PREF_BUNDLE_PATCHED, true)
@@ -423,7 +505,7 @@ object HttpClient {
             e.apply()
             if (publishToRuntime) VencordRuntime = patched
             bundleCheckedThisSession = true
-            VDELog.i("HTTP", "Bundle patched and saved to disk")
+            VDELog.i("HTTP", "Bundle patched and saved to disk (build=${buildTag ?: "unknown"} sha256=$hash)")
         }
     }
 

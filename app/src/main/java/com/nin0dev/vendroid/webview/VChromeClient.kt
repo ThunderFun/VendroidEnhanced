@@ -23,6 +23,20 @@ import java.lang.ref.WeakReference
 
 class VChromeClient(activity: MainActivity) : WebChromeClient() {
     private val activityRef: WeakReference<MainActivity> = WeakReference(activity)
+
+    companion object {
+        // Per-page cap for unprefixed ERROR console capture from Discord
+        // app origins. Reset by VWebviewClient.onPageStarted.
+        private val consoleErrorQuota = java.util.concurrent.atomic.AtomicInteger(30)
+        private val seenConsoleErrors: MutableSet<String> =
+            java.util.concurrent.ConcurrentHashMap.newKeySet()
+
+        @JvmStatic
+        fun resetPageErrorQuota() {
+            consoleErrorQuota.set(30)
+            seenConsoleErrors.clear()
+        }
+    }
     private var customView: View? = null
     private var customViewCallback: CustomViewCallback? = null
     private var originalStatusBarColor: Int = 0
@@ -78,9 +92,21 @@ class VChromeClient(activity: MainActivity) : WebChromeClient() {
             return true
         }
 
-        // Non-Vendroid messages: logcat only in debug builds. Use Log.e/w
-        // directly, not Logger, to avoid flooding VDELog with Discord's
-        // internal JS noise (React dev tools, webpack HMR, etc.).
+        // Non-Vendroid messages: logcat only in debug builds to avoid
+        // flooding VDELog with Discord's internal JS noise. Unprefixed
+        // ERROR messages from Discord app origins are persisted (capped,
+        // deduped) since they signal bundle boot failures.
+        if (msg.messageLevel() == MessageLevel.ERROR) {
+            val host = activityRef.get()?.currentHostForBridge
+            if (host != null && com.nin0dev.vendroid.utils.Constants.isDiscordAppOrigin(host)) {
+                val source = msg.sourceId() ?: ""
+                val titled = "$message @ ${UrlNormalizer.redactForLog(source)}:${msg.lineNumber()}"
+                val dedupeKey = titled.take(80)
+                if (seenConsoleErrors.add(dedupeKey) && consoleErrorQuota.getAndDecrement() > 0) {
+                    VDELog.log(VDELog.Level.ERROR, "JS", titled.take(500))
+                }
+            }
+        }
         if (BuildConfig.DEBUG) {
             when (msg.messageLevel()) {
                 MessageLevel.ERROR -> Log.e("Vendroid", "[JS] $message @ ${msg.lineNumber()}")

@@ -18,6 +18,16 @@
 
             android:orientation="vertical">
 
+            <!-- Last-boot state from the boot-verify probe. -->
+            <TextView
+                android:id="@+id/last_boot_state"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginBottom="12dp"
+                android:textAppearance="?attr/textAppearanceBodySmall"
+                android:textColor="?android:attr/textColorSecondary"
+                android:visibility="gone" />
+
             <com.google.android.material.card.MaterialCardView
                 android:id="@+id/start_normally"
                 style="?attr/materialCardViewFilledStyle"

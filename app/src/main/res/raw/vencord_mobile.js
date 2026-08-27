@@ -1358,13 +1358,27 @@
     var initStage = 0; // 0=need webpack, 1=need plugins/flux, 2=done
     var initAttempts = 0;
     var MAX_INIT_ATTEMPTS = 300; // 300 * 50ms = 15s
+    var _lastInitError = null;
+    var _lastInitErrorAt = -100;
+
+    // Diagnostic snapshot: typeofVencord, webpack state, chunk count, etc.
+    function bootStateSnapshot() {
+        return "typeofVencord=" + typeof Vencord
+            + " webpack=" + (typeof Vencord !== "undefined" && Vencord.Webpack ? typeof Vencord.Webpack.wreq : "n/a")
+            + " capturedWreq=" + (_vendroidCapturedWreq ? "yes" : "no")
+            + " chunkLen=" + (window.webpackChunkdiscord_app ? window.webpackChunkdiscord_app.length : "none")
+            + " attempts=" + initAttempts
+            + " uncaught=" + (window.__vdeUncaught ? window.__vdeUncaught.length : 0);
+    }
 
     function tryAdvanceInit() {
         if (initStage >= 2) return;
 
         if (initStage === 0) {
             // Stage 1: webpack init
-            if (Vencord.Webpack.wreq) {
+            if (typeof Vencord === "undefined" || !Vencord.Webpack) {
+                // Bundle not loaded yet or boot crashed; keep polling.
+            } else if (Vencord.Webpack.wreq) {
                 initStage = 1;
             } else if (_vendroidCapturedWreq) {
                 vendroidCallInitWebpack();
@@ -1399,14 +1413,23 @@
     function initTick() {
         if (initStage >= 2) return;
         initAttempts++;
+        if (initAttempts === 1) {
+            console.warn("[Vendroid] Boot initial: " + bootStateSnapshot());
+        }
         try {
             tryAdvanceInit();
         } catch(e) {
-            console.error("[Vendroid] initTick error: " + e.message);
+            var msg = e && e.message ? e.message : String(e);
+            // Throttle identical messages to every 40 ticks.
+            if (msg !== _lastInitError || initAttempts - _lastInitErrorAt >= 40) {
+                console.error("[Vendroid] initTick error: " + msg + " | " + bootStateSnapshot());
+                _lastInitError = msg;
+                _lastInitErrorAt = initAttempts;
+            }
         }
         if (initStage >= 2) return;
         if (initAttempts >= MAX_INIT_ATTEMPTS) {
-            console.error("[Vendroid] Init timed out after " + initAttempts + " attempts (" + (initAttempts * 50) + "ms)");
+            console.error("[Vendroid] Init timed out after " + initAttempts + " attempts (" + (initAttempts * 50) + "ms) | " + bootStateSnapshot());
             initStage = 2;
             recoverPlugins();
             tryStartPluginsStage();
