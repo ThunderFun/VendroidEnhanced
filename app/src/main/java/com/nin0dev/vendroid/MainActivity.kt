@@ -414,6 +414,16 @@ class MainActivity : AppCompatActivity() {
             currentHostForBridge = "discord.com"
             return "https://discord.com/app"
         }
+        // Remember-last-channel off: load the app shell instead of a saved
+        // position, and drop any saved URL so re-enabling can't restore one.
+        if (!sPrefs.getBoolean("vendroid_rememberLastChannel", false)) {
+            if (sPrefs.contains("lastUrl")) {
+                sPrefs.edit { remove("lastUrl") }
+            }
+            wv!!.loadUrl("https://discord.com/app")
+            currentHostForBridge = "discord.com"
+            return "https://discord.com/app"
+        }
         val lastUrl = sPrefs.getString("lastUrl", null)
         if (lastUrl != null) {
             val host = Uri.parse(lastUrl).host
@@ -497,12 +507,14 @@ class MainActivity : AppCompatActivity() {
             currentUrlForBridge = url
             currentHostForBridge = Uri.parse(url).host
             val host = currentHostForBridge
-            // Only persist URLs the app can resume into (channels, DMs, /app).
-            // Saving a non-app page (e.g. /blog/...) would reload it on restart
-            // with empty history, hardlocking the user there.
-            if (host != null && Constants.isDiscordDomain(host) && isAppResumeUrl(url)) {
-                getSharedPreferences("settings", Context.MODE_PRIVATE)
-                    .edit() { putString("lastUrl", url) }
+            // Persist only resumable app routes (isAppResumeUrl) and only
+            // while remember-last-channel is enabled; a saved non-app page
+            // (e.g. /blog/...) would reload on restart with empty back
+            // history, trapping the user there.
+            val prefs = getSharedPreferences("settings", Context.MODE_PRIVATE)
+            if (host != null && Constants.isDiscordDomain(host) && isAppResumeUrl(url) &&
+                prefs.getBoolean("vendroid_rememberLastChannel", false)) {
+                prefs.edit() { putString("lastUrl", url) }
             }
         }
         wv?.onPause()
@@ -580,16 +592,23 @@ class MainActivity : AppCompatActivity() {
      */
     private fun injectVencordAttempt(runtime: String, mobileRuntime: String, attempt: Int) {
         val w = wv ?: return
+        val expectedHost = Uri.parse(currentUrlForBridge ?: return).host
+            ?.let { gson.toJson(it) } ?: return
+        // The renderer must already sit on the expected Discord host. A
+        // mismatch means a provisional document (mid-navigation commit)
+        // with no guaranteed quota-managed storage yet; evaluating the
+        // bundle in that state has broken boot before.
         w.evaluateJavascript(
             "(document.readyState==='loading'?'L'" +
+            ":location.hostname!==$expectedHost?'H'" +
             ":(typeof Vencord!=='undefined'" +
                 "?(typeof VencordMobile!=='undefined'?'B':'V')" +
                 ":'N'))"
         ) { raw ->
             when (raw?.trim('"')) {
-                "L" -> {
-                    // Parser still running; retry briefly, then give up on this
-                    // document (the next navigation restarts the flow).
+                "L", "H" -> {
+                    // Still parsing or wrong document; retry briefly, then
+                    // give up and let the next navigation restart the flow.
                     if (attempt < INJECT_POLL_MAX_ATTEMPTS) {
                         w.postDelayed({ injectVencordAttempt(runtime, mobileRuntime, attempt + 1) }, 100)
                     }
@@ -645,12 +664,23 @@ class MainActivity : AppCompatActivity() {
     //
     // __vdeUncaught entries are pre-formatted strings ("msg@src:line" from
     // VencordNative.bridgeBootstrapJs), so they are joined raw.
+    //
+    // localStorage diagnosis reports the type, the own-property descriptor
+    // (native storage defines an accessor on window), the shim flag, and the
+    // prelude's at-boot snapshot (__vdeLsBoot) to distinguish "storage never
+    // worked" from "removed by in-page code". No self-heal: a silent repair
+    // would erase the evidence of who removed it.
     private val BOOT_VERIFY_JS =
             "(function(){try{" +
                 "var u=(window.__vdeUncaught||[]).slice(0,5).join(' | ');" +
-                "var ls=(function(){try{var x=window.localStorage;return (x&&typeof x.getItem==='function')?'ok':'BROKEN('+typeof x+')'}catch(e){return 'THROWS'}})();" +
+                "var lsv,thr=false;try{lsv=window.localStorage}catch(e){thr=true}" +
+                "var ls='ls='+(thr?'throws':typeof lsv)" +
+                    "+'|own='+(Object.getOwnPropertyDescriptor(window,'localStorage')?'y':'n')" +
+                    "+'|shim='+(window.__vdeLsShim?'y':'n')" +
+                    "+'|watch='+(window.__vdeLsWatch===undefined?'n':window.__vdeLsWatch)" +
+                    "+'|boot0='+(window.__vdeLsBoot===undefined?'?':window.__vdeLsBoot);" +
                 "var w=(typeof Vencord!=='undefined'&&Vencord&&Vencord.Webpack)?(Vencord.Webpack.wreq?'wreq-ok':'no-wreq'):'none';" +
-                "return 'vencord='+typeof Vencord+'|webpack='+w+'|mobile='+typeof VencordMobile+'|localStorage='+ls+'|uncaught=['+u+']';" +
+                "return 'vencord='+typeof Vencord+'|webpack='+w+'|mobile='+typeof VencordMobile+'|'+ls+'|uncaught=['+u+']';" +
                 "}catch(e){return 'probe-failed:'+e.message}})()"
 
     /**

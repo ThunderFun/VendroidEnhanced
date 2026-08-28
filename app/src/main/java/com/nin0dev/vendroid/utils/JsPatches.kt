@@ -142,6 +142,9 @@ object JsPatches {
             "'use strict';" +
             "if(window.__vdeEnvShim)return;" +
             "window.__vdeEnvShim=1;" +
+            // Boot-probe snapshot (boot0): storage health at injection time,
+            // before any page script ran.
+            "try{window.__vdeLsBoot=typeof window.localStorage}catch(_){window.__vdeLsBoot='throws'}" +
             // Android Chromium lacks getDisplayMedia (desktop-only)
             "try{" +
                 "if(!window.navigator.mediaDevices)" +
@@ -155,6 +158,7 @@ object JsPatches {
             "try{" +
                 "var ls=null;try{ls=window.localStorage}catch(_){ls=undefined}" +
                 "if(!ls||typeof ls.getItem!=='function'||typeof ls.setItem!=='function'){" +
+                    "window.__vdeLsShim=1;" +
                     "var mem={};" +
                     "var store={getItem:function(k){return Object.prototype.hasOwnProperty.call(mem,k)?mem[k]:null;}," +
                         "setItem:function(k,v){k=String(k);mem[k]=String(v);try{var n=0;for(var q in mem)n++;if(n>128)delete mem[Object.keys(mem)[0]]}catch(_){}}," +
@@ -165,6 +169,19 @@ object JsPatches {
                     "try{Object.defineProperty(window,'localStorage',{value:store,configurable:true,writable:true});" +
                         "console.warn('[Vendroid] window.localStorage unavailable; installed in-memory fallback')}catch(e2){" +
                         "console.warn('[Vendroid] window.localStorage unavailable and could not be shimmed:',e2)}" +
+                "}" +
+                // Storage healthy: re-publish localStorage as a
+                // non-configurable own accessor so page JS can no longer
+                // delete or redefine it. A later probe reporting
+                // ls=undefined|own=n then points below the JS layer, i.e.
+                // engine-side invalidation.
+                "else{" +
+                    "try{var real=ls;" +
+                        "Object.defineProperty(window,'localStorage',{configurable:false,enumerable:true," +
+                            "get:function(){return real;}," +
+                            "set:function(v){console.warn('[Vendroid] localStorage overwritten by page code');}});" +
+                        "window.__vdeLsWatch=1;" +
+                    "}catch(e){window.__vdeLsWatch='failed:'+e.message}" +
                 "}" +
             "}catch(e){}" +
         "})()"

@@ -43,6 +43,7 @@ class VencordNative(private val activity: WeakReference<MainActivity>, wv: WebVi
         private val BOOLEAN_SETTING_KEYS = setOf(
             "vendroid_confirmExternalLinks",
             "vendroid_blockTypingIndicator",
+            "vendroid_rememberLastChannel",
             // Migrated by MainActivity.migrateSettings() and read by the plugin.
             // Guarded here so setString can't type-poison them into Strings.
             "checkVDEUpdates",
@@ -142,7 +143,11 @@ class VencordNative(private val activity: WeakReference<MainActivity>, wv: WebVi
                 "console.error('[Vendroid][Uncaught] '+m+' @ '+s+':'+l);" +
                 "window.__vdeLastUncaught=m;window.__vdeLastUncaughtAt=Date.now();}};" +
                 "window.addEventListener('error',function(ev){" +
-                "var m=(ev&&ev.message)?String(ev.message):'error';" +
+                // Resource load failures (img/script/link) surface as message-less
+                // ErrorEvents; record only genuine script exceptions, which carry
+                // a message or error object.
+                "if(!((ev&&ev.message)||(ev&&ev.error)))return;" +
+                "var m=String(ev.message);" +
                 "var s=(ev&&ev.filename)?ev.filename:'?';" +
                 "var ln=(ev&&ev.lineno)?ev.lineno:0;" +
                 "vdeEmit(m,s,ln);},true);" +
@@ -690,6 +695,10 @@ class VencordNative(private val activity: WeakReference<MainActivity>, wv: WebVi
             // effect without an app restart.
             if (safeId == "vendroid_blockTypingIndicator") {
                 com.nin0dev.vendroid.webview.VWebviewClient.updateTypingBlock(value)
+            }
+            // Opt-out wipes any persisted position.
+            if (safeId == "vendroid_rememberLastChannel" && !value) {
+                prefs.edit { remove("lastUrl") }
             }
             Unit
         }

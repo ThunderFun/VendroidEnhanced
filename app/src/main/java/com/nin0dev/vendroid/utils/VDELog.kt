@@ -95,7 +95,7 @@ object VDELog {
     }
 
     fun log(level: Level, tag: String, message: String, throwable: Throwable? = null) {
-        val entry = LogEntry(System.currentTimeMillis(), level, tag, message)
+        val entry = LogEntry(System.currentTimeMillis(), level, tag, redactIds(message))
         synchronized(buffer) {
             buffer.addLast(entry)
             if (buffer.size > MAX_ENTRIES) buffer.removeFirst()
@@ -123,6 +123,45 @@ object VDELog {
     fun e(tag: String, message: String) = log(Level.ERROR, tag, message)
     fun e(tag: String, message: String, throwable: Throwable) = log(Level.ERROR, tag, message, throwable)
     fun d(tag: String, message: String) = log(Level.DEBUG, tag, message)
+
+    // Snowflake redaction. log() is the single chokepoint, so every sink
+    // (ring buffer, disk file, log viewer / share output) passes through it.
+
+    /** Snowflakes are 17-20 digit epoch-based IDs. Epoch-ms timestamps are
+     *  13 digits and hashes are hex, so a pure-digit run of this length is
+     *  practically never a false positive. */
+    private const val SNOWFLAKE_MIN_DIGITS = 17
+    private const val SNOWFLAKE_MAX_DIGITS = 20
+    private val SNOWFLAKE_REGEX =
+        Regex("(?<!\\d)\\d{$SNOWFLAKE_MIN_DIGITS,$SNOWFLAKE_MAX_DIGITS}(?!\\d)")
+
+    // Bounded so hostile console spam of distinct large numbers cannot grow it.
+    private const val MAX_SNOWFLAKE_ALIASES = 128
+    private val snowflakeAliases = java.util.concurrent.ConcurrentHashMap<String, String>()
+    private val snowflakeCounter = java.util.concurrent.atomic.AtomicInteger(0)
+
+    /**
+     * Replaces Discord snowflakes with stable aliases ("[sn1]", "[sn2]",
+     * ...) so references stay correlatable across lines while real values
+     * never reach logs or shares. Aliases live in memory only and reset
+     * each session.
+     */
+    fun redactIds(raw: String): String {
+        if (!raw.any { it.isDigit() }) return raw
+        return SNOWFLAKE_REGEX.replace(raw) { m ->
+            val id = m.value
+            snowflakeAliases[id] ?: run {
+                if (snowflakeAliases.size >= MAX_SNOWFLAKE_ALIASES) {
+                    "[sn]"
+                } else {
+                    // Losing racer adopts the winner's alias, so every ID
+                    // maps to exactly one stable alias.
+                    val alias = "[sn${snowflakeCounter.incrementAndGet()}]"
+                    snowflakeAliases.putIfAbsent(id, alias) ?: alias
+                }
+            }
+        }
+    }
 
     fun getRecentLogs(count: Int = 500): String {
         val entries: List<LogEntry>
@@ -206,7 +245,7 @@ object VDELog {
                 append(entry.message.replace("\n", "\\n"))
                 if (throwable != null) {
                     append(" | ")
-                    append(throwable.stackTraceToString())
+                    append(redactIds(throwable.stackTraceToString()))
                 }
                 append('\n')
             }
