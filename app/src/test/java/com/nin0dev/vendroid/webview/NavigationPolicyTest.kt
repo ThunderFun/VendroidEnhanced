@@ -23,7 +23,7 @@ class NavigationPolicyTest {
 
     @Test fun navAllowed_discordSubdomain() {
         assertTrue(Constants.isNavigationAllowedDomain("canary.discord.com"))
-        assertTrue(Constants.isNavigationAllowedDomain("ptb.discordapp.com"))
+        assertTrue(Constants.isNavigationAllowedDomain("ptb.discord.com"))
     }
 
     @Test fun navAllowed_discordapp() {
@@ -34,13 +34,27 @@ class NavigationPolicyTest {
         assertTrue(Constants.isNavigationAllowedDomain("discord.gg"))
     }
 
-    @Test fun navAllowed_discordMedia() {
-        assertTrue(Constants.isNavigationAllowedDomain("discord.media"))
+    // Raw-content CDN hosts render as a bare image/video document with no
+    // in-app back path (media hardlock), so main-frame navigation is
+    // deliberately rejected and these hosts route through the link popup.
+    // Subresource loads (<img> etc.) are unaffected; the firewall governs
+    // those separately. See SECURITY_TRACKER.md (isNavigationAllowedDomain).
+    @Test fun navAllowed_rawContentCdnRejected() {
+        assertFalse(Constants.isNavigationAllowedDomain("discord.media"))
+        assertFalse(Constants.isNavigationAllowedDomain("media.discord.media"))
+        assertFalse(Constants.isNavigationAllowedDomain("discordapp.net"))
+        assertFalse(Constants.isNavigationAllowedDomain("cdn.discordapp.net"))
+        assertFalse(Constants.isNavigationAllowedDomain("media.discordapp.net"))
     }
 
-    @Test fun navAllowed_discordappNet() {
-        assertTrue(Constants.isNavigationAllowedDomain("discordapp.net"))
-        assertTrue(Constants.isNavigationAllowedDomain("cdn.discordapp.net"))
+    // Non-apex discordapp.com subdomains (cdn., media., ptb.) serve
+    // attacker-uploaded content and get no in-app main-frame navigation;
+    // only the apex is navigable. Matches the apex-only rule in
+    // isDiscordAppOrigin.
+    @Test fun navAllowed_discordappSubdomainsRejected() {
+        assertFalse(Constants.isNavigationAllowedDomain("ptb.discordapp.com"))
+        assertFalse(Constants.isNavigationAllowedDomain("cdn.discordapp.com"))
+        assertFalse(Constants.isNavigationAllowedDomain("media.discordapp.com"))
     }
 
     @Test fun navAllowed_discordsays() {

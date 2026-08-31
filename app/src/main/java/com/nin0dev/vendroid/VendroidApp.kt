@@ -91,9 +91,22 @@ class VendroidApp : Application() {
                 }
             }.start()
 
+            // Safe mode: raise the kill switch and never publish a runtime in
+            // this process. Read synchronously; Application.onCreate always
+            // precedes Activity.onCreate here, so the read cannot race the
+            // one-shot pref reset in MainActivity.
+            val safeMode = getSharedPreferences("settings", Context.MODE_PRIVATE)
+                .getBoolean("safeMode", false)
+            if (safeMode) {
+                HttpClient.vencordDisabled = true
+                VDELog.w("VDE", "Safe mode: skipping Vencord runtime preload")
+            }
+
             // Pre-load the Vencord runtimes on a background thread so they are
             // in memory by the time MainActivity.onCreate() runs.
             Thread {
+                // Publish-site guard; see HttpClient.vencordDisabled.
+                if (HttpClient.vencordDisabled) return@Thread
                 try {
                     // 1. VencordMobile runtime (65 KB raw resource, memory-mapped)
                     if (HttpClient.VencordMobileRuntime == null) {
@@ -136,7 +149,9 @@ class VendroidApp : Application() {
             // network activity phones home before the user accepts the risk
             // warning. (Other startup threads are local-only: runtime preload,
             // cookie-DB warmup, and disk-cache preload touch no network.)
-            if (riskAccepted) {
+            // Safe mode skips this too: only vencord_mobile.js applies the
+            // CSS, and it never loads, so the prefetch buys nothing.
+            if (riskAccepted && !safeMode) {
                 Thread {
                     try {
                         val sPrefs = getSharedPreferences("settings", Context.MODE_PRIVATE)

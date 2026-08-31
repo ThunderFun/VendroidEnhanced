@@ -208,6 +208,9 @@ class VencordNative(private val activity: WeakReference<MainActivity>, wv: WebVi
     @Volatile
     private var firewallDialogActive = false
 
+    @Volatile
+    private var quickCssDialogActive = false
+
     private var originalStatusBarColor: Int? = null
     private var originalNavBarColor: Int? = null
 
@@ -240,7 +243,16 @@ class VencordNative(private val activity: WeakReference<MainActivity>, wv: WebVi
         var evicted = false
         for (key in cssPrefs.all.keys) {
             if (!key.startsWith("css_cache_") || key.endsWith("_ts")) continue
-            val ts = cssPrefs.getLong("${key}_ts", 0)
+            // VendroidApp's prefetch guards this same getLong. One
+            // type-poisoned timestamp would otherwise abort every eviction
+            // run at the same key, since getAll() iteration order is stable.
+            // 0L reads as stale, so the removals below also clear the poison.
+            val ts = try {
+                cssPrefs.getLong("${key}_ts", 0)
+            } catch (e: Exception) {
+                VDELog.w("VN", "CSS cache ${key}_ts type-poisoned, evicting")
+                0L
+            }
             if (now - ts > CSS_CACHE_TTL_MS) {
                 editor.remove(key)
                 editor.remove("${key}_ts")
@@ -770,13 +782,14 @@ class VencordNative(private val activity: WeakReference<MainActivity>, wv: WebVi
 
     private fun openQuickCssInternal(quickCss: String?) {
         val act = activity.get() ?: return
+        if (quickCssDialogActive) return
         val safeQuickCss = quickCss ?: ""
         openAssetEditor(
             act = act,
             assetUrl = "file:///android_asset/quickcss_editor.html",
-            createBridge = { wv, dialog -> QuickCssBridge(act, wv, dialog) },
-            onShown = {},
-            onDialogDismiss = {},
+            createBridge = { dialog -> QuickCssBridge(act, dialog) },
+            onShown = { quickCssDialogActive = true },
+            onDialogDismiss = { quickCssDialogActive = false },
             onPageFinished = { view ->
                 if (safeQuickCss.isNotEmpty()) {
                     view.evaluateJavascript(
@@ -830,23 +843,27 @@ class VencordNative(private val activity: WeakReference<MainActivity>, wv: WebVi
      */    private fun openAssetEditor(
         act: MainActivity,
         assetUrl: String,
-        createBridge: (WebView, android.app.Dialog) -> EditorOrigin,
+        createBridge: (android.app.Dialog) -> EditorOrigin,
         onShown: () -> Unit,
         onDialogDismiss: () -> Unit,
         onPageFinished: (WebView) -> Unit
     ) {
         act.runOnUiThread {
+            // Nullable so the catch path can clean up a failure at any point.
+            var wv: WebView? = null
+            var dialog: android.app.Dialog? = null
             try {
                 if (act.isFinishing || act.isDestroyed) return@runOnUiThread
-                val wv = WebView(act)
-                SecureWebViewDialog.configure(wv)
+                val editor = WebView(act)
+                wv = editor
+                SecureWebViewDialog.configure(editor)
 
-                val dialog = SecureWebViewDialog.create(act, wv) { onDialogDismiss() }
+                dialog = SecureWebViewDialog.create(act, editor) { onDialogDismiss() }
 
-                val bridge = createBridge(wv, dialog)
-                wv.addJavascriptInterface(bridge, "VencordMobileNative")
+                val bridge = createBridge(dialog)
+                editor.addJavascriptInterface(bridge, "VencordMobileNative")
 
-                wv.webViewClient = object : android.webkit.WebViewClient() {
+                editor.webViewClient = object : android.webkit.WebViewClient() {
                     // Fail closed: only ever load the expected bundled asset.
                     // Any navigation away from it (a link tap, meta refresh, or
                     // a future asset change) is blocked so the
@@ -886,9 +903,19 @@ class VencordNative(private val activity: WeakReference<MainActivity>, wv: WebVi
 
                 onShown()
                 dialog.show()
-                wv.loadUrl(assetUrl)
+                editor.loadUrl(assetUrl)
             } catch (e: Throwable) {
-                onDialogDismiss()
+                val d = dialog
+                if (d != null && d.isShowing) {
+                    // Dismissal runs the listener chain, which destroys wv,
+                    // resets the active flag, and unregisters the dialog.
+                    d.dismiss()
+                } else {
+                    // A never-shown dialog never fires its dismiss listener.
+                    wv?.destroy()
+                    if (d != null) act.unregisterDialog(d)
+                    onDialogDismiss()
+                }
                 VDELog.e("VN", "openAssetEditor($assetUrl) failed", e)
             }
         }
@@ -896,7 +923,6 @@ class VencordNative(private val activity: WeakReference<MainActivity>, wv: WebVi
 
     private class QuickCssBridge(
         private val activity: MainActivity,
-        private val editorWebView: WebView,
         private val dialog: android.app.Dialog
     ) : EditorOrigin {
         // Set from onPageFinished (UI thread). WebView.getUrl() must be called
@@ -970,7 +996,7 @@ class VencordNative(private val activity: WeakReference<MainActivity>, wv: WebVi
         openAssetEditor(
             act = act,
             assetUrl = "file:///android_asset/log_viewer.html",
-            createBridge = { wv, dialog -> LogViewerBridge(act, wv, dialog) },
+            createBridge = { dialog -> LogViewerBridge(act, dialog) },
             onShown = { logsDialogActive = true },
             onDialogDismiss = { logsDialogActive = false },
             onPageFinished = { view ->
@@ -984,7 +1010,6 @@ class VencordNative(private val activity: WeakReference<MainActivity>, wv: WebVi
 
     private class LogViewerBridge(
         private val activity: MainActivity,
-        private val viewerWebView: WebView,
         private val dialog: android.app.Dialog
     ) : EditorOrigin {
         @Volatile override var originCommitted = false
@@ -1028,7 +1053,7 @@ class VencordNative(private val activity: WeakReference<MainActivity>, wv: WebVi
         openAssetEditor(
             act = act,
             assetUrl = "file:///android_asset/firewall_editor.html",
-            createBridge = { wv, dialog -> FirewallEditorBridge(act, wv, dialog) },
+            createBridge = { dialog -> FirewallEditorBridge(act, dialog) },
             onShown = { firewallDialogActive = true },
             onDialogDismiss = { firewallDialogActive = false },
             onPageFinished = { view ->
@@ -1042,7 +1067,6 @@ class VencordNative(private val activity: WeakReference<MainActivity>, wv: WebVi
 
     private class FirewallEditorBridge(
         private val activity: MainActivity,
-        private val editorWebView: WebView,
         private val dialog: android.app.Dialog
     ) : EditorOrigin {
         @Volatile override var originCommitted = false

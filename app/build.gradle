@@ -9,8 +9,9 @@ if (keystorePropertiesFile.exists()) {
 }
 
 android {
-    namespace 'com.nin0dev.vendroid'
-    compileSdk 36
+    namespace = 'com.nin0dev.vendroid'
+    compileSdk 37
+    compileSdkMinor = 1
 
     defaultConfig {
         applicationId "com.nin0dev.vendroid"
@@ -48,8 +49,8 @@ android {
         dev {
             applicationIdSuffix ".dev"
             minifyEnabled true
-            shrinkResources true
-            signingConfig signingConfigs.debug
+            shrinkResources = true
+            signingConfig = signingConfigs.debug
             proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
             buildConfigField "boolean", "ALLOW_WEBVIEW_DEBUGGING", "false"
             // Enforce the strict CSP in dev to shake out breakage before release.
@@ -58,8 +59,8 @@ android {
 
         release {
             minifyEnabled true
-            shrinkResources true
-            signingConfig signingConfigs.release
+            shrinkResources = true
+            signingConfig = signingConfigs.release
             proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
             buildConfigField "boolean", "ALLOW_WEBVIEW_DEBUGGING", "false"
             // Enforce the strict CSP in release once validated.
@@ -77,16 +78,16 @@ android {
 
 dependencies {
 
-    implementation 'androidx.annotation:annotation:1.9.1'
-    implementation 'com.google.android.material:material:1.12.0'
-    implementation 'androidx.appcompat:appcompat:1.7.0'
-    implementation 'androidx.activity:activity-ktx:1.9.3'
-    implementation 'com.google.code.gson:gson:2.12.1'
-    implementation 'androidx.webkit:webkit:1.12.1'
-    implementation 'com.squareup.okhttp3:okhttp:5.4.0'
+    implementation 'androidx.annotation:annotation:1.10.0'
+    implementation 'com.google.android.material:material:1.14.0'
+    implementation 'androidx.appcompat:appcompat:1.8.0'
+    implementation 'androidx.activity:activity-ktx:1.13.0'
+    implementation 'com.google.code.gson:gson:2.14.0'.
+    implementation 'androidx.webkit:webkit:1.17.0'
+    implementation 'com.squareup.okhttp3:okhttp:5.5.0'
 
     testImplementation 'junit:junit:4.13.2'
-    testImplementation 'org.robolectric:robolectric:4.14.1'
-    testImplementation 'androidx.test:core:1.6.1'
+    testImplementation 'org.robolectric:robolectric:4.16.1'
+    testImplementation 'androidx.test:core:1.7.0'
 }
 

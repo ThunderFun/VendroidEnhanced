@@ -52,6 +52,17 @@ object HttpClient {
         private set
 
     /**
+     * Session kill switch for safe mode. Raised at process start and
+     * idempotently by MainActivity's safe-mode branch; never cleared for the
+     * life of the process. Deliberately not re-read from the "safeMode" pref,
+     * which MainActivity resets one-shot at startup. Readiness checks must
+     * consult this flag so a safe-mode session survives activity recreation,
+     * when the pref is false again.
+     */
+    @Volatile
+    var vencordDisabled: Boolean = false
+
+    /**
      * True once a bundle fetch or revalidation has completed in this process
      * (via [fetchVencord] or the JS-bridge update path). The warm-navigation
      * fast path keys on this rather than `VencordRuntime != null`, which the
@@ -241,6 +252,14 @@ object HttpClient {
         sPrefs: SharedPreferences,
         vendroidFile: File
     ): String {
+        // downloadStoreAndSync bounds its writes by MAX_READ_BYTES, but an
+        // interrupted write or a full disk can leave an arbitrary file behind,
+        // and readText() has no cap: oversized content would OOM the calling
+        // thread. Same bound as readAsText; fail closed.
+        val fileSize = vendroidFile.length()
+        if (fileSize > MAX_READ_BYTES) {
+            throw IOException("Cached bundle exceeds $MAX_READ_BYTES byte limit ($fileSize bytes)")
+        }
         val raw = vendroidFile.readText()
         logBundleIdentity("Cached bundle", raw)
         if (isPersistedPatchCurrent(sPrefs)) return raw
@@ -274,10 +293,13 @@ object HttpClient {
             throw IOException("Vencord location must use HTTPS: $vencordLocation")
         }
         val vendroidFile = File(activity.filesDir, "vencord.js")
-        // Discard a zero-length file (interrupted write) so the cache branches
-        // below don't load an empty bundle.
-        if (vendroidFile.exists() && vendroidFile.length() == 0L) {
-            VDELog.w("HTTP", "Cached vencord.js is empty, discarding")
+        // Discard a zero-length file (interrupted write) or an oversized one
+        // (botched write; readBundleFromDisk refuses it). Deleting makes the
+        // failure self-healing: the fetch below installs a fresh bundle rather
+        // than every cold start failing on the same corrupt file.
+        val cachedLength = if (vendroidFile.exists()) vendroidFile.length() else -1L
+        if (cachedLength == 0L || cachedLength > MAX_READ_BYTES) {
+            VDELog.w("HTTP", "Cached vencord.js is unusable ($cachedLength bytes), discarding")
             vendroidFile.delete()
             invalidateBundleCache(sPrefs)
         }

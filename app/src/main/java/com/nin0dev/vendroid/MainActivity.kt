@@ -1,6 +1,7 @@
 package com.nin0dev.vendroid
 
 import android.annotation.SuppressLint
+import android.app.Dialog
 import android.content.Context
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.view.WindowCompat
@@ -36,6 +37,16 @@ import androidx.core.content.edit
 class MainActivity : AppCompatActivity() {
     private var wvInitialized = false
     private var prewarmUsed = false
+    // WebView threading model (read before touching wv or its callbacks):
+    //  - All access is on the UI thread. onDestroy nulls wv right after
+    //    destroy(), and since callbacks also run on the UI thread, nothing
+    //    can observe the gap: wv != null means the WebView is alive.
+    //  - Entry checks like "val w = wv ?: return" are the destroy-guards;
+    //    try/catch IllegalStateException elsewhere is only defense-in-depth.
+    //  - A destroyed WebView may still deliver pending evaluateJavascript
+    //    results (null or stale). A callback holding a captured instance must
+    //    re-check this field before calling into it; see the probe callback
+    //    in injectVencordAttempt and showDiscordToast.
     private var wv: WebView? = null
 
     /** Cached URL for bridge-thread safety: updated on the UI thread and read
@@ -79,6 +90,32 @@ class MainActivity : AppCompatActivity() {
     /** Public so the WebView/JS layers can schedule/dismiss the loading screen
      *  directly without a pass-through facade on the activity. */
     val loadingScreen: LoadingScreenManager get() = loadingScreenManager
+
+    // Dialogs created by this activity (risk warning, link popup, asset
+    // editors). UI-thread only, like wv.
+    private val managedDialogs = mutableListOf<Dialog>()
+
+    /** Registers a dialog for teardown in onDestroy. Call before [Dialog.show]. */
+    fun registerDialog(dialog: Dialog) {
+        managedDialogs.add(dialog)
+    }
+
+    /** Drops a dialog whose dismiss listener has run. */
+    fun unregisterDialog(dialog: Dialog) {
+        managedDialogs.remove(dialog)
+    }
+
+    private fun dismissManagedDialogs() {
+        // Snapshot: dismiss listeners (posted) call unregisterDialog.
+        for (dialog in managedDialogs.toList()) {
+            try {
+                if (dialog.isShowing) dialog.dismiss()
+            } catch (t: Throwable) {
+                VDELog.w("Main", "Dialog dismiss failed during teardown: $t")
+            }
+        }
+        managedDialogs.clear()
+    }
 
     private val fetchExecutor = Executors.newSingleThreadExecutor()
 
@@ -148,7 +185,12 @@ class MainActivity : AppCompatActivity() {
             }
             .setNegativeButton(android.R.string.cancel) { _, _ -> finish() }
             .create()
-        dialog.setOnDismissListener { if (!sPrefs.getBoolean("riskWarningAccepted", false)) finish() }
+        dialog.setOnDismissListener {
+            // Teardown dismissal must not re-enter finish() on a dying activity.
+            if (isFinishing || isDestroyed) return@setOnDismissListener
+            if (!sPrefs.getBoolean("riskWarningAccepted", false)) finish()
+        }
+        registerDialog(dialog)
         dialog.show()
     }
 
@@ -327,42 +369,28 @@ class MainActivity : AppCompatActivity() {
     }
 
     /** Loads the Vencord runtimes (bridge + JS bundle) unless safe mode is
-     *  on. */
+     *  active. Keyed on the kill switch OR the pref: the pref is reset by this
+     *  branch's first run, so a mid-session activity recreation (dark-mode
+     *  toggle, not covered by configChanges) must not fall through and
+     *  re-publish the on-disk bundle.
+     *
+     *  Runs on the UI thread; disk I/O is delegated to
+     *  [loadVencordRuntimesFromDisk]. */
     private fun loadVencordRuntimes(sPrefs: SharedPreferences, editor: SharedPreferences.Editor) {
-        if (!sPrefs.getBoolean("safeMode", false)) {
+        if (!HttpClient.vencordDisabled && !sPrefs.getBoolean("safeMode", false)) {
             vencordNative = VencordNative(WeakReference(this), wv!!)
             wv?.addJavascriptInterface(vencordNative, "VencordMobileNative")
-            // These reads are usually no-ops because VendroidApp.onCreate()
-            // already loaded them on a background thread. They remain a safety
-            // net for process-death paths where the Application is recreated.
-            if (HttpClient.VencordMobileRuntime == null) {
-                resources.openRawResource(R.raw.vencord_mobile).use { inputStream ->
-                    HttpClient.setVencordMobileRuntime(HttpClient.readAsText(inputStream))
-                }
-            }
-            val vendroidFile = File(filesDir, "vencord.js")
-            val fileContent: String? = if (HttpClient.VencordRuntime == null) {
-                // Skip the cached file while a redownload is pending so the
-                // stale bundle is never published; fetchVencord installs a
-                // fresh one or loads this file from its own offline fallback.
-                // Freshness bookkeeping lives in HttpClient alone.
-                if (!HttpClient.needsBundleRedownload(sPrefs) && vendroidFile.exists()) {
-                    try { HttpClient.readBundleFromDisk(sPrefs, vendroidFile) }
-                    catch (e: Exception) { VDELog.e("Main", "Failed to read vendroidFile", e); null }
-                } else null
-            } else null
-            fileContent?.let {
-                synchronized(vencordRuntimeLock) {
-                    // readBundleFromDisk already applied patches if needed, so
-                    // this is just a synchronized publish of the ready bundle.
-                    if (HttpClient.VencordRuntime == null) {
-                        try {
-                            HttpClient.setVencordRuntime(it)
-                        } catch (e: Exception) {
-                            VDELog.e("Main", "publishing Vencord runtime failed", e)
-                        }
-                    }
-                }
+            // Usually a no-op: VendroidApp.onCreate() preloads both runtimes
+            // on a background thread, but a cold start can lose that race with
+            // the preload still mid-read. Never load inline. This is the UI
+            // thread, and reading ~1 MB (plus its SHA-256 hash, plus the regex
+            // pass a stale patch flag triggers) is startup jank at the busiest
+            // point of the launch. Queue the reads on fetchExecutor ahead of
+            // the fetchVencord task below, so the disk read still completes
+            // before the conditional GET and the 304 branch keeps skipping its
+            // re-read.
+            if (HttpClient.VencordRuntime == null || HttpClient.VencordMobileRuntime == null) {
+                loadVencordRuntimesFromDisk(sPrefs)
             }
             val weakSelf = WeakReference(this)
             fetchExecutor.execute {
@@ -375,12 +403,29 @@ class MainActivity : AppCompatActivity() {
                 }
             }
         } else {
+            // Raise the switch and clear anything already in memory. No-ops
+            // after a cold start (VendroidApp did both); load-bearing when
+            // the activity re-enters safe mode in a running process.
+            HttpClient.vencordDisabled = true
+            HttpClient.setVencordRuntime(null)
+            HttpClient.setVencordMobileRuntime(null)
             Toast.makeText(this, "Safe mode enabled, Vencord won't be loaded", Toast.LENGTH_SHORT)
                 .show()
             VDELog.w("Main", "Safe mode enabled — Vencord will not load")
             editor.putBoolean("safeMode", false)
             editor.apply()
         }
+    }
+
+    /** Loads whichever runtimes are still missing, off the UI thread. */
+    private fun loadVencordRuntimesFromDisk(sPrefs: SharedPreferences) {
+        // Capture while the activity is alive; resources/filesDir are not
+        // guaranteed after onDestroy. The body lives in the companion object,
+        // so the queued lambda holds no activity reference.
+        val res = resources
+        val dir = filesDir
+        val weakSelf = WeakReference(this)
+        fetchExecutor.execute { runSafetyNetLoad(sPrefs, res, dir, weakSelf) }
     }
 
     /** Resolves the initial URL from a deep link intent or the last resume
@@ -456,10 +501,10 @@ class MainActivity : AppCompatActivity() {
                 // overwritten by the initial-URL load.
                 pendingDeepLink = url.toString()
             } else if (HttpClient.VencordMobileRuntime == null) {
-                if (getSharedPreferences("settings", Context.MODE_PRIVATE)
-                        .getBoolean("safeMode", false)) {
-                    // Safe mode never loads runtimes, so a deferred link would
-                    // never be consumed. Load it directly via NavigationPolicy.
+                if (HttpClient.vencordDisabled) {
+                    // Safe mode never consumes a deferred link (no runtimes to
+                    // inject), and the pref is already reset by now, so key on
+                    // the session flag. Load directly via NavigationPolicy.
                     VDELog.w("Main", "Safe mode active; loading deep link directly: $url")
                     if (com.nin0dev.vendroid.webview.NavigationPolicy.decide(url, true)
                         == com.nin0dev.vendroid.webview.NavigationPolicy.Action.LOAD_IN_WEBVIEW) {
@@ -548,6 +593,12 @@ class MainActivity : AppCompatActivity() {
     }
 
     override fun onDestroy() {
+        // Dismiss tracked dialogs before anything else. After onDestroy the
+        // framework's window cleanup logs WindowLeaked and removes the views
+        // without running dismiss listeners. SecureWebViewDialog destroys its
+        // WebView only in its dismiss listener, so this is the last point where
+        // the editor WebViews are still destroyable.
+        dismissManagedDialogs()
         // loadingScreenManager is set only once startup passes the first-run
         // risk warning. If the user declines, or the activity is destroyed
         // while the warning is shown, it is never set and must not be touched.
@@ -557,6 +608,8 @@ class MainActivity : AppCompatActivity() {
         wv?.stopLoading()
         wvInitialized = false
         (wv?.parent as? android.view.ViewGroup)?.removeView(wv)
+        // wv is nulled immediately (see the threading-model note on wv):
+        // callbacks flushed after destroy() see null and no-op.
         wv?.destroy()
         wv = null
         if (::vencordNative.isInitialized) vencordNative.shutdown()
@@ -568,6 +621,9 @@ class MainActivity : AppCompatActivity() {
     }
 
     fun injectVencordIfReady() {
+        // Safe mode: never inject. Also covers the fetchVencord caller, which
+        // publishes a downloaded bundle before calling this.
+        if (HttpClient.vencordDisabled) return
         val runtime: String?
         val mobileRuntime: String?
         synchronized(vencordRuntimeLock) {
@@ -591,6 +647,8 @@ class MainActivity : AppCompatActivity() {
      * downloaded mid-session applies on the next navigation instead.
      */
     private fun injectVencordAttempt(runtime: String, mobileRuntime: String, attempt: Int) {
+        // Destroy-guard: after onDestroy, wv == null and the probe eval below
+        // never runs. The probe result callback re-checks liveness itself.
         val w = wv ?: return
         val expectedHost = Uri.parse(currentUrlForBridge ?: return).host
             ?.let { gson.toJson(it) } ?: return
@@ -605,10 +663,19 @@ class MainActivity : AppCompatActivity() {
                 "?(typeof VencordMobile!=='undefined'?'B':'V')" +
                 ":'N'))"
         ) { raw ->
+            // Liveness guard for the whole callback. A destroyed WebView can
+            // still deliver pending eval results; by then wv is null, so
+            // wv !== w and we bail. Covers every WebView call below, including
+            // w.reload(), which is not wrapped in try/catch: on a destroyed
+            // WebView reload() throws NPE inside Chromium on many builds, not
+            // IllegalStateException, so a catch would not contain it.
+            if (wv !== w) return@evaluateJavascript
             when (raw?.trim('"')) {
                 "L", "H" -> {
                     // Still parsing or wrong document; retry briefly, then
                     // give up and let the next navigation restart the flow.
+                    // Safe after destroy: postDelayed on a detached view does
+                    // not throw and the action never runs.
                     if (attempt < INJECT_POLL_MAX_ATTEMPTS) {
                         w.postDelayed({ injectVencordAttempt(runtime, mobileRuntime, attempt + 1) }, 100)
                     }
@@ -693,11 +760,21 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun bootVerify(source: String) {
+        // Destroy-guard (see the threading-model note on wv): return before
+        // the unguarded evaluateJavascript below. isFinishing/isDestroyed
+        // skips the probe once teardown has begun.
         val w = wv ?: return
         if (isFinishing || isDestroyed) return
         val url = currentUrlForBridge ?: return
         val host = Uri.parse(url).host ?: return
         if (!Constants.isDiscordAppOrigin(host)) return
+        // Probing in safe mode would report a healthy boot as failed and
+        // overwrite the crash state that brought the user to recovery.
+        // Record that safe mode ran instead.
+        if (HttpClient.vencordDisabled) {
+            persistSafeModeBootState()
+            return
+        }
         w.evaluateJavascript(BOOT_VERIFY_JS) { raw ->
             val verdict = raw?.let { unquoteJsResult(it) } ?: "no-result"
             val ok = verdict.startsWith("vencord=object") && verdict.contains("|mobile=object")
@@ -722,6 +799,17 @@ class MainActivity : AppCompatActivity() {
             val sPrefs = getSharedPreferences("settings", Context.MODE_PRIVATE)
             val build = sPrefs.getString(HttpClient.PREF_BUNDLE_BUILD, null) ?: "unknown-build"
             val state = (if (ok) "ok" else "fail") + " $build | " + verdict.take(140)
+            if (sPrefs.getString(PREF_LAST_BOOT_STATE, null) == state) return
+            sPrefs.edit().putString(PREF_LAST_BOOT_STATE, state).apply()
+        } catch (_: Exception) {}
+    }
+
+    /** Persists the safe-mode marker for the recovery screen. */
+    private fun persistSafeModeBootState() {
+        try {
+            val sPrefs = getSharedPreferences("settings", Context.MODE_PRIVATE)
+            val build = sPrefs.getString(HttpClient.PREF_BUNDLE_BUILD, null) ?: "unknown-build"
+            val state = "safe-mode (Vencord disabled) $build"
             if (sPrefs.getString(PREF_LAST_BOOT_STATE, null) == state) return
             sPrefs.edit().putString(PREF_LAST_BOOT_STATE, state).apply()
         } catch (_: Exception) {}
@@ -755,5 +843,85 @@ class MainActivity : AppCompatActivity() {
 
         /** Bound on the parse-completion retries in injectVencordAttempt (100ms apart). */
         private const val INJECT_POLL_MAX_ATTEMPTS = 20
+
+        /**
+         * Body of [loadVencordRuntimesFromDisk]. Companion-scoped and internal
+         * so unit tests can drive it synchronously, and so the queued lambda
+         * captures no activity.
+         *
+         * Guards are re-evaluated at execution time: the queue wait can span a
+         * safe-mode re-entry or an invalidateBundleCache() from the JS-bridge
+         * update path. Publishes are compare-and-sets under
+         * [vencordRuntimeLock] because the preload thread may publish the same
+         * content while this task waits; an unconditional set would clobber
+         * it, and make tests that stub the runtimes flaky.
+         */
+        internal fun runSafetyNetLoad(
+            sPrefs: SharedPreferences,
+            res: android.content.res.Resources,
+            dir: File,
+            weakSelf: WeakReference<MainActivity>
+        ) {
+            // Safe mode may have been raised since enqueue; a session that can
+            // never publish should not pay for the reads.
+            if (HttpClient.vencordDisabled) return
+            var published = false
+            try {
+                // 1. Mobile runtime (65 KB raw resource).
+                if (HttpClient.VencordMobileRuntime == null) {
+                    val mobile = res.openRawResource(R.raw.vencord_mobile).use {
+                        HttpClient.readAsText(it)
+                    }
+                    synchronized(vencordRuntimeLock) {
+                        if (!HttpClient.vencordDisabled && HttpClient.VencordMobileRuntime == null) {
+                            HttpClient.setVencordMobileRuntime(mobile)
+                            published = true
+                        }
+                    }
+                }
+                // 2. Main runtime (~1 MB from disk).
+                if (!HttpClient.vencordDisabled && HttpClient.VencordRuntime == null) {
+                    val vendroidFile = File(dir, "vencord.js")
+                    // Skip the cached file while a redownload is pending so the
+                    // stale bundle is never published; fetchVencord installs a
+                    // fresh one or loads this file from its own offline
+                    // fallback. Freshness bookkeeping lives in HttpClient alone.
+                    if (!HttpClient.needsBundleRedownload(sPrefs) && vendroidFile.exists()) {
+                        try {
+                            // readBundleFromDisk patches when the persisted flag
+                            // is stale; the result is ready to publish.
+                            val fileContent = HttpClient.readBundleFromDisk(sPrefs, vendroidFile)
+                            synchronized(vencordRuntimeLock) {
+                                // The vencordDisabled re-check matters: safe
+                                // mode nulls the runtime, so a queued read
+                                // could otherwise publish into a safe-mode
+                                // session.
+                                if (!HttpClient.vencordDisabled && HttpClient.VencordRuntime == null) {
+                                    HttpClient.setVencordRuntime(fileContent)
+                                    published = true
+                                }
+                            }
+                        } catch (e: Exception) {
+                            VDELog.e("Main", "Failed to read vendroidFile", e)
+                        }
+                    }
+                }
+            } catch (e: Exception) {
+                // Shared executor: an uncaught throw here would silently kill
+                // the worker and delay the fetchVencord task queued behind it.
+                VDELog.e("Main", "Vencord runtime safety-net load failed", e)
+            }
+            if (!published) return
+            // Reads are async now, so the first page can finish before this
+            // publish lands: onPageStarted then flags missedInjection and
+            // nothing re-checks until fetchVencord's network path completes.
+            // injectVencordIfReady is idempotent; it injects into the live
+            // document, or reloads once via the missedInjection branch when
+            // the page booted without the runtimes.
+            val act = weakSelf.get()
+            if (act != null && !act.isFinishing && !act.isDestroyed) {
+                act.runOnUiThread { act.injectVencordIfReady() }
+            }
+        }
     }
 }

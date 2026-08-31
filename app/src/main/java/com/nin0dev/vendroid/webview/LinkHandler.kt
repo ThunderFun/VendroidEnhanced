@@ -8,6 +8,7 @@ import android.content.Intent
 import android.net.Uri
 import android.widget.Toast
 import com.google.android.material.dialog.MaterialAlertDialogBuilder
+import com.nin0dev.vendroid.MainActivity
 import com.nin0dev.vendroid.R
 import java.lang.ref.WeakReference
 
@@ -72,6 +73,12 @@ class LinkHandler(context: Context) {
                 }
             }
             .create()
+        // Tracked so activity teardown dismisses it instead of leaking the window.
+        val main = activity as? MainActivity
+        if (main != null) {
+            main.registerDialog(dialog)
+            dialog.setOnDismissListener { main.unregisterDialog(dialog) }
+        }
         dialog.show()
     }
 

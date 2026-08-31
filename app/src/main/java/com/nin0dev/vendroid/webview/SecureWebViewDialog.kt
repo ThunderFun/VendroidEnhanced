@@ -5,6 +5,7 @@ import android.app.Dialog
 import android.graphics.Color
 import android.webkit.WebSettings
 import android.webkit.WebView
+import com.nin0dev.vendroid.MainActivity
 
 /**
  * Helper for building a full-screen, black-themed dialog that hosts a
@@ -28,16 +29,26 @@ import android.webkit.WebView
 
     /**
      * Creates a full-screen black dialog hosting [wv]. The dialog is
-     * cancelable and destroys [wv] on dismissal. [onDismiss] is invoked after
-     * the WebView is destroyed (e.g. to reset an "active" flag). Callers must
+     * cancelable and destroys [wv] on dismissal; [onDismiss] is invoked after
+     * the WebView is destroyed (e.g. to reset an "active" flag). When
+     * [activity] is a [MainActivity] the dialog is registered there, so a
+     * destroy while showing dismisses it and runs this listener. Callers must
      * call [Dialog.show] and load the asset HTML themselves.
-     */    fun create(activity: Activity, wv: WebView, onDismiss: (() -> Unit)? = null): Dialog =
-        Dialog(activity, android.R.style.Theme_Black_NoTitleBar_Fullscreen).apply {
+     */
+    fun create(activity: Activity, wv: WebView, onDismiss: (() -> Unit)? = null): Dialog {
+        val mainActivity = activity as? MainActivity
+        return Dialog(activity, android.R.style.Theme_Black_NoTitleBar_Fullscreen).apply {
             setContentView(wv)
             setCancelable(true)
             setOnDismissListener {
-                wv.destroy()
-                onDismiss?.invoke()
+                try {
+                    wv.destroy()
+                } finally {
+                    onDismiss?.invoke()
+                    mainActivity?.unregisterDialog(this)
+                }
             }
+            mainActivity?.registerDialog(this)
         }
+    }
 }

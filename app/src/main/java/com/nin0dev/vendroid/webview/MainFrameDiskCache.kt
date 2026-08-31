@@ -233,7 +233,7 @@ import kotlin.concurrent.withLock
                     headers[k] = String(dec.decode(vEnc), Charsets.UTF_8)
                 } catch (_: Exception) {}
             }
-            if (headers.isEmpty()) headers["Content-Type"] = "text/html"
+            if (headers.isEmpty()) headers["content-type"] = "text/html"
             CachedMainFrame(body, reason, headers, fetchedAt)
         } catch (e: Exception) {
             VDELog.d("MainFrameDiskCache", "read failed: ${e.message}")

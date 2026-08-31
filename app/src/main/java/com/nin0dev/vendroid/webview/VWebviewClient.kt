@@ -6,11 +6,14 @@ import android.graphics.Bitmap
 import android.net.Uri
 import android.os.Build
 import android.util.LruCache
+import android.webkit.CookieManager
 import android.webkit.WebResourceRequest
 import android.webkit.WebResourceResponse
 import android.webkit.WebView
 import android.webkit.WebViewClient
 import androidx.annotation.RequiresApi
+import androidx.webkit.WebResourceResponseCompat
+import androidx.webkit.WebViewFeature
 import com.nin0dev.vendroid.BuildConfig
 import com.nin0dev.vendroid.utils.Constants
 import com.nin0dev.vendroid.utils.FirewallConfig
@@ -115,9 +118,13 @@ class VWebviewClient(
     ): String? {
         val headIdx = findHeadCloseIndex(text)
         if (headIdx < 0) return null
+        // Gate on the local snapshot, not isMainFrameRuntimeReady(): a re-read
+        // of the statics here could race a mid-session null (clientMod switch)
+        // against the !! uses below.
         val runtime = HttpClient.VencordRuntime
         val mobileRuntime = HttpClient.VencordMobileRuntime
-        val runtimeReady = isDiscordMainFrame && runtime != null && mobileRuntime != null
+        val runtimeReady = isDiscordMainFrame && !HttpClient.vencordDisabled &&
+            runtime != null && mobileRuntime != null
         val sb = StringBuilder(text.length + (runtime?.length ?: 0) + (mobileRuntime?.length ?: 0) + 256)
         sb.append(text, 0, headIdx)
         sb.append(disableHighlightTag)
@@ -182,9 +189,16 @@ class VWebviewClient(
         return sb.toString()
     }
 
-    /** True when both Vencord runtimes are in memory. Shared by the network path,
-     *  the disk-serve path, and [onPageStarted] so they agree on readiness. */    private fun isMainFrameRuntimeReady(): Boolean =
-        HttpClient.VencordRuntime != null && HttpClient.VencordMobileRuntime != null
+    /**
+     * The single Vencord injection gate: safe mode off and both runtimes in
+     * memory. Shared by the network, disk-serve, and [onPageStarted] paths so
+     * they agree on readiness. Callers holding local snapshots gate on
+     * [HttpClient.vencordDisabled] directly instead (see [injectFirewallAndCss]).
+     */
+    private fun isMainFrameRuntimeReady(): Boolean =
+        !HttpClient.vencordDisabled &&
+            HttpClient.VencordRuntime != null &&
+            HttpClient.VencordMobileRuntime != null
 
     /**
      * Finds the real closing `</head>`, skipping matches inside raw-text
@@ -253,7 +267,7 @@ class VWebviewClient(
             if (!Constants.isDiscordAppOrigin(host)) return@evaluateJavascript
             val runtime = HttpClient.VencordRuntime
             val mobileRuntime = HttpClient.VencordMobileRuntime
-            if (runtime != null && mobileRuntime != null) {
+            if (!HttpClient.vencordDisabled && runtime != null && mobileRuntime != null) {
                 // Evaluate separately to avoid building a ~1 MB string on the UI
                 // thread. The capability-token bootstrap must run first so the
                 // token is in scope (closure-captured, not a window global)
@@ -267,7 +281,9 @@ class VWebviewClient(
                 }
                 VDELog.i("WV", "Runtime injected via bridge for ${UrlNormalizer.redactForLog(url)}")
                 activity.scheduleBootVerify("page-start-eval")
-            } else {
+            } else if (!HttpClient.vencordDisabled) {
+                // Only meaningful while a runtime could still arrive this
+                // session; safe mode never publishes one.
                 activity.missedInjection = true
             }
         }
@@ -377,12 +393,16 @@ class VWebviewClient(
             }
         }
 
-        // A stale-served main frame is always HTML (the raw shell). Serve a clean
-        // "text/html" MIME; the charset goes in the "encoding" arg, not the MIME.
+        // A stale-served main frame is always HTML (the raw shell). Serve a
+        // clean "text/html" MIME; the charset goes in the "encoding" arg, not
+        // the MIME. Header reads are case-insensitive because entries
+        // persisted by older builds keep the server's wire casing (lowercase
+        // on HTTP/2, Title-Case on HTTP/1.1); an exact-case miss here silently
+        // dropped CSP/HSTS from stale serves of HTTP/2-fetched shells.
         val ct = "text/html"
-        val csp = shell.headers["Content-Security-Policy"]
-        val cspRo = shell.headers["Content-Security-Policy-Report-Only"]
-        val hsts = shell.headers["Strict-Transport-Security"]
+        val csp = ResponseHeaderMerge.valueFor(shell.headers, "content-security-policy")
+        val cspRo = ResponseHeaderMerge.valueFor(shell.headers, "content-security-policy-report-only")
+        val hsts = ResponseHeaderMerge.valueFor(shell.headers, "strict-transport-security")
         return WebResourceResponse(
             ct, "utf-8", 200, shell.reasonPhrase,
             buildStaleHeaders(bodyBytes.size, ct, csp, cspRo, hsts),
@@ -403,11 +423,11 @@ class VWebviewClient(
         hsts: String?
     ): Map<String, String> {
         val headers = HashMap<String, String>()
-        headers["Content-Type"] = contentType
-        headers["Content-Length"] = bodySize.toString()
-        if (csp != null) headers["Content-Security-Policy"] = csp
-        if (cspReportOnly != null) headers["Content-Security-Policy-Report-Only"] = cspReportOnly
-        if (hsts != null) headers["Strict-Transport-Security"] = hsts
+        headers["content-type"] = contentType
+        headers["content-length"] = bodySize.toString()
+        if (csp != null) headers["content-security-policy"] = csp
+        if (cspReportOnly != null) headers["content-security-policy-report-only"] = cspReportOnly
+        if (hsts != null) headers["strict-transport-security"] = hsts
         return headers
     }
 
@@ -486,6 +506,13 @@ class VWebviewClient(
     ): Response? {
         if (depth >= 3) return response
         if (response.code !in 300..399) return response
+        // Chromium would have applied this hop's Set-Cookie natively. Login
+        // flows commonly set session cookies on a 302 before redirecting, so
+        // replay each into the cookie store, scoped to the hop's own URL (the
+        // store enforces domain/path against it). Idempotent with the
+        // final-response delivery in [fetchAndProcessResponse] when the chain
+        // ends on this response.
+        harvestRedirectCookies(response)
         val location = response.header("Location") ?: return response
         val resolved = response.request.url.resolve(location) ?: return response
         val target = resolved.toString()
@@ -579,9 +606,12 @@ class VWebviewClient(
                             runtimeEmbeddedUrls.add(urlString)
                         }
                     }
+                    // Cached headers are already lowercase (fetch path
+                    // canonicalizes); the puts below replace in place rather
+                    // than adding a second, mixed-case line.
                     val headers = HashMap(cached.headers)
-                    headers["Content-Type"] = "text/html"
-                    headers["Content-Length"] = serveBytes.size.toString()
+                    headers["content-type"] = "text/html"
+                    headers["content-length"] = serveBytes.size.toString()
                     return WebResourceResponse(
                         "text/html", "utf-8", cached.statusCode, cached.reasonPhrase,
                         headers, ByteArrayInputStream(serveBytes)
@@ -619,6 +649,30 @@ class VWebviewClient(
         } finally {
             // Close to return the pooled connection (not disconnect()).
             response?.close()
+        }
+    }
+
+    /**
+     * Redirect hops' Set-Cookie headers never reach Chromium on the app-
+     * followed chain (only the final response is served). Replay each into
+     * the store; full Set-Cookie strings (HttpOnly/SameSite/Expires) are
+     * parsed by the store's own cookie parser. Values that could not occur
+     * on the wire (NUL, newline) are dropped so a malformed header cannot
+     * poison the store. HSTS from hops has no public setter and is accepted
+     * as a gap; the final response's HSTS still applies normally.
+     */
+    private fun harvestRedirectCookies(response: Response) {
+        val hopUrl = response.request.url.toString()
+        var applied = 0
+        for ((name, value) in response.headers) {
+            if (!name.equals("set-cookie", ignoreCase = true)) continue
+            if (value.none { it == '\u0000' || it == '\n' }) {
+                CookieManager.getInstance().setCookie(hopUrl, value)
+                applied++
+            }
+        }
+        if (applied > 0) {
+            VDELog.d("WV", "Applied $applied redirect-hop cookie(s) for ${UrlNormalizer.redactForLog(hopUrl)}")
         }
     }
 
@@ -743,6 +797,9 @@ class VWebviewClient(
 
         val statusCode = response.code
 
+        // Fold duplicate header names (see ResponseHeaderMerge); Set-Cookie
+        // values are diverted to setCookies and re-attached below.
+        val setCookies = ArrayList<String>(2)
         val modifiedHeaders = HashMap<String, String>(response.headers.size.coerceAtLeast(16))
         for ((key, value) in response.headers) {
             val lowerKey = key.lowercase()
@@ -750,22 +807,22 @@ class VWebviewClient(
                 if (BuildConfig.ENFORCE_STRICT_CSP) {
                     // Enforce the strict policy; the browser itself blocks
                     // exfiltration (connect-src) to non-allowlisted hosts.
-                    modifiedHeaders[key] = buildVencordCompatibleCsp()
+                    modifiedHeaders["content-security-policy"] = buildVencordCompatibleCsp()
                 } else {
                     // Report-only: keep the enforced policy loose and attach the
                     // strict policy as Report-Only to collect violations first.
                     val stripped = stripVencordIncompatibleCsp(value)
-                    if (stripped.isNotEmpty()) modifiedHeaders[key] = stripped
+                    if (stripped.isNotEmpty()) modifiedHeaders["content-security-policy"] = stripped
                     if (isMainFrame) {
-                        modifiedHeaders["Content-Security-Policy-Report-Only"] = buildVencordCompatibleCsp()
+                        modifiedHeaders["content-security-policy-report-only"] = buildVencordCompatibleCsp()
                     }
                 }
                 continue
             }
             if (isDiscordDomain && lowerKey == "content-security-policy-report-only") continue
-            modifiedHeaders[key] = value
+            ResponseHeaderMerge.merge(modifiedHeaders, setCookies, lowerKey, value)
         }
-        if (isCss) modifiedHeaders["Content-Type"] = "text/css"
+        if (isCss) modifiedHeaders["content-type"] = "text/css"
         val reasonPhrase = response.message.takeIf { it.isNotEmpty() } ?: "OK"
 
         // A Discord main frame is always HTML. OkHttp's transparent gzip decode
@@ -775,14 +832,12 @@ class VWebviewClient(
         // (charset goes in the separate "encoding" arg — putting it in the MIME
         // makes WebView render the document as plain text).
         if (isDiscordDomain && isMainFrame && statusCode in 200..299) {
-            modifiedHeaders["Content-Type"] = "text/html"
-            modifiedHeaders.remove("Content-Encoding")
+            modifiedHeaders["content-type"] = "text/html"
             modifiedHeaders.remove("content-encoding")
-            modifiedHeaders.remove("Content-Length")
             modifiedHeaders.remove("content-length")
         }
         // Re-read so the served MIME and the injection gate both see "text/html".
-        val effectiveContentType = modifiedHeaders.getOrDefault("Content-Type", "application/octet-stream")
+        val effectiveContentType = modifiedHeaders.getOrDefault("content-type", "application/octet-stream")
 
         // OkHttp has no errorStream; byteStream() yields the error page for 4xx/5xx
         // and an empty stream for no-body responses (204/304/HEAD). Read once for
@@ -800,9 +855,7 @@ class VWebviewClient(
         } catch (_: Exception) {
             // Serving fewer bytes than Content-Length promises makes Chromium
             // wait for bytes that never arrive — drop the framing headers.
-            modifiedHeaders.remove("Content-Length")
             modifiedHeaders.remove("content-length")
-            modifiedHeaders.remove("Content-Encoding")
             modifiedHeaders.remove("content-encoding")
             ByteArray(0)
         }
@@ -814,7 +867,7 @@ class VWebviewClient(
         // revalidate on a later cold start. Injection is applied at serve time
         // with the current firewall config, so only app-shell routes qualify.
         if (isDiscordDomain && isMainFrame && statusCode in 200..299 && bodyBytes.isNotEmpty()) {
-            val ctLower = (modifiedHeaders.getOrDefault("Content-Type", "")).lowercase()
+            val ctLower = (modifiedHeaders.getOrDefault("content-type", "")).lowercase()
             if (ctLower.contains("text/html")) {
                 // bodyBytes is still raw here; injection happens below. Persist
                 // off the network thread with the sanitized headers so a stale
@@ -834,7 +887,7 @@ class VWebviewClient(
         // document time instead of blocking the UI thread on a ~1 MB
         // evaluateJavascript round-trip.
         if (isDiscordDomain && isMainFrame && statusCode in 200..299 && bodyBytes.isNotEmpty()) {
-            val ctLower = (modifiedHeaders.getOrDefault("Content-Type", "")).lowercase()
+            val ctLower = (modifiedHeaders.getOrDefault("content-type", "")).lowercase()
             if (ctLower.contains("text/html")) {
                 try {
                     val text = bodyBytes.toString(Charsets.UTF_8)
@@ -842,8 +895,7 @@ class VWebviewClient(
                     val patched = injectFirewallAndCss(text, urlString, isDiscordMainFrame = isDiscordDomain)
                     if (patched != null && patched !== text) {
                         bodyBytes = patched.toByteArray(Charsets.UTF_8)
-                        modifiedHeaders["Content-Length"] = bodyBytes.size.toString()
-                        modifiedHeaders.remove("Content-Encoding")
+                        modifiedHeaders["content-length"] = bodyBytes.size.toString()
                         modifiedHeaders.remove("content-encoding")
                         // Record the embedded URL so onPageStarted can skip
                         // re-injection. On overflow, clear so a new navigation
@@ -868,19 +920,13 @@ class VWebviewClient(
             // the next serve. THEME_CSS has no injected content, so it caches
             // the final bytes.
             val bytesToCache = if (cacheTarget == CacheTarget.MAIN_FRAME) rawBodyBytes else bodyBytes
-            // Strip Set-Cookie from the cached headers (live serve keeps it for
-            // session/login). A cached replay would resurrect an old token
-            // (zombie session) or cross accounts on a shared device.
-            val headersToCache = if (cacheTarget == CacheTarget.MAIN_FRAME) {
-                HashMap(modifiedHeaders).apply {
-                    remove("Content-Length"); remove("content-length")
-                    remove("Content-Encoding"); remove("content-encoding")
-                    remove("Set-Cookie"); remove("set-cookie")
-                }
-            } else {
-                HashMap(modifiedHeaders).apply {
-                    remove("Set-Cookie"); remove("set-cookie")
-                }
+            // Set-Cookie never enters modifiedHeaders (diverted to setCookies),
+            // so cached headers are cookie-free by construction. A cached
+            // replay cannot resurrect an old token (zombie session) or cross
+            // accounts on a shared device.
+            val headersToCache = HashMap(modifiedHeaders).apply {
+                remove("content-length")
+                remove("content-encoding")
             }
             val entry = CachedResponse(statusCode, reasonPhrase, headersToCache, bytesToCache)
             when (cacheTarget) {
@@ -901,7 +947,55 @@ class VWebviewClient(
             }
         }
 
+        if (setCookies.isNotEmpty()) {
+            val responseUrl = response.request.url.toString()
+            if (isMultiCookieChannelSupported()) {
+                // Chromium M138+ splits the androidx wrapper's NUL-joined value
+                // into real Set-Cookie headers, so every cookie survives with
+                // full attribute fidelity (HttpOnly, SameSite, Expires).
+                try {
+                    val compat = WebResourceResponseCompat(
+                        effectiveContentType, "utf-8", statusCode, reasonPhrase,
+                        modifiedHeaders, ByteArrayInputStream(bodyBytes)
+                    )
+                    compat.setCookies(setCookies)
+                    return compat.toWebResourceResponse()
+                } catch (_: Exception) {
+                    // Glue failure; fall through to the CookieManager path.
+                }
+            }
+            // Without the multivalue channel the flat map can carry only one
+            // Set-Cookie, and comma-joining corrupts Expires dates. Replay
+            // each into the cookie store, scoped to the final response URL.
+            // setCookie is void, so a store that refuses a cookie logs nothing
+            // here; the delivery log below still shows what was attempted.
+            for (cookie in setCookies) {
+                CookieManager.getInstance().setCookie(responseUrl, cookie)
+            }
+            VDELog.d("WV", "Delivered ${setCookies.size} Set-Cookie header(s) for ${UrlNormalizer.redactForLog(responseUrl)}")
+        }
+
         return WebResourceResponse(effectiveContentType, "utf-8", statusCode, reasonPhrase, modifiedHeaders, ByteArrayInputStream(bodyBytes))
+    }
+
+    /**
+     * The multivalue Set-Cookie channel needs Chromium M138+ glue. The
+     * provider's COOKIE_INTERCEPT feature report is ground truth; OEM
+     * WebViews vary and version strings are unreliable. Support is fixed for
+     * the process lifetime once WebView is loaded, so the check is cached.
+     */
+    @Volatile
+    private var multiCookieChannel: Boolean? = null
+
+    private fun isMultiCookieChannelSupported(): Boolean {
+        multiCookieChannel?.let { return it }
+        val supported = try {
+            WebViewFeature.isFeatureSupported(WebViewFeature.COOKIE_INTERCEPT)
+        } catch (_: Exception) {
+            false
+        }
+        multiCookieChannel = supported
+        return supported
     }
 
     companion object {
