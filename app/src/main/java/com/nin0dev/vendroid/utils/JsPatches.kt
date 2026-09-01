@@ -12,6 +12,15 @@ object JsPatches {
      * SW fetch events are still intercepted at the Android layer by
      * ServiceWorkerClientCompat.
      *
+     * Scheme semantics: https/wss are judged by host allowlist; blob: by the
+     * host of its inner URL, because blob: itself parses with an empty host.
+     * data: fetches are inert local decodes and pass, except in the Worker
+     * constructor, where they could run code no wrapper sees. All other
+     * schemes (http, ws, file, about:, custom) fail closed, matching the
+     * native shouldBlockUri gate; blob: workers are allowed on purpose (the
+     * CSP worker-src 'self' blob: expects them). Relative URLs resolve
+     * against location.href.
+     *
      * Best-effort defense-in-depth: it does not wrap RTCPeerConnection (WebRTC
      * bypasses it), and the idempotency markers (__vendroidFw etc.) are writable
      * window globals, so earlier script can neuter it. The native
@@ -56,16 +65,27 @@ object JsPatches {
             "window.__vendroidFw=1;" +
             "var a=$arr;" +
             "function ok(h){for(var i=0;i<a.length;i++){var e=a[i];if(h===e||h.endsWith(e))return true;if(e.charCodeAt(0)===46&&h===e.slice(1))return true;}return false;}" +
-            // Normalize string/Request/URL args so the allowlist can't be bypassed.
-            "function g(u){if(typeof u==='string')return u;try{if(u&&u.url&&(u instanceof Request||u instanceof URL))return u.url;}catch(e){}return null;}" +
-            "function bad(u){var s=g(u);if(s===null)return false;try{return !ok(new URL(s).host);}catch(e){return false;}}" +
+            // Normalize args so the allowlist can't be bypassed. URL objects
+            // expose .href, not .url; other objects are stringified the same
+            // way the fetch spec coerces them.
+            "function g(u){if(typeof u==='string')return u;try{if(u instanceof Request)return u.url;if(u instanceof URL)return u.href;}catch(e){}try{return String(u);}catch(e){}return null;}" +
+            // w truthy = Worker context. blob: has an empty host (opaque path),
+            // so it is judged by the inner URL. data: fetches are inert but
+            // data: workers execute code, so they stay blocked. Unparseable
+            // strings fail open.
+            "function bad(u,w){var s=g(u);if(s===null)return false;var p;try{p=new URL(s,location.href);}catch(e){return false;}var c=p.protocol;" +
+            "if(c==='blob:'){try{return !ok(new URL(p.pathname).host);}catch(e){return true;}}" +
+            "if(c==='data:')return !!w;" +
+            "if(c!=='https:'&&c!=='wss:')return true;" +
+            "return !ok(p.host);}" +
             // Redact query/fragment so token-bearing URLs never reach the shareable log.
             "function redact(u){if(!u)return u;try{var q=u.indexOf('?'),f=u.indexOf('#'),e=q<0?f:(f<0?q:Math.min(q,f));return e<0?u:u.slice(0,e)+'[...]';}catch(e){return u;}}" +
             "var of=window.fetch;window.fetch=function(u,o){if(bad(u)){console.warn('[Vendroid] Blocked fetch: '+redact(g(u)));return Promise.reject(new TypeError('Blocked by Vendroid firewall'));}return of.apply(this,arguments);};" +
             "var oxo=XMLHttpRequest.prototype.open;XMLHttpRequest.prototype.open=function(m,u){if(bad(u)){console.warn('[Vendroid] Blocked XHR: '+redact(g(u)));throw new TypeError('Blocked by Vendroid firewall');}return oxo.apply(this,arguments);};" +
             "var ow=window.WebSocket;window.WebSocket=function(u,p){if(bad(u)){console.warn('[Vendroid] Blocked WS: '+redact(g(u)));throw new TypeError('Blocked by Vendroid firewall');}return new ow(u,p);};Object.setPrototypeOf(window.WebSocket,ow);window.WebSocket.prototype=ow.prototype;" +
             "if(window.EventSource){var oes=window.EventSource;window.EventSource=function(u,o){if(bad(u)){console.warn('[Vendroid] Blocked ES: '+redact(g(u)));throw new TypeError('Blocked by Vendroid firewall');}return new oes(u,o);};}" +
-            "if(window.Worker){var owr=window.Worker;window.Worker=function(u,o){if(bad(u)){console.warn('[Vendroid] Blocked Worker: '+redact(g(u)));throw new TypeError('Blocked by Vendroid firewall');}return new owr(u,o);};}" +
+            // 1 = Worker context: data: workers stay blocked.
+            "if(window.Worker){var owr=window.Worker;window.Worker=function(u,o){if(bad(u,1)){console.warn('[Vendroid] Blocked Worker: '+redact(g(u)));throw new TypeError('Blocked by Vendroid firewall');}return new owr(u,o);};}" +
             // Wrap sendBeacon too (was silently unwrapped); bind() preserves `this`.
             "if(navigator&&navigator.sendBeacon){var osb=navigator.sendBeacon.bind(navigator);navigator.sendBeacon=function(u,d){if(bad(u)){console.warn('[Vendroid] Blocked Beacon: '+redact(g(u)));return false;}return osb(u,d);};}" +
             "})()"
@@ -115,6 +135,12 @@ object JsPatches {
      * per navigation. Each patch has its own idempotency guard
      * (__vendroidFw, __vendroidAnimCtrl, __vendroidCspReporter), so re-running
      * is safe.
+     *
+     * Fallback path: injectFirewallAndCss embeds the same three patches at
+     * `</head>` and consumeFirewallEmbedded() skips this call when the embed
+     * landed. This string serves pages where no `</head>` was found or the
+     * embed threw. Keep the compositions identical; dropping a patch from
+     * either side silently disables it on that path.
      */
     val STARTUP_PATCHES_JS: String
         get() = NETWORK_FIREWALL_JS + ";" + ANIMATION_PATCH_JS + ";" + CSP_VIOLATION_REPORTER_JS

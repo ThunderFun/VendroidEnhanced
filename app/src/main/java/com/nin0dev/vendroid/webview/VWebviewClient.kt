@@ -95,6 +95,21 @@ class VWebviewClient(
     private val disableHighlightTag = "<style id=\"vendroid-disable-highlight\">$disableHighlightCss</style>"
 
     /**
+     * Result of [injectFirewallAndCss].
+     *
+     * [runtimeEmbedded] reflects the same snapshot that performed the embed,
+     * so it always matches the served HTML. Callers must claim
+     * runtimeEmbeddedUrls from this flag, never from a fresh re-read of the
+     * HttpClient statics: a preload publishing between the embed snapshot and
+     * a re-read would claim runtimes the HTML lacks, and onPageStarted would
+     * then skip its typeof probe and missedInjection recovery.
+     */
+    private class InjectionResult(
+        val html: String?,
+        val runtimeEmbedded: Boolean
+    )
+
+    /**
      * Injects the JS network firewall, CSP violation reporter, disable-highlight
      * CSS, and — when both runtimes are in memory — the Vencord runtimes into a
      * Discord main-frame shell at `</head>`.
@@ -109,26 +124,42 @@ class VWebviewClient(
      * via [escapeScriptTagContent] so a literal `</script>` cannot terminate
      * the inline tag early.
      *
-     * @return the patched HTML, or null if no `</head>` was found or the
-     *   runtime was not ready, so callers fall through to bridge injection.
+     * @return an [InjectionResult] whose [InjectionResult.html] is the patched
+     *   HTML, or null when no `</head>` was found (callers serve the unpatched
+     *   body). A non-null html may still lack the runtime scripts;
+     *   [InjectionResult.runtimeEmbedded] is the embed verdict for that body.
      */    private fun injectFirewallAndCss(
         text: String,
         urlString: String,
         isDiscordMainFrame: Boolean
-    ): String? {
+    ): InjectionResult {
         val headIdx = findHeadCloseIndex(text)
-        if (headIdx < 0) return null
-        // Gate on the local snapshot, not isMainFrameRuntimeReady(): a re-read
-        // of the statics here could race a mid-session null (clientMod switch)
-        // against the !! uses below.
+        if (headIdx < 0) return InjectionResult(null, false)
+        // Gate on the local snapshot, not a fresh static re-read: a re-read of
+        // the statics here could race a mid-session null (clientMod switch)
+        // against the !! uses below. Callers propagate runtimeReady as the
+        // embed verdict (see InjectionResult).
         val runtime = HttpClient.VencordRuntime
         val mobileRuntime = HttpClient.VencordMobileRuntime
         val runtimeReady = isDiscordMainFrame && !HttpClient.vencordDisabled &&
             runtime != null && mobileRuntime != null
-        val sb = StringBuilder(text.length + (runtime?.length ?: 0) + (mobileRuntime?.length ?: 0) + 256)
+        val firewallJs = JsPatches.NETWORK_FIREWALL_JS
+        val animJs = JsPatches.ANIMATION_PATCH_JS
+        val cspJs = JsPatches.CSP_VIOLATION_REPORTER_JS
+        val sb = StringBuilder(
+            text.length + firewallJs.length + animJs.length + cspJs.length +
+                (runtime?.length ?: 0) + (mobileRuntime?.length ?: 0) + 256
+        )
         sb.append(text, 0, headIdx)
         sb.append(disableHighlightTag)
-        sb.append("<script>${JsPatches.NETWORK_FIREWALL_JS};${JsPatches.CSP_VIOLATION_REPORTER_JS}</script>")
+        // Embedded form of STARTUP_PATCHES_JS, so the patches run at parse
+        // time. The payload sets must match: once the embed is recorded,
+        // onPageStarted skips the evaluateJavascript fallback, so a patch
+        // missing from this tag never runs on the common path. The animation
+        // patch was once omitted here, and the background visibility spoof
+        // silently no-opped on every load. These strings go in raw; none may
+        // contain "</script" or "<!--".
+        sb.append("<script>$firewallJs;$animJs;$cspJs</script>")
         if (runtimeReady) {
             sb.append("<script>")
                 .append(escapeScriptTagContent(VencordNative.bridgeBootstrapJs()))
@@ -139,7 +170,7 @@ class VWebviewClient(
                 .append(escapedMobileRuntimeOf(mobileRuntime!!)).append(";</script>")
         }
         sb.append(text, headIdx, text.length)
-        return sb.toString()
+        return InjectionResult(sb.toString(), runtimeReady)
     }
 
     /**
@@ -175,30 +206,23 @@ class VWebviewClient(
      * `</script` (case-insensitive) with `<\/script`. The HTML parser no longer
      * recognizes the closing tag, while `\/` evaluates to `/` at runtime, so JS
      * semantics are unchanged.
+     *
+     * Scans [s] itself with ignoreCase matching, never a lowercased copy:
+     * lowercasing can change string length (İ U+0130 becomes i + U+0307), so
+     * offsets taken from the copy slice [s] at wrong positions, corrupting
+     * the tail or leaving `</script` unescaped.
      */    private fun escapeScriptTagContent(s: String): String {
         if (!s.contains("</script", ignoreCase = true)) return s
         val sb = StringBuilder(s.length + 16)
         var i = 0
-        val lower = s.lowercase()
         while (i < s.length) {
-            val next = lower.indexOf("</script", i)
+            val next = s.indexOf("</script", i, ignoreCase = true)
             if (next < 0) { sb.append(s, i, s.length); break }
             sb.append(s, i, next).append("<\\/script")
             i = next + "</script".length
         }
         return sb.toString()
     }
-
-    /**
-     * The single Vencord injection gate: safe mode off and both runtimes in
-     * memory. Shared by the network, disk-serve, and [onPageStarted] paths so
-     * they agree on readiness. Callers holding local snapshots gate on
-     * [HttpClient.vencordDisabled] directly instead (see [injectFirewallAndCss]).
-     */
-    private fun isMainFrameRuntimeReady(): Boolean =
-        !HttpClient.vencordDisabled &&
-            HttpClient.VencordRuntime != null &&
-            HttpClient.VencordMobileRuntime != null
 
     /**
      * Finds the real closing `</head>`, skipping matches inside raw-text
@@ -344,27 +368,32 @@ class VWebviewClient(
         val cached: MainFrameDiskCache.CachedMainFrame? = inMemoryShell(urlString)
         val shell = cached ?: return null
         val text = try { String(shell.body, Charsets.UTF_8) } catch (_: Exception) { return null }
-        val patched = injectFirewallAndCss(text, urlString, isDiscordMainFrame = true)
-        // If there was no `</head>` or the runtime wasn't ready (patched ==
-        // null), serve the unpatched body and let onPageStarted apply the
-        // scripts via the bridge rather than leaving the shell unpatched.
+        val result = injectFirewallAndCss(text, urlString, isDiscordMainFrame = true)
+        val patched = result.html
+        // No `</head>` (patched == null): serve the unpatched body and let
+        // onPageStarted apply the scripts via the bridge.
         val bodyBytes = (patched ?: text).toByteArray(Charsets.UTF_8)
-        val runtimeEmbedded = patched != null && isMainFrameRuntimeReady()
 
         // Record that this URL's HTML already has the firewall/runtime
         // embedded so onPageStarted skips re-injecting them. Only claim
         // "embedded" when it actually was — otherwise onPageStarted would skip
         // its evaluateJavascript fallback and the page would run with no JS
         // firewall (fail-open). On overflow, clear so a new navigation is
-        // still tracked.
+        // still tracked. The removes drop claims stranded by a load aborted
+        // between shouldInterceptRequest and onPageStarted: the next visit to
+        // this URL must not consume a claim for a body that lacks the scripts.
         if (patched != null) {
             if (firewallEmbeddedUrls.size >= MAX_FIREWALL_TRACKED) firewallEmbeddedUrls.clear()
             firewallEmbeddedUrls.add(urlString)
+        } else {
+            firewallEmbeddedUrls.remove(urlString)
         }
-        if (runtimeEmbedded) {
+        if (result.runtimeEmbedded) {
             if (runtimeEmbeddedUrls.size >= MAX_RUNTIME_TRACKED) runtimeEmbeddedUrls.clear()
             runtimeEmbeddedUrls.add(urlString)
             VDELog.i("WV", "Embedded Vencord runtime into stale main frame: ${UrlNormalizer.redactForLog(urlString)}")
+        } else {
+            runtimeEmbeddedUrls.remove(urlString)
         }
         // Background revalidate; skip if one is already in flight for this URL.
         if (revalidatingUrls.add(urlString)) {
@@ -490,9 +519,14 @@ class VWebviewClient(
      * All hops must be https and pass the privacy filter. Credential-bearing
      * headers are never forwarded to a different origin.
      *
-     * Returns the final (non-redirect) [Response], the 3xx itself when it
-     * cannot be followed (no Location, loop, or depth limit), or null when a
-     * hop is rejected by the allowlist (caller serves a blocking response).
+     * Returns the final (non-redirect) [Response], or null when the chain
+     * cannot proceed: a hop rejected by the allowlist, a redirect loop, a
+     * missing/unresolvable Location, or the depth limit (a 4th redirect
+     * response). The caller turns null into a blocking response, so a 3xx is
+     * never served as the resource. Chromium treats intercepted responses as
+     * final and does not follow their Location; serving one would render the
+     * redirect body (typically empty) as the page and pass its unvalidated
+     * Location header to Chromium.
      *
      * [response] is owned by the caller; this method never closes it. It
      * closes any intermediate responses it allocates while following.
@@ -504,19 +538,21 @@ class VWebviewClient(
         depth: Int,
         seen: MutableSet<String>
     ): Response? {
-        if (depth >= 3) return response
         if (response.code !in 300..399) return response
         // Chromium would have applied this hop's Set-Cookie natively. Login
         // flows commonly set session cookies on a 302 before redirecting, so
         // replay each into the cookie store, scoped to the hop's own URL (the
-        // store enforces domain/path against it). Idempotent with the
-        // final-response delivery in [fetchAndProcessResponse] when the chain
-        // ends on this response.
+        // store enforces domain/path against it). Runs for every 3xx response.
+        // A blocked one never reaches fetchAndProcessResponse, so this is its
+        // only delivery path. resolveRedirects validates each hop URL before
+        // fetching it, so replays never target an unvalidated host.
         harvestRedirectCookies(response)
-        val location = response.header("Location") ?: return response
-        val resolved = response.request.url.resolve(location) ?: return response
+        // Depth limit: a 4th redirect is never served (see KDoc).
+        if (depth >= 3) return null
+        val location = response.header("Location") ?: return null
+        val resolved = response.request.url.resolve(location) ?: return null
         val target = resolved.toString()
-        if (!seen.add(target)) return response  // redirect loop guard
+        if (!seen.add(target)) return null  // redirect loop → block
 
         if (resolved.scheme != "https") return null
         val resolvedHost = resolved.host ?: return null  // fail closed on unresolvable host
@@ -596,15 +632,22 @@ class VWebviewClient(
                     // as the disk cache). This way a tightened firewall applies
                     // on the very next serve instead of serving a stale embed.
                     val text = String(cached.body, Charsets.UTF_8)
-                    val patched = injectFirewallAndCss(text, urlString, isDiscordMainFrame = true)
+                    val result = injectFirewallAndCss(text, urlString, isDiscordMainFrame = true)
+                    val patched = result.html
                     val serveBytes = (patched ?: text).toByteArray(Charsets.UTF_8)
+                    // Snapshot verdict and stranded-claim removes; see
+                    // InjectionResult and serveStaleMainFrame.
                     if (patched != null) {
                         if (firewallEmbeddedUrls.size >= MAX_FIREWALL_TRACKED) firewallEmbeddedUrls.clear()
                         firewallEmbeddedUrls.add(urlString)
-                        if (isMainFrameRuntimeReady()) {
-                            if (runtimeEmbeddedUrls.size >= MAX_RUNTIME_TRACKED) runtimeEmbeddedUrls.clear()
-                            runtimeEmbeddedUrls.add(urlString)
-                        }
+                    } else {
+                        firewallEmbeddedUrls.remove(urlString)
+                    }
+                    if (result.runtimeEmbedded) {
+                        if (runtimeEmbeddedUrls.size >= MAX_RUNTIME_TRACKED) runtimeEmbeddedUrls.clear()
+                        runtimeEmbeddedUrls.add(urlString)
+                    } else {
+                        runtimeEmbeddedUrls.remove(urlString)
                     }
                     // Cached headers are already lowercase (fetch path
                     // canonicalizes); the puts below replace in place rather
@@ -632,9 +675,10 @@ class VWebviewClient(
             val rb = okHttpRequestBuilder(req, urlString)
             response = HttpClient.sharedClient.newCall(rb.build()).execute()
             // Redirects are not auto-followed; resolve 3xx manually through the
-            // allowlist gate. Null means a hop was rejected → block. Seed the
-            // loop guard with the original URL so a self-3xx host doesn't add
-            // an extra hop before the loop is detected.
+            // allowlist gate. Null means the chain never reached a final
+            // response. Seed the loop guard with the original URL so a
+            // self-3xx host doesn't add an extra hop before the loop is
+            // detected.
             val resolved = resolveRedirects(req, response, urlString, 0, hashSetOf(urlString))
             if (resolved == null) {
                 return blockedResponse()
@@ -660,6 +704,9 @@ class VWebviewClient(
      * on the wire (NUL, newline) are dropped so a malformed header cannot
      * poison the store. HSTS from hops has no public setter and is accepted
      * as a gap; the final response's HSTS still applies normally.
+     *
+     * Also covers 3xx responses that resolveRedirects blocks (depth limit,
+     * loop, unusable Location).
      */
     private fun harvestRedirectCookies(response: Response) {
         val hopUrl = response.request.url.toString()
@@ -748,7 +795,15 @@ class VWebviewClient(
             "https://*.github.io https://*.codeberg.page; " +
             "connect-src 'self' https://*.discord.com https://*.discordapp.com " +
             "https://*.discord.media https://*.discordapp.net " +
-            "wss://gateway.discord.gg wss://remote-auth-gateway.discord.gg " +
+            // Wildcards, not bare hosts: Discord assigns regional gateways
+            // (wss://gateway-us-east1-b.discord.gg) and voice gateways on
+            // *.discord.media, which a bare wss://gateway.discord.gg misses.
+            "wss://*.discord.gg wss://*.discord.media " +
+            // Attachment uploads PUT files directly to signed URLs on these
+            // Discord-owned buckets. Pinned, not *.storage.googleapis.com, so
+            // attacker-created buckets stay blocked as exfil targets.
+            "https://discord-attachments-uploads-prd.storage.googleapis.com " +
+            "https://discord-attachments-upstream-prd.storage.googleapis.com " +
             "https://vde-builds.nin0.dev " +
             "https://badges.vencord.dev https://vendroid.nin0.dev; " +
             "img-src * data: blob:; " +
@@ -823,20 +878,37 @@ class VWebviewClient(
             ResponseHeaderMerge.merge(modifiedHeaders, setCookies, lowerKey, value)
         }
         if (isCss) modifiedHeaders["content-type"] = "text/css"
-        val reasonPhrase = response.message.takeIf { it.isNotEmpty() } ?: "OK"
+        // HTTP/2 has no reason phrase (OkHttp returns ""), so the old "OK"
+        // fallback reported a 404 as "404 OK". Use the standard IANA phrase
+        // for known codes and leave the rest empty, as h2 does.
+        val reasonPhrase = response.message.takeIf { it.isNotEmpty() }
+            ?: STANDARD_REASON_PHRASES[statusCode].orEmpty()
 
-        // A Discord main frame is always HTML. OkHttp's transparent gzip decode
-        // can drop Content-Type and strips Content-Encoding/Content-Length; the
-        // body has already been fully read, so those framing headers are stale.
-        // Pin a clean MIME: WebResourceResponse's mimeType must be "text/html"
-        // (charset goes in the separate "encoding" arg — putting it in the MIME
-        // makes WebView render the document as plain text).
-        if (isDiscordDomain && isMainFrame && statusCode in 200..299) {
-            modifiedHeaders["content-type"] = "text/html"
+        // WebResourceResponse's mimeType must be a bare media type. The
+        // charset goes in the separate "encoding" arg; a MIME carrying it
+        // ("text/html; charset=utf-8") makes WebView render the document as
+        // plain text. OkHttp's transparent gzip decode can also drop
+        // Content-Type and strips Content-Encoding/Content-Length, and the
+        // body has already been fully read, so those framing headers are
+        // stale at any status code.
+        if (isDiscordDomain && isMainFrame) {
+            if (statusCode in 200..299) {
+                // The app shell is always HTML. Pin a clean MIME so the
+                // injection gate below agrees.
+                modifiedHeaders["content-type"] = "text/html"
+            } else {
+                // Error pages keep the server's media type, bare; the API
+                // answers errors in JSON, and forcing text/html would
+                // mislabel them. A dropped or empty type still falls back to
+                // HTML, since the octet-stream default below would turn the
+                // page into a download.
+                modifiedHeaders["content-type"] =
+                    ResponseHeaderMerge.bareMediaType(modifiedHeaders["content-type"]) ?: "text/html"
+            }
             modifiedHeaders.remove("content-encoding")
             modifiedHeaders.remove("content-length")
         }
-        // Re-read so the served MIME and the injection gate both see "text/html".
+        // Re-read so the served MIME matches what the block above wrote.
         val effectiveContentType = modifiedHeaders.getOrDefault("content-type", "application/octet-stream")
 
         // OkHttp has no errorStream; byteStream() yields the error page for 4xx/5xx
@@ -875,7 +947,7 @@ class VWebviewClient(
                 val rawBytes = bodyBytes
                 val sanitizedHeaders = HashMap(modifiedHeaders)
                 diskCacheExecutor.execute {
-                    MainFrameDiskCache.writeMainFrame(urlString, rawBytes, sanitizedHeaders)
+                    MainFrameDiskCache.writeMainFrame(urlString, rawBytes, sanitizedHeaders, reasonPhrase)
                 }
             }
         }
@@ -891,8 +963,8 @@ class VWebviewClient(
             if (ctLower.contains("text/html")) {
                 try {
                     val text = bodyBytes.toString(Charsets.UTF_8)
-                    val runtimeReady = isMainFrameRuntimeReady()
-                    val patched = injectFirewallAndCss(text, urlString, isDiscordMainFrame = isDiscordDomain)
+                    val result = injectFirewallAndCss(text, urlString, isDiscordMainFrame = isDiscordDomain)
+                    val patched = result.html
                     if (patched != null && patched !== text) {
                         bodyBytes = patched.toByteArray(Charsets.UTF_8)
                         modifiedHeaders["content-length"] = bodyBytes.size.toString()
@@ -904,11 +976,18 @@ class VWebviewClient(
                         if (firewallEmbeddedUrls.size >= MAX_FIREWALL_TRACKED) firewallEmbeddedUrls.clear()
                         firewallEmbeddedUrls.add(urlString)
                         VDELog.i("WV", "Embedded firewall JS: $host (${FirewallConfig.jsAllowedHosts().size} hosts)")
-                        if (runtimeReady) {
+                        if (result.runtimeEmbedded) {
                             if (runtimeEmbeddedUrls.size >= MAX_RUNTIME_TRACKED) runtimeEmbeddedUrls.clear()
                             runtimeEmbeddedUrls.add(urlString)
                             VDELog.i("WV", "Embedded Vencord runtime into main frame")
+                        } else {
+                            runtimeEmbeddedUrls.remove(urlString)
                         }
+                    } else {
+                        // No `</head>`: raw body. Drop any stranded claim
+                        // (see serveStaleMainFrame).
+                        firewallEmbeddedUrls.remove(urlString)
+                        runtimeEmbeddedUrls.remove(urlString)
                     }
                 } catch (_: Exception) {}
             }
@@ -1010,6 +1089,23 @@ class VWebviewClient(
         // Headers that select a different response body, folded into the cache key.
         private val VARIANT_HEADERS = setOf(
             "if-none-match", "if-modified-since", "accept-encoding", "accept"
+        )
+        // IANA reason phrases (RFC 9110) for codes that surface through the
+        // interceptor; consulted only when the wire carried none (HTTP/2).
+        private val STANDARD_REASON_PHRASES = mapOf(
+            200 to "OK", 201 to "Created", 202 to "Accepted", 204 to "No Content",
+            206 to "Partial Content",
+            301 to "Moved Permanently", 302 to "Found", 303 to "See Other",
+            304 to "Not Modified", 307 to "Temporary Redirect", 308 to "Permanent Redirect",
+            400 to "Bad Request", 401 to "Unauthorized", 403 to "Forbidden",
+            404 to "Not Found", 405 to "Method Not Allowed", 408 to "Request Timeout",
+            409 to "Conflict", 410 to "Gone", 413 to "Content Too Large",
+            414 to "URI Too Long", 415 to "Unsupported Media Type",
+            416 to "Range Not Satisfiable", 429 to "Too Many Requests",
+            431 to "Request Header Fields Too Large", 451 to "Unavailable For Legal Reasons",
+            500 to "Internal Server Error", 501 to "Not Implemented", 502 to "Bad Gateway",
+            503 to "Service Unavailable", 504 to "Gateway Timeout",
+            505 to "HTTP Version Not Supported"
         )
         private val VENCORD_INCOMPATIBLE_CSP_DIRECTIVES = hashSetOf(
             "default-src", "script-src", "script-src-elem", "script-src-attr",

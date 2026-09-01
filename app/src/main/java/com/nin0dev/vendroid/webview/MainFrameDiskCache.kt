@@ -86,11 +86,13 @@ import kotlin.concurrent.withLock
      * Persists a raw HTML main-frame response. No-op unless [isCacheableRoute]
      * passes and the body is within the size cap. [headers] must be the
      * fetch-path's sanitized headers so a stale serve preserves security headers.
+     * [reasonPhrase] is stored in the meta and replayed on a stale serve.
      */
     fun writeMainFrame(
         urlString: String,
         rawBody: ByteArray,
         headers: Map<String, String>,
+        reasonPhrase: String = "OK",
         nowMs: Long = System.currentTimeMillis()
     ): Boolean {
         val dir = cacheDir ?: return false
@@ -124,7 +126,7 @@ import kotlin.concurrent.withLock
             //   2..: "key\tbase64value" header pairs (bounded, no newlines in values)
             val sb = StringBuilder()
             sb.append(nowMs).append('\n')
-            sb.append(Base64.getEncoder().encodeToString("OK".toByteArray(Charsets.UTF_8))).append('\n')
+            sb.append(Base64.getEncoder().encodeToString(reasonPhrase.toByteArray(Charsets.UTF_8))).append('\n')
             val enc = Base64.getEncoder()
             for ((k, v) in headers) {
                 // Keep only headers that matter to re-serve (security/content-type).

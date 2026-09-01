@@ -488,9 +488,12 @@ object HttpClient {
             throw IOException("Refusing to store bundle failing sanity check (${content.length} chars)")
         }
         val buildTag = extractBuildTag(content)
-        val hash = shortSha256(content)
-        VDELog.i("HTTP", "Bundle downloaded (${content.length} chars) build=${buildTag ?: "unknown"} sha256=$hash, applying patches...")
+        val downloadHash = shortSha256(content)
+        VDELog.i("HTTP", "Bundle downloaded (${content.length} chars) build=${buildTag ?: "unknown"} sha256=$downloadHash, applying patches...")
         val patched = applyPatches(content)
+        // Hash the patched body: that is what gets installed on disk and what
+        // the "Cached bundle ... sha256=" preload line hashes on the next start.
+        val hash = shortSha256(patched)
         synchronized(bundleWriteLock) {
             // Unique temp name: startup and the JS-bridge update path write the
             // same bundle on different executors, and a shared "vencord.js.tmp"

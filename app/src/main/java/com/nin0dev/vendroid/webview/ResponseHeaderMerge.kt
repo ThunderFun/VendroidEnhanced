@@ -73,4 +73,18 @@ internal object ResponseHeaderMerge {
         if (exact != null) return exact
         return headers.entries.firstOrNull { it.key.lowercase() == lowerName }?.value
     }
+
+    /**
+     * Strips MIME parameters from a Content-Type value
+     * ("text/html; charset=utf-8" -> "text/html"); returns null when
+     * [contentType] is null or has no media type before the parameters.
+     *
+     * For use as a WebResourceResponse mimeType only: Blink exact-matches
+     * that string, so a parameter-bearing value renders the document as
+     * plain text. The header map keeps the full value.
+     */
+    fun bareMediaType(contentType: String?): String? {
+        val bare = contentType?.substringBefore(';')?.trim()
+        return bare?.takeIf { it.isNotEmpty() }
+    }
 }

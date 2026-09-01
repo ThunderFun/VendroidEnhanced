@@ -38,7 +38,10 @@ object FirewallConfig {
                 "githack.com", ".githack.com",
                 "vencord.dev", ".vencord.dev",
                 "git.nin0.dev", ".git.nin0.dev",
-                "vde-builds.nin0.dev", ".vde-builds.nin0.dev"
+                "vde-builds.nin0.dev", ".vde-builds.nin0.dev",
+                // Vendroid's own API (About-panel contributor list): the CSP
+                // allows it; without this entry the JS firewall rejects the fetch.
+                "vendroid.nin0.dev", ".vendroid.nin0.dev"
             )
         ),
         HCAPTCHA(

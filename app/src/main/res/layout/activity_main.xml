@@ -5,12 +5,6 @@
     android:layout_height="match_parent"
     tools:context=".MainActivity">
 
-    <ViewStub
-        android:id="@+id/quickcss_stub"
-        android:layout="@layout/quickcss_overlay"
-        android:layout_width="match_parent"
-        android:layout_height="match_parent" />
-
     <!-- Placeholder only. The real WebView is created programmatically in
          MainActivity (reusing the pre-warmed renderer when available) and
          installed here so setContentView doesn't pay the cost of inflating a

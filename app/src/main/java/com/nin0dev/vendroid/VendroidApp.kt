@@ -84,8 +84,12 @@ class VendroidApp : Application() {
                         settingsEditor.remove(key)
                     }
                     settingsEditor.putBoolean("css_cache_migrated", true)
-                    settingsEditor.apply()
+                    // Apply the copy before the removals+flag. A death between
+                    // the two flushes would otherwise persist the flag without
+                    // the copied entries; in this order it leaves duplicates
+                    // and the migration re-runs.
                     if (migrated) editor.apply()
+                    settingsEditor.apply()
                 } catch (ex: Exception) {
                     VDELog.e("VDE", "CSS cache migration failed", ex)
                 }
@@ -269,13 +273,22 @@ class VendroidApp : Application() {
             return Application.getProcessName()
         }
         // Fallback for API 26-27: read the process name from /proc/self/cmdline.
-        return try {
+        try {
             val bytes = java.io.File("/proc/self/cmdline").readBytes()
             val end = bytes.indexOf(0.toByte())
-            String(bytes, 0, if (end > 0) end else bytes.size)
-        } catch (ex: Exception) {
-            VDELog.e("VDE", "getCurrentProcessName fallback failed", ex)
-            ""
+            val name = String(bytes, 0, if (end > 0) end else bytes.size)
+            if (name.isNotEmpty()) return name
+        } catch (_: Exception) {
         }
+        // A failed cmdline read would misclassify this process as non-web and
+        // skip FirewallConfig.init, blocking every request. ActivityManager
+        // reports only the caller's own processes since API 22.
+        val am = getSystemService(Context.ACTIVITY_SERVICE) as? android.app.ActivityManager
+        val name = am?.runningAppProcesses
+            ?.firstOrNull { it.pid == android.os.Process.myPid() }?.processName
+        if (name.isNullOrEmpty()) {
+            VDELog.e("VDE", "Process name detection failed on API ${Build.VERSION.SDK_INT}")
+        }
+        return name ?: ""
     }
 }

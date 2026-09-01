@@ -142,4 +142,30 @@ class ResponseHeaderMergeTest {
     @Test fun valueFor_missReturnsNull() {
         assertNull(ResponseHeaderMerge.valueFor(mapOf("a" to "b"), "c"))
     }
+
+    @Test fun bareMediaType_stripsParameters() {
+        assertEquals("text/html", ResponseHeaderMerge.bareMediaType("text/html; charset=utf-8"))
+        assertEquals("application/json", ResponseHeaderMerge.bareMediaType("application/json; charset=utf-8"))
+    }
+
+    @Test fun bareMediaType_bareValuePassesThrough() {
+        assertEquals("text/html", ResponseHeaderMerge.bareMediaType("text/html"))
+        assertEquals("application/json", ResponseHeaderMerge.bareMediaType("application/json"))
+    }
+
+    @Test fun bareMediaType_trimsWhitespace() {
+        assertEquals("text/html", ResponseHeaderMerge.bareMediaType(" text/html "))
+        assertEquals("text/html", ResponseHeaderMerge.bareMediaType("text/html ; charset=utf-8"))
+    }
+
+    @Test fun bareMediaType_nullOrEmptyReturnsNull() {
+        assertNull(ResponseHeaderMerge.bareMediaType(null))
+        assertNull(ResponseHeaderMerge.bareMediaType(""))
+        assertNull(ResponseHeaderMerge.bareMediaType("   "))
+    }
+
+    @Test fun bareMediaType_parameterOnlyValueReturnsNull() {
+        // Caller decides the fallback; the media type is genuinely absent.
+        assertNull(ResponseHeaderMerge.bareMediaType("; charset=utf-8"))
+    }
 }

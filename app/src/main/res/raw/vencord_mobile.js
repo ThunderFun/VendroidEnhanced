@@ -8,6 +8,15 @@
     // lifetime if capture never succeeds. 40 x 500ms ~= 20s.
     var _vendroidCaptureMaxAttempts = 40;
     var _vendroidGiveUpLogged = false;
+    // Store-only policy for the probe-captured wreq: a startup-entry capture
+    // precedes Discord's remaining chunk pushes, so wreq.m is nearly empty;
+    // initializing Vencord then made findByProps miss and its Lazy proxies
+    // throw "Reflect.get called on non-object", breaking plugin starts and
+    // text commands. tryInitWebpack() hands the wreq over no earlier than
+    // VENDROID_WREQ_RESCUE_ATTEMPTS (200 ticks = 10s) and only once the
+    // registry holds at least this many modules.
+    var VENDROID_WREQ_MIN_MODULES = 100;
+    var _vendroidWreqFloorLogged = false;
     // Hot-path input logging (beforeinput/composition, per keystroke) crosses
     // the renderer→native IPC and lands in a disk-backed log — keep it off
     // unless actively debugging input issues.
@@ -59,26 +68,38 @@
         }
     }
 
+    // Throttle probe pushes: extractWebpackRequire() also calls this from
+    // the 50ms init poll, and unthrottled probes burned the 40-attempt
+    // budget in ~2s.
+    var _vendroidLastProbeAt = 0;
+
     function vendroidTryCaptureWreq() {
-        if (_vendroidCapturedWreq) return;
-        if (!_vendroidJsonpCallback) return;
+        if (_vendroidCapturedWreq) return true;
+        if (!_vendroidJsonpCallback) return false;
         if (_vendroidCaptureAttempts >= _vendroidCaptureMaxAttempts) {
             if (!_vendroidGiveUpLogged) {
                 _vendroidGiveUpLogged = true;
                 console.error("[Vendroid] Gave up capturing __webpack_require__ after " + _vendroidCaptureAttempts + " attempts; runtime patches will not apply");
             }
-            return;
+            return false;
         }
 
+        // Startup-entry format. Webpack never executes factories arriving via
+        // push(); only the third array element (runtime callback) runs, with
+        // __webpack_require__ as argument. The old probe pushed chunk id 0,
+        // which marked the real chunk 0 installed (installedChunks[0] = 0) and
+        // could break its lazy require.e(0); this id is unique and non-numeric.
+        var now = Date.now();
+        if (now - _vendroidLastProbeAt < 500) return false;
+        _vendroidLastProbeAt = now;
         _vendroidCaptureAttempts++;
-        var captured = null;
-        var fakeModuleId = "_vc_wreq_" + Date.now();
-        var fakeFactory = function(module, exports, __webpack_require__) {
-            captured = __webpack_require__;
-        };
 
-        var fakeChunk = [[0], {}];
-        fakeChunk[1][fakeModuleId] = fakeFactory;
+        var captured = null;
+        var fakeChunk = [
+            ["_vendroid_probe_" + now + "_" + _vendroidCaptureAttempts],
+            {},
+            function(wreq) { captured = wreq; }
+        ];
 
         try {
             _vendroidJsonpCallback(fakeChunk);
@@ -86,62 +107,24 @@
             if (_vendroidCaptureAttempts <= 3) console.warn("[Vendroid] Fake chunk error: " + e.message);
         }
 
+        // Vencord's _initWebpack does Reflect.defineProperty(e.c, ...), so a
+        // captured wreq needs .c; a shape change then fails here instead of
+        // half-initializing Vencord.
         if (captured && typeof captured === "function" && captured.c) {
+            // Store only; tryInitWebpack() hands it over late (see VENDROID_WREQ_MIN_MODULES).
             _vendroidCapturedWreq = captured;
-            console.warn("[Vendroid] Captured __webpack_require__ from fake chunk!");
-            vendroidCallInitWebpack();
-        } else if (captured && typeof captured === "object") {
-            var found = null;
-            try {
-                var keys = Object.keys(captured);
-                for (var i = 0; i < keys.length; i++) {
-                    var val = captured[keys[i]];
-                    if (typeof val === "function" && val.c) { found = val; break; }
-                }
-            } catch(e) {}
-            if (found) {
-                _vendroidCapturedWreq = found;
-                console.warn("[Vendroid] Captured __webpack_require__ from object wrapper!");
-                vendroidCallInitWebpack();
-            } else {
-                if (_vendroidCaptureAttempts <= 3) console.warn("[Vendroid] Fake chunk captured object but no wreq inside (keys=" + (captured ? Object.keys(captured).length : 0) + ")");
-                if (!_vendroidCapturedWreq) {
-                    setTimeout(vendroidTryCaptureWreq, 500);
-                }
-            }
-        } else {
-            if (_vendroidCaptureAttempts <= 3) console.warn("[Vendroid] Fake chunk did not capture __webpack_require__ (type=" + typeof captured + ", hasC=" + !!(captured && captured.c) + ")");
-            if (!_vendroidCapturedWreq) {
-                setTimeout(vendroidTryCaptureWreq, 500);
-            }
+            console.warn("[Vendroid] Captured __webpack_require__ from startup entry!");
+            return true;
         }
+        if (_vendroidCaptureAttempts <= 3) {
+            console.warn("[Vendroid] Startup-entry probe did not yield wreq (type=" + typeof captured + ", attempt " + _vendroidCaptureAttempts + ")");
+        }
+        setTimeout(vendroidTryCaptureWreq, 500);
+        return false;
     }
 
-    function vendroidCallInitWebpack() {
-        if (!_vendroidCapturedWreq) return;
-        function doCall() {
-            try {
-                if (typeof Vencord !== "undefined" && Vencord.Webpack) {
-                    if (Vencord.Webpack.wreq) {
-                        console.warn("[Vendroid] wreq already set, skipping _initWebpack");
-                        return;
-                    }
-                    if (typeof Vencord.Webpack._initWebpack === "function") {
-                        Vencord.Webpack._initWebpack(_vendroidCapturedWreq);
-                        console.warn("[Vendroid] _initWebpack called! wreq=" + typeof Vencord.Webpack.wreq + " cache=" + typeof Vencord.Webpack.cache);
-                        // Immediately try to advance to plugins stage — no need to wait for the poll
-                        tryAdvanceInit();
-                        return;
-                    }
-                } else {
-                    setTimeout(doCall, 50);
-                }
-            } catch(e) {
-                console.error("[Vendroid] _initWebpack call failed: " + e.message);
-            }
-        }
-        doCall();
-    }
+    // No eager handover function here. tryInitWebpack() is the only path to
+    // Vencord.Webpack._initWebpack; timing policy at VENDROID_WREQ_MIN_MODULES.
 
     function tryPushFakeChunkDirectly() {
         if (_vendroidCapturedWreq) return true;
@@ -151,20 +134,21 @@
         if (typeof pushFn !== "function") return false;
         if (pushFn.toString().indexOf("[native code]") !== -1) return false;
 
+        // Same startup-entry probe format as vendroidTryCaptureWreq().
         var captured = null;
-        var fakeModuleId = "_vc_wreq_" + Date.now();
-        var fakeFactory = function(module, exports, __webpack_require__) {
-            captured = __webpack_require__;
-        };
-        var fakeChunk = [[0], {}];
-        fakeChunk[1][fakeModuleId] = fakeFactory;
+        var now = Date.now();
+        var fakeChunk = [
+            ["_vendroid_probe_" + now],
+            {},
+            function(wreq) { captured = wreq; }
+        ];
         try {
             pushFn.call(chunkArr, fakeChunk);
         } catch(e) {}
         if (captured && typeof captured === "function" && captured.c) {
+            // Store only, same policy as vendroidTryCaptureWreq().
             _vendroidCapturedWreq = captured;
             console.warn("[Vendroid] Captured __webpack_require__ via direct push!");
-            vendroidCallInitWebpack();
             return true;
         }
         return false;
@@ -194,6 +178,25 @@
         }
     } catch(e) {
         console.error("[Vendroid] ModalEscapeHandler FAILED: " + e.message);
+    }
+
+    // Discord's esc binding throws "Reflect.get called on non-object" on an
+    // empty layer stack, so the action only runs when a layer is rendered.
+    // Modals, popouts and context menus mount in the layer containers;
+    // tooltips match too, and a throw there just lands in the call-site catch.
+    function discordLayerOpen() {
+        try {
+            var containers = document.querySelectorAll('[class*="layerContainer"]');
+            // No containers at all (markup change): fail open to the previous
+            // unconditional call instead of breaking modal closing.
+            if (containers.length === 0) return true;
+            for (var i = 0; i < containers.length; i++) {
+                if (containers[i].childElementCount > 0) return true;
+            }
+        } catch(e) {
+            return true;
+        }
+        return false;
     }
 
     let isSidebarOpen = false;
@@ -340,10 +343,22 @@
         }
 
         if (_vendroidCapturedWreq) {
+            // Registry floor: see VENDROID_WREQ_MIN_MODULES. Falling through
+            // would not help, since extractWebpackRequire() returns the same
+            // captured wreq; the poll just retries until MAX_INIT_ATTEMPTS.
+            var mLen = 0;
+            try { mLen = _vendroidCapturedWreq.m ? Object.keys(_vendroidCapturedWreq.m).length : 0; } catch(e) {}
+            if (mLen < VENDROID_WREQ_MIN_MODULES) {
+                if (!_vendroidWreqFloorLogged) {
+                    _vendroidWreqFloorLogged = true;
+                    console.warn("[Vendroid] Captured wreq held back: module registry has " + mLen + " entries (waiting for " + VENDROID_WREQ_MIN_MODULES + ")");
+                }
+                return false;
+            }
             try {
                 if (typeof Vencord.Webpack._initWebpack === "function") {
                     Vencord.Webpack._initWebpack(_vendroidCapturedWreq);
-                    console.warn("[Vendroid] _initWebpack called from captured wreq, wreq=" + typeof Vencord.Webpack.wreq);
+                    console.warn("[Vendroid] _initWebpack called from captured wreq, wreq=" + typeof Vencord.Webpack.wreq + " modules=" + mLen);
                     if (Vencord.Webpack.wreq) return true;
                 }
             } catch(e) {
@@ -1176,8 +1191,9 @@
             var Common = Vencord.Webpack && Vencord.Webpack.Common;
             var MessageActions = Common && Common.MessageActions;
             if (!MessageActions || typeof MessageActions.sendMessage !== "function") {
-                // MessageActions not ready yet — retry for up to ~15s
-                if (_vendroidCmdRetryCount++ < 300) {
+                // MessageActions not ready yet; retry up to ~30s (slow page
+                // loads keep the registry partial past 15s)
+                if (_vendroidCmdRetryCount++ < 600) {
                     setTimeout(setupTextCommandDispatcher, 50);
                 }
                 return;
@@ -1224,8 +1240,12 @@
             _vendroidCmdPatched = true;
             console.warn("[Vendroid] Text command dispatcher installed (/me, /shrug, /tableflip, /unflip, /tts, /spoiler)");
         } catch(e) {
-            console.error("[Vendroid] setupTextCommandDispatcher failed: " + e.message);
-            if (_vendroidCmdRetryCount++ < 300) {
+            // Retries every 50ms: log the first failure, then one line
+            // every ~2s, or a slow page load prints ~400 identical errors.
+            if (_vendroidCmdRetryCount === 0 || _vendroidCmdRetryCount % 40 === 0) {
+                console.error("[Vendroid] setupTextCommandDispatcher failed (retry " + _vendroidCmdRetryCount + "): " + e.message);
+            }
+            if (_vendroidCmdRetryCount++ < 600) {
                 setTimeout(setupTextCommandDispatcher, 50);
             }
         }
@@ -1646,8 +1666,15 @@
                 });
                 window.addEventListener("unhandledrejection", function(ev) {
                     var r = ev.reason;
-                    console.error("[Vendroid] Search-diag rejection :: " +
-                        (r && r.message ? r.message : String(r)) +
+                    var m = r && r.message ? r.message : String(r);
+                    // Benign WebView audio race (sound-effect play() vs
+                    // pause()), not a search failure. preventDefault also
+                    // stops Chromium's "Uncaught (in promise)" line.
+                    if (r && r.name === "AbortError" && m.indexOf("play() request was interrupted") !== -1) {
+                        ev.preventDefault();
+                        return;
+                    }
+                    console.error("[Vendroid] Search-diag rejection :: " + m +
                         (r && r.stack ? "\nSTACK: " + r.stack : ""));
                 });
                 console.warn("[Vendroid] Search-diag listeners installed");
@@ -2015,11 +2042,14 @@
         822986, 733344, 821500, 382811, 552229, 458265, 499957, 247320
     ];
 
-    // tryAdvanceInit() is called both by hooks (vendroidCallInitWebpack) and
-    // the poll loop, so init responds as soon as conditions are met.
+    // The init poll is the only driver of tryAdvanceInit().
     var initStage = 0; // 0=need webpack, 1=need plugins/flux, 2=done
     var initAttempts = 0;
     var MAX_INIT_ATTEMPTS = 300; // 300 * 50ms = 15s
+    // Before this tick the poll only watches for Vencord's own wreq, which
+    // its chunk-script hook sets a few seconds after the main chunk. Rescue
+    // handover policy: see VENDROID_WREQ_MIN_MODULES.
+    var VENDROID_WREQ_RESCUE_ATTEMPTS = 200; // 200 * 50ms = 10s
     var _lastInitError = null;
     var _lastInitErrorAt = -100;
 
@@ -2042,10 +2072,7 @@
                 // Bundle not loaded yet or boot crashed; keep polling.
             } else if (Vencord.Webpack.wreq) {
                 initStage = 1;
-            } else if (_vendroidCapturedWreq) {
-                vendroidCallInitWebpack();
-                if (Vencord.Webpack.wreq) initStage = 1;
-            } else if (tryInitWebpack()) {
+            } else if (initAttempts >= VENDROID_WREQ_RESCUE_ATTEMPTS && tryInitWebpack()) {
                 initStage = 1;
             }
             // Apply Slate override at stage 1 (before React renders).
@@ -2057,9 +2084,6 @@
 
         if (initStage === 1) {
             // Stage 2: FluxDispatcher + Plugins
-            if (_vendroidCapturedWreq && typeof Vencord !== "undefined" && Vencord.Webpack && !Vencord.Webpack.wreq) {
-                vendroidCallInitWebpack();
-            }
             var hasPlugins = typeof Vencord !== "undefined" && Vencord.Plugins && Object.keys(Vencord.Plugins.plugins).length > 0;
             var fd = findFluxDispatcher();
             if (fd && hasPlugins) {
@@ -2159,9 +2183,10 @@
             // Modal-fallback sessions skip our overlay root; Discord's esc
             // binding drives them, so its action consumes the press here —
             // falling through would open the sidebar over an open Discord
-            // layer.
+            // layer. Skipped when no layer is open (see discordLayerOpen): the
+            // press must unwind the sidebar below.
             var meh = getModalEscapeHandler();
-            if (meh && typeof meh.action === "function") {
+            if (meh && typeof meh.action === "function" && discordLayerOpen()) {
                 try {
                     meh.action();
                     return true;

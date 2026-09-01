@@ -133,9 +133,15 @@ class VChromeClient(activity: MainActivity) : WebChromeClient() {
             activity.fileChooserLauncher.launch(intent)
             true
         } catch (e: Exception) {
+            // Deliver a cancel via the callback or return false, never both.
+            // False cancels the request through Chromium's internal
+            // uploadFileCallback, and that callback's duplicate-delivery
+            // guard throws "Duplicate showFileChooser result" inline on the
+            // UI thread.
             activity.filePathCallback = null
             filePathCallback.onReceiveValue(null)
-            false
+            VDELog.log(VDELog.Level.WARN, "FileChooser", "Failed to launch file chooser intent", e)
+            true
         }
     }
 

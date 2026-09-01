@@ -106,9 +106,10 @@ class LoadingScreenManager(
     }
 
     fun cleanup() {
-        timeoutRunnable?.let { handler.removeCallbacks(it) }
-        dismissRunnable?.let { handler.removeCallbacks(it) }
-        animRunnable?.let { handler.removeCallbacks(it) }
+        // A repeated schedule call overwrites the field holding its runnable's
+        // only reference, so per-field removal leaks queued orphans past
+        // onDestroy. The handler is private, so a blanket removal is safe.
+        handler.removeCallbacksAndMessages(null)
         // Cancel any in-flight dismiss animation so its withEndAction doesn't
         // touch a detached/destroyed view hierarchy after onDestroy.
         dismissAnimator?.cancel()

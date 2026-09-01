@@ -18,6 +18,7 @@ import android.webkit.WebChromeClient
 import android.widget.Toast
 import com.google.gson.Gson
 import com.nin0dev.vendroid.utils.Constants
+import com.nin0dev.vendroid.utils.FirewallConfig
 import com.nin0dev.vendroid.utils.JsPatches
 import com.nin0dev.vendroid.utils.VDELog
 import com.nin0dev.vendroid.ui.LoadingScreenManager
@@ -153,6 +154,13 @@ class MainActivity : AppCompatActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         VDELog.i("Main", "onCreate()")
+        // VendroidApp gates FirewallConfig.init on process-name detection,
+        // which can fail on API 26/27. This activity only ever runs in :web
+        // and init() is idempotent, so initializing here is always safe.
+        if (!FirewallConfig.isInitialized()) {
+            FirewallConfig.init(applicationContext)
+            Constants.invalidateFirewallCaches()
+        }
         // Load settings once and reuse throughout onCreate.
         val sPrefs = getSharedPreferences("settings", Context.MODE_PRIVATE)
         if (!sPrefs.getBoolean("migratedSettings", false)) {
@@ -345,7 +353,10 @@ class MainActivity : AppCompatActivity() {
         VWebviewClient.updateTypingBlock(blockTyping)
 
         // Sync the external-link confirmation toggle to the link popup.
-        val confirmLinks = sPrefs.getBoolean("vendroid_confirmExternalLinks", true)
+        // runCatching: a String-typed key left by an older build would crash
+        // startup here, before the bridge's write-path recovery can purge it.
+        val confirmLinks = runCatching { sPrefs.getBoolean("vendroid_confirmExternalLinks", true) }
+            .getOrDefault(true)
         com.nin0dev.vendroid.webview.LinkHandler.updateConfirmExternalLinks(confirmLinks)
     }
 
@@ -490,41 +501,55 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun handleUrl(url: Uri?) {
-        if (url != null) {
-            val host = url.host
-            if (host == null || !Constants.isDiscordDomain(host)) return
-            val path = url.path ?: ""
-            currentUrlForBridge = url.toString()
-            currentHostForBridge = host
-            if (!wvInitialized || wv == null) {
-                // Defer until onCreate finishes; loadUrl now would be
-                // overwritten by the initial-URL load.
-                pendingDeepLink = url.toString()
-            } else if (HttpClient.VencordMobileRuntime == null) {
-                if (HttpClient.vencordDisabled) {
-                    // Safe mode never consumes a deferred link (no runtimes to
-                    // inject), and the pref is already reset by now, so key on
-                    // the session flag. Load directly via NavigationPolicy.
-                    VDELog.w("Main", "Safe mode active; loading deep link directly: $url")
-                    if (com.nin0dev.vendroid.webview.NavigationPolicy.decide(url, true)
-                        == com.nin0dev.vendroid.webview.NavigationPolicy.Action.LOAD_IN_WEBVIEW) {
-                        wv?.loadUrl(url.toString())
-                    }
-                } else {
-                    // Runtime not injected into this page yet; transitionTo would
-                    // no-op against a page without Vencord. Defer until the
-                    // runtimes are injected (see injectVencordIfReady).
-                    pendingDeepLink = url.toString()
-                }
+        if (url == null) return
+        val host = url.host
+        // Non-Discord links are dropped; resolveInitialUrl loads the app shell
+        // for them on cold start, but a running session has nothing to load.
+        if (host == null || !Constants.isDiscordDomain(host)) return
+        val path = url.path ?: ""
+        // Route through NavigationPolicy like the cold-start path
+        // (resolveInitialUrl, tracker #10). Otherwise a /blog link drives the
+        // SPA to a page with no back path, and a cdn.discordapp.com link
+        // builds a garbage transitionTo route from the URL's path.
+        if (com.nin0dev.vendroid.webview.NavigationPolicy.decide(url, true)
+            != com.nin0dev.vendroid.webview.NavigationPolicy.Action.LOAD_IN_WEBVIEW) {
+            // Path/domain rule triggered (e.g. /blog or a CDN host): show the
+            // link popup and stay on the current page (cold start has no
+            // current page, so it loads the shell instead). Leave the bridge
+            // URL/host fields alone so they keep naming the live page; a
+            // non-app-origin host fails VencordNative's domain checks closed.
+            VDELog.d("Main", "Deep link policy popup: ${UrlNormalizer.redactForLog(url.toString())}")
+            com.nin0dev.vendroid.webview.LinkHandler(this).showLinkPopup(url)
+            return
+        }
+        currentUrlForBridge = url.toString()
+        currentHostForBridge = host
+        if (!wvInitialized || wv == null) {
+            // Defer until onCreate finishes; loadUrl now would be
+            // overwritten by the initial-URL load. handleUrl re-runs the
+            // policy gate on every entry, including routePendingDeepLink.
+            pendingDeepLink = url.toString()
+        } else if (HttpClient.VencordMobileRuntime == null) {
+            if (HttpClient.vencordDisabled) {
+                // Safe mode never consumes a deferred link (no runtimes to
+                // inject), and the pref is already reset by now, so key on
+                // the session flag.
+                VDELog.w("Main", "Safe mode active; loading deep link directly: $url")
+                wv?.loadUrl(url.toString())
             } else {
-                // Guarded so a page without Vencord (safe mode / failed load)
-                // fails silently instead of throwing a ReferenceError.
-                wv!!.evaluateJavascript(
-                    "if(window.Vencord&&Vencord.Webpack&&Vencord.Webpack.Common)" +
-                        "{Vencord.Webpack.Common.NavigationRouter.transitionTo(${gson.toJson(path)})}",
-                    null
-                )
+                // Runtime not injected into this page yet; transitionTo would
+                // no-op against a page without Vencord. Defer until the
+                // runtimes are injected (see injectVencordIfReady).
+                pendingDeepLink = url.toString()
             }
+        } else {
+            // Guarded so a page without Vencord (safe mode / failed load)
+            // fails silently instead of throwing a ReferenceError.
+            wv!!.evaluateJavascript(
+                "if(window.Vencord&&Vencord.Webpack&&Vencord.Webpack.Common)" +
+                    "{Vencord.Webpack.Common.NavigationRouter.transitionTo(${gson.toJson(path)})}",
+                null
+            )
         }
     }
 
@@ -562,18 +587,20 @@ class MainActivity : AppCompatActivity() {
                 prefs.edit() { putString("lastUrl", url) }
             }
         }
-        wv?.onPause()
-        wv?.pauseTimers()
-        // Stop the loading animation loop while backgrounded.
-        if (::loadingScreenManager.isInitialized) loadingScreenManager.pause()
-        // When backgrounded, spoof document.hidden and pause CSS animations so
-        // Discord's React app throttles and the compositor stops wasted GPU
-        // work. With pauseTimers() this removes most background CPU/GPU churn.
+        // Spoof document.hidden and pause CSS animations so the React app
+        // throttles and the compositor stops wasted GPU work while
+        // backgrounded. Run before onPause(): a paused renderer defers
+        // pending evaluateJavascript, so the spoof would land late or wait
+        // for resume.
         wv?.evaluateJavascript(
             "if(window.__vendroidSetVisibility)window.__vendroidSetVisibility('hidden');" +
             "if(window.__vendroidPauseAnimations)window.__vendroidPauseAnimations()",
             null
         )
+        wv?.onPause()
+        wv?.pauseTimers()
+        // Stop the loading animation loop while backgrounded.
+        if (::loadingScreenManager.isInitialized) loadingScreenManager.pause()
         super.onPause()
     }
 
@@ -737,6 +764,11 @@ class MainActivity : AppCompatActivity() {
     // prelude's at-boot snapshot (__vdeLsBoot) to distinguish "storage never
     // worked" from "removed by in-page code". No self-heal: a silent repair
     // would erase the evidence of who removed it.
+    //
+    // fw/anim report the firewall gate (__vendroidFw) and the
+    // animation/visibility gate (__vendroidAnimCtrl). Off means the page
+    // never received the patches. The ok verdict ignores both: a missing
+    // patch is a payload bug, not a failed Vencord boot.
     private val BOOT_VERIFY_JS =
             "(function(){try{" +
                 "var u=(window.__vdeUncaught||[]).slice(0,5).join(' | ');" +
@@ -747,7 +779,9 @@ class MainActivity : AppCompatActivity() {
                     "+'|watch='+(window.__vdeLsWatch===undefined?'n':window.__vdeLsWatch)" +
                     "+'|boot0='+(window.__vdeLsBoot===undefined?'?':window.__vdeLsBoot);" +
                 "var w=(typeof Vencord!=='undefined'&&Vencord&&Vencord.Webpack)?(Vencord.Webpack.wreq?'wreq-ok':'no-wreq'):'none';" +
-                "return 'vencord='+typeof Vencord+'|webpack='+w+'|mobile='+typeof VencordMobile+'|'+ls+'|uncaught=['+u+']';" +
+                "return 'vencord='+typeof Vencord+'|webpack='+w+'|mobile='+typeof VencordMobile+'|'" +
+                    "+'fw='+(window.__vendroidFw?'on':'off')+'|anim='+(window.__vendroidAnimCtrl?'on':'off')" +
+                    "+'|'+ls+'|uncaught=['+u+']';" +
                 "}catch(e){return 'probe-failed:'+e.message}})()"
 
     /**
