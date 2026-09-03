@@ -10,6 +10,8 @@ import android.content.SharedPreferences
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
 import java.io.File
 import android.view.View
 import android.webkit.ValueCallback
@@ -28,9 +30,9 @@ import com.nin0dev.vendroid.webview.UrlNormalizer
 import com.nin0dev.vendroid.webview.VChromeClient
 import com.nin0dev.vendroid.webview.VWebviewClient
 import com.nin0dev.vendroid.webview.VencordNative
-import java.io.IOException
 import java.lang.ref.WeakReference
 import java.util.concurrent.Executors
+import java.util.concurrent.RejectedExecutionException
 import androidx.activity.result.ActivityResultLauncher
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.core.content.edit
@@ -300,7 +302,10 @@ class MainActivity : AppCompatActivity() {
         wv!!.setWebViewClient(webViewClient)
         wv!!.setWebChromeClient(chromeClient)
 
-        if (sPrefs.getBoolean("desktopMode", false)) {
+        // getBoolean throws on a non-Boolean value under desktopMode; fall
+        // back to the default so stale or type-poisoned prefs cannot crash
+        // cold start.
+        if (runCatching { sPrefs.getBoolean("desktopMode", false) }.getOrDefault(false)) {
             wv!!.settings.userAgentString =
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
         }
@@ -396,23 +401,14 @@ class MainActivity : AppCompatActivity() {
             // the preload still mid-read. Never load inline. This is the UI
             // thread, and reading ~1 MB (plus its SHA-256 hash, plus the regex
             // pass a stale patch flag triggers) is startup jank at the busiest
-            // point of the launch. Queue the reads on fetchExecutor ahead of
-            // the fetchVencord task below, so the disk read still completes
-            // before the conditional GET and the 304 branch keeps skipping its
-            // re-read.
+            // point of the launch. The reads queue on fetchExecutor
+            // immediately; the conditional GET runs much later (see
+            // scheduleDeferredBundleCheck), so the disk read always completes
+            // first and the 304 branch skips its re-read.
             if (HttpClient.VencordRuntime == null || HttpClient.VencordMobileRuntime == null) {
                 loadVencordRuntimesFromDisk(sPrefs)
             }
-            val weakSelf = WeakReference(this)
-            fetchExecutor.execute {
-                val act = weakSelf.get()
-                if (act == null || act.isFinishing || act.isDestroyed) return@execute
-                try {
-                    fetchVencord(act)
-                } catch (e: IOException) {
-                    VDELog.e("Main", "fetchVencord failed", e)
-                }
-            }
+            scheduleDeferredBundleCheck()
         } else {
             // Raise the switch and clear anything already in memory. No-ops
             // after a cold start (VendroidApp did both); load-bearing when
@@ -426,6 +422,61 @@ class MainActivity : AppCompatActivity() {
             editor.putBoolean("safeMode", false)
             editor.apply()
         }
+    }
+
+    /**
+     * Schedules the bundle freshness check [BUNDLE_CHECK_DEFER_MS] past the
+     * boot window instead of running it at startup. The disk-preloaded
+     * runtime already boots the page, so the outcome never gates first paint;
+     * its only outputs are freshness bookkeeping and, on a new bundle, a
+     * mid-session publish that applies on the next navigation. Deferring
+     * keeps the connection setup (a fresh TCP/TLS to a second host) and any
+     * 200 download out of the most latency-sensitive window of the boot.
+     *
+     * The posted Runnable captures only locals plus a WeakReference:
+     * referencing [fetchExecutor] in the lambda would resolve it through the
+     * activity and strongly retain it for the whole deferral.
+     *
+     * Liveness is re-checked at execution time because onDestroy may run
+     * while the post is pending. isDestroyed is set before onDestroy
+     * dispatches and this callback is serialized with it on the main thread,
+     * so the guard is airtight even though a finished activity is not
+     * necessarily isFinishing (config-change recreation); the
+     * RejectedExecutionException catch below is not the primary guard.
+     */
+    private fun scheduleDeferredBundleCheck() {
+        val executor = fetchExecutor
+        val weakSelf = WeakReference(this)
+        Handler(Looper.getMainLooper()).postDelayed({
+            val act = weakSelf.get()
+            if (act == null || act.isFinishing || act.isDestroyed) return@postDelayed
+            // Mirrors runSafetyNetLoad's enqueue-race guard; fetchVencord
+            // does not self-gate on the kill switch. No in-process path
+            // currently flips vencordDisabled after scheduling (RecoveryActivity
+            // kills the :web process before committing safeMode, and the pref
+            // is one-shot-reset), so this check is cheap insurance.
+            if (HttpClient.vencordDisabled) return@postDelayed
+            try {
+                executor.execute {
+                    val a = weakSelf.get()
+                    if (a == null || a.isFinishing || a.isDestroyed) return@execute
+                    try {
+                        fetchVencord(a)
+                    } catch (e: Exception) {
+                        // Deliberately broader than IOException: an uncaught
+                        // throw on this shared executor kills the process. A
+                        // failed bundle check must degrade to a logged error,
+                        // never a crash loop; the cached file stays on disk as
+                        // the offline fallback.
+                        VDELog.e("Main", "fetchVencord failed", e)
+                    }
+                }
+            } catch (_: RejectedExecutionException) {
+                // fetchExecutor.shutdownNow() between the post and here;
+                // unreachable via the lifecycle (see the liveness note above),
+                // kept so a future caller cannot crash the main thread.
+            }
+        }, BUNDLE_CHECK_DEFER_MS)
     }
 
     /** Loads whichever runtimes are still missing, off the UI thread. */
@@ -878,6 +929,12 @@ class MainActivity : AppCompatActivity() {
         /** Bound on the parse-completion retries in injectVencordAttempt (100ms apart). */
         private const val INJECT_POLL_MAX_ATTEMPTS = 20
 
+        /** Delay before the deferred bundle freshness check fires (see
+         *  [scheduleDeferredBundleCheck]). Tunable; should sit past the boot
+         *  window (main frame + Vencord boot) yet still land on the user's
+         *  first session. */
+        private const val BUNDLE_CHECK_DEFER_MS = 10_000L
+
         /**
          * Body of [loadVencordRuntimesFromDisk]. Companion-scoped and internal
          * so unit tests can drive it synchronously, and so the queued lambda
@@ -941,8 +998,10 @@ class MainActivity : AppCompatActivity() {
                     }
                 }
             } catch (e: Exception) {
-                // Shared executor: an uncaught throw here would silently kill
-                // the worker and delay the fetchVencord task queued behind it.
+                // Shared executor: an uncaught throw here would kill the
+                // worker and the process with it, losing the rest of this
+                // task's reads; the CAS publishes tolerate a partial run, and
+                // the log keeps the gap diagnosable.
                 VDELog.e("Main", "Vencord runtime safety-net load failed", e)
             }
             if (!published) return

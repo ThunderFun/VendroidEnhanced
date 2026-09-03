@@ -66,7 +66,9 @@ object HttpClient {
      * True once a bundle fetch or revalidation has completed in this process
      * (via [fetchVencord] or the JS-bridge update path). The warm-navigation
      * fast path keys on this rather than `VencordRuntime != null`, which the
-     * disk preloads also set and which says nothing about freshness.
+     * disk preloads also set and which says nothing about freshness. Across
+     * process death the same idea carries via [PREF_LAST_BUNDLE_CHECK] and
+     * [BUNDLE_CHECK_INTERVAL_MS].
      */
     @Volatile
     private var bundleCheckedThisSession = false
@@ -125,6 +127,40 @@ object HttpClient {
             Regex.escape("//# sourceURL=file:///WebpackModule").toRegex(),
             "//# sourceURL=https://discord.com/vencord-module",
             "https://discord.com/vencord-module"
+        ),
+        // Prunes splashScreen, discordBranch, and the developer-modal
+        // allowRemoteDebugging toggle from the eq.js settings tree. The gate
+        // blocks all three and nothing native consumes them, so their rows
+        // would flip in the UI without persisting. The fourth unprefixed
+        // key, desktopMode, is allowed in VencordNative instead of pruned.
+        //
+        // A deletion has no natural marker, so the replacement is a comment
+        // token: it keeps the object literal valid and supplies the marker
+        // applyPatches needs to stay idempotent. Patterns anchor on the
+        // pristine upstream bundle, not the patched eq.js snapshot in the
+        // repo root; if upstream re-bundles and a pattern stops matching,
+        // applyPatches logs "Patch matched nothing" and
+        // HttpClientBundlePatchTest fails on the vendored snapshot.
+        BundlePatch(
+            Regex.escape(
+                "allowRemoteDebugging:{label:\"Allow remote debugging\",type:\"toggle\",description:\"Expose WebView to remote Chrome DevTools. You will be able to inspect the WebView on a browser using chrome://inspect. This does not give any access outside of your local network\",defaultValue:!1},"
+            ).toRegex(),
+            "/*vde-prune-remdbg*/",
+            "vde-prune-remdbg"
+        ),
+        BundlePatch(
+            Regex.escape(
+                "discordBranch:{type:\"select\",label:\"Discord branch\",description:\"The Discord branch to load\",options:[{key:\"stable\",label:\"Stable\"},{key:\"canary\",label:\"Canary\"},{key:\"ptb\",label:\"PTB\"}],defaultValue:\"stable\"},"
+            ).toRegex(),
+            "/*vde-prune-branch*/",
+            "vde-prune-branch"
+        ),
+        BundlePatch(
+            Regex.escape(
+                "splashScreen:{label:\"Splash screen\",type:\"select\",description:\"Splash screen to show at app launch\",defaultValue:\"viggy\",options:[{key:\"viggy\",label:\"Viggy, by Shoritsu\"},{key:\"shiggy\",label:\"Shiggy, by naga_U\"},{key:\"oneko\",label:\"Oneko\"}]},"
+            ).toRegex(),
+            "/*vde-prune-splash*/",
+            "vde-prune-splash"
         )
     )
 
@@ -139,6 +175,21 @@ object HttpClient {
 
     /** SharedPreferences key of the bundle URL the stored ETag belongs to. */
     const val PREF_ETAG_LOCATION = "vencordEtagLocation"
+
+    /** SharedPreferences key of the epoch-ms of the last definitive freshness
+     *  answer (304 or fresh download); boots inside [BUNDLE_CHECK_INTERVAL_MS]
+     *  skip the conditional GET entirely. Always read through [runCatching]:
+     *  page JS can write settings-pref strings via the bridge, so a non-Long
+     *  value must degrade to "never checked" (window due), never to "fresh". */
+    const val PREF_LAST_BUNDLE_CHECK = "lastBundleCheckMs"
+
+    /** How long a definitive freshness answer (304 / fresh download) lets
+     *  later boots skip the bundle's conditional GET. Deliberately shorter
+     *  than the CSS cache's 12h: this gates arbitrary JS in the Discord
+     *  origin, so the window bounds security-update latency at ~6h + one
+     *  boot. The session flag already grants long-lived processes unbounded
+     *  staleness; this carries the same idea across process death. */
+    internal const val BUNDLE_CHECK_INTERVAL_MS = 6 * 60 * 60 * 1000L
 
     /** SharedPreferences key of the bundle build tag (e.g. "Vencord@ada5cfe"). */
     const val PREF_BUNDLE_BUILD = "vencordBundleBuild"
@@ -166,7 +217,21 @@ object HttpClient {
 
     /** Resolves the effective bundle URL from prefs, honoring clientMod. */
     fun resolveBundleLocation(sPrefs: SharedPreferences): String {
-        val defaultUrl = if (sPrefs.getString("clientMod", "vencord") == "equicord") {
+        // Choke point: a wrong-typed clientMod must never escape onto the
+        // startup fetch path in fetchVencord or into
+        // VencordNative.updateVencord's @JavascriptInterface body. Either
+        // consumer crashing killed the process on every cold start. The
+        // setBool STRING_SETTING_KEYS guard stops new poison and
+        // VendroidApp's boot-time heal removes old; this catch contains any
+        // future regression to a logged default instead of an uncaught
+        // ClassCastException.
+        val clientMod = try {
+            sPrefs.getString("clientMod", "vencord")
+        } catch (e: ClassCastException) {
+            VDELog.w("HTTP", "clientMod pref wrong-typed (${e.javaClass.simpleName}); using default")
+            "vencord"
+        }
+        val defaultUrl = if (clientMod == "equicord") {
             Constants.EQUICORD_BUNDLE_URL
         } else {
             Constants.JS_BUNDLE_URL
@@ -193,8 +258,45 @@ object HttpClient {
             isCustomBundleLocation(resolveBundleLocation(sPrefs)) ||
             BuildConfig.DEBUG
 
+    /**
+     * Single definition of "this boot may skip the bundle's conditional GET":
+     * a runtime is in memory, no forced redownload is pending, and either a
+     * check completed this session or the last definitive answer is inside
+     * the freshness window. Pure so unit tests can pin the verdict, above all
+     * the polarity: an absent stamp (lastCheckMs <= 0) must read as DUE, never
+     * fresh. Inverting that compiles clean, passes every other test, and
+     * silently disables revalidation forever.
+     */
+    internal fun bundleCheckSkippable(
+        runtimeInMemory: Boolean,
+        needsRedownload: Boolean,
+        checkedThisSession: Boolean,
+        lastCheckMs: Long,
+        nowMs: Long
+    ): Boolean =
+        runtimeInMemory && !needsRedownload &&
+            (checkedThisSession || !isBundleCheckDue(lastCheckMs, nowMs))
+
+    /**
+     * True when the persisted stamp no longer lets a boot skip the conditional
+     * GET: never checked, an untrustworthy stamp, or an elapsed window. Pure
+     * so unit tests can pin the window math without prefs or network.
+     *
+     * A backwards wall clock (manual change, dead RTC booting to epoch) makes
+     * the delta negative; treating that as due keeps a security update from
+     * being postponed until wall time catches up.
+     */
+    internal fun isBundleCheckDue(lastCheckMs: Long, nowMs: Long): Boolean {
+        if (lastCheckMs <= 0L) return true
+        val delta = nowMs - lastCheckMs
+        if (delta < 0L) return true
+        return delta >= BUNDLE_CHECK_INTERVAL_MS
+    }
+
     /** Invalidates the bundle's freshness bookkeeping while keeping the file
-     *  on disk as the offline fallback. */
+     *  on disk as the offline fallback. Also clears the freshness-window
+     *  stamp, so a discarded corrupt file cannot ride a window earned by a
+     *  previous, different bundle. */
     private fun invalidateBundleCache(sPrefs: SharedPreferences) {
         sPrefs.edit()
             .remove(PREF_ETAG)
@@ -203,6 +305,7 @@ object HttpClient {
             .remove(PREF_BUNDLE_HASH)
             .remove(PREF_BUNDLE_PATCHED)
             .remove(PREF_BUNDLE_PATCH_SET)
+            .remove(PREF_LAST_BUNDLE_CHECK)
             .apply()
     }
 
@@ -324,11 +427,41 @@ object HttpClient {
             if (versionBump) invalidateBundleCache(sPrefs)
         }
 
-        // Warm-navigation fast path: skip the network round-trip only when a
-        // fetch or revalidation already completed in this session. A runtime
-        // preloaded from disk is not a freshness proof.
-        if (VencordRuntime != null && !needsRedownload && bundleCheckedThisSession) {
-            VDELog.d("HTTP", "Bundle already verified this session, skipping fetch")
+        // Warm-navigation fast path: skip the round trip when a check already
+        // completed this session, or the last definitive answer (304 / fresh
+        // download) is inside the freshness window. A runtime preloaded from
+        // disk is no freshness proof, so VencordRuntime != null alone never
+        // suffices; bundleCheckSkippable owns the verdict.
+        val checkedThisSession = bundleCheckedThisSession
+        // runCatching per the PREF_LAST_BUNDLE_CHECK contract: a non-Long
+        // here must read as never-checked, not fresh.
+        val lastCheck = runCatching { sPrefs.getLong(PREF_LAST_BUNDLE_CHECK, 0L) }.getOrDefault(0L)
+        if (bundleCheckSkippable(
+                runtimeInMemory = VencordRuntime != null,
+                needsRedownload = needsRedownload,
+                checkedThisSession = checkedThisSession,
+                lastCheckMs = lastCheck,
+                nowMs = System.currentTimeMillis()
+            )
+        ) {
+            if (checkedThisSession) {
+                VDELog.d("HTTP", "Bundle already verified this session, skipping fetch")
+            } else {
+                VDELog.d(
+                    "HTTP",
+                    "Bundle checked ${System.currentTimeMillis() - lastCheck}ms ago, " +
+                        "inside freshness window; skipping fetch"
+                )
+            }
+            bundleCheckedThisSession = true
+            // Must survive the early return: on a cold boot this can fire
+            // before any inject pass, after the preload won runSafetyNetLoad's
+            // CAS and the safety net returned without injecting, leaving
+            // missedInjection set. This call is then the only recovery trigger
+            // until the next navigation; it is idempotent.
+            activity.runOnUiThread {
+                (activity as? com.nin0dev.vendroid.MainActivity)?.injectVencordIfReady()
+            }
             return
         }
 
@@ -357,6 +490,13 @@ object HttpClient {
                         VencordRuntime = readBundleFromDisk(sPrefs, vendroidFile)
                     }
                     bundleCheckedThisSession = true
+                    // Definitive freshness answer: stamp the window so later
+                    // boots skip the round trip entirely. The fallback
+                    // branches below deliberately do not stamp: a failed
+                    // check must not masquerade as a fresh one.
+                    sPrefs.edit()
+                        .putLong(PREF_LAST_BUNDLE_CHECK, System.currentTimeMillis())
+                        .apply()
                 }
 
                 responseCode == HttpURLConnection.HTTP_NOT_MODIFIED -> {
@@ -521,6 +661,11 @@ object HttpClient {
                 e.remove(PREF_ETAG_LOCATION)
             }
             e.putInt(PREF_LAST_BUNDLE_UPDATE, BuildConfig.VERSION_CODE)
+            // A fresh download is a definitive freshness answer for every
+            // caller of this writer, so the skip-window stamp lives here
+            // rather than per-branch in fetchVencord, under bundleWriteLock:
+            // it can never describe a download that didn't happen.
+            e.putLong(PREF_LAST_BUNDLE_CHECK, System.currentTimeMillis())
             if (buildTag != null) e.putString(PREF_BUNDLE_BUILD, buildTag) else e.remove(PREF_BUNDLE_BUILD)
             e.putString(PREF_BUNDLE_HASH, hash)
             // Persist the patch state so a later cold start skips the ~1MB

@@ -41,22 +41,68 @@ class VencordNative(private val activity: WeakReference<MainActivity>, wv: WebVi
         // via setString) would make getBoolean throw ClassCastException — a
         // crash loop at startup for vendroid_confirmExternalLinks and a silent
         // toggle defeat for the others. setString must never write to them.
-        private val BOOLEAN_SETTING_KEYS = setOf(
+        // String-read mirror: STRING_SETTING_KEYS below.
+        internal val BOOLEAN_SETTING_KEYS = setOf(
             "vendroid_confirmExternalLinks",
             "vendroid_blockTypingIndicator",
             "vendroid_rememberLastChannel",
             // Migrated by MainActivity.migrateSettings() and read by the plugin.
             // Guarded here so setString can't type-poison them into Strings.
             "checkVDEUpdates",
-            "checkAnnouncements"
+            "checkAnnouncements",
+            // Desktop UA switch. installWebView reads this as a Boolean at
+            // startup; that read falls back to false on a wrong type, but a
+            // String would still disable the toggle.
+            "desktopMode"
         )
+
+        // Settings keys the app reads as Strings. Writing a Boolean here
+        // makes getString throw ClassCastException; clientMod did exactly
+        // that: both of its readers sat on the startup fetch path (and
+        // updateVencord's @JavascriptInterface body) with no matching catch,
+        // so one bridge call crash-looped the process on every cold start,
+        // and no recovery option cleared the key. setBool must never write
+        // to these, the mirror of BOOLEAN_SETTING_KEYS above. vencordLocation
+        // is already rejected by isKeyAllowed for reads and writes; listed
+        // here only to pin the contract if that gate changes.
+        internal val STRING_SETTING_KEYS = setOf(
+            "clientMod",
+            "vencordLocation"
+        )
+
+        // Single type-contract gate for both bridge write paths: returns
+        // false when the app reads [key] with the other type. Both setters
+        // call this before guardedPrefs, so a rejected call consumes no
+        // rate-limit slot or distinct-key budget. internal + pure so
+        // BridgeSettingTypeContractTest can pin it without Android.
+        internal fun isTypeSafeBridgeWrite(op: String, key: String): Boolean =
+            !(op == "setString" && key in BOOLEAN_SETTING_KEYS) &&
+                !(op == "setBool" && key in STRING_SETTING_KEYS)
 
         // Settings keys outside the Vencord-/vendroid_ prefixes that the plugin
         // may legitimately read/write via the bridge.
         private val EXTRA_ALLOWED_KEYS = setOf(
             "checkVDEUpdates",
-            "checkAnnouncements"
+            "checkAnnouncements",
+            // Desktop mode toggle from the eq.js settings tree, consumed by
+            // installWebView at startup. Unprefixed; without this entry both
+            // its reads and writes were dropped, so the toggle never applied.
+            "desktopMode"
         )
+
+        // Which settings keys page JS may read or write via the bridge. Split
+        // from [isKeyAllowed] and kept pure so BridgeKeyAllowlistTest can pin
+        // it without Android. vencordLocation is rejected for reads as well
+        // as writes: it selects the code the app downloads and executes, and
+        // a custom value can carry credentials in its query string.
+        internal fun isBridgeKeyAllowed(id: String): Boolean =
+            id != "vencordLocation" &&
+                (id == "clientMod" ||
+                    id in EXTRA_ALLOWED_KEYS ||
+                    id.startsWith("Vencord-") ||
+                    id.startsWith("vendroid_") ||
+                    id.startsWith("Vencord_") ||
+                    id.startsWith("css_cache_"))
         // Launcher activity-alias names (manifest: <activity-alias
         // android:name=".${name}MainActivity">). Declared as a List because
         // reconcileIconState() uses the order as tie-breaker when several
@@ -475,10 +521,7 @@ class VencordNative(private val activity: WeakReference<MainActivity>, wv: WebVi
     }
 
     private fun isKeyAllowed(id: String, forWrite: Boolean): Boolean {
-        if (id == "vencordLocation") return false
-        if (id == "clientMod") return true
-        if (id in EXTRA_ALLOWED_KEYS) return true
-        if (id.startsWith("Vencord-") || id.startsWith("vendroid_") || id.startsWith("Vencord_") || id.startsWith("css_cache_")) return true
+        if (isBridgeKeyAllowed(id)) return true
         val op = if (forWrite) "write" else "read"
         VDELog.w("VN", "Blocked $op for disallowed key: $id")
         return false
@@ -807,7 +850,7 @@ class VencordNative(private val activity: WeakReference<MainActivity>, wv: WebVi
         // vendroid_blockTypingIndicator would make the startup getBoolean()
         // throw ClassCastException (a crash loop for the former, a silent
         // toggle defeat for the latter).
-        if (safeId in BOOLEAN_SETTING_KEYS) {
+        if (!isTypeSafeBridgeWrite("setString", safeId)) {
             VDELog.w("VN", "Rejected setString on Boolean-key: $safeId")
             return
         }
@@ -843,6 +886,10 @@ class VencordNative(private val activity: WeakReference<MainActivity>, wv: WebVi
                     remove(HttpClient.PREF_ETAG_LOCATION)
                     remove(HttpClient.PREF_BUNDLE_PATCHED)
                     remove(HttpClient.PREF_BUNDLE_PATCH_SET)
+                    // The putInt above already forces needsBundleRedownload,
+                    // which bypasses the freshness window; clearing the stamp
+                    // too keeps "invalidate" consistent everywhere it happens.
+                    remove(HttpClient.PREF_LAST_BUNDLE_CHECK)
                     activity.get()?.filesDir?.let { File(it, "vencord.js").delete() }
                     HttpClient.setVencordRuntime(null)
                 }
@@ -858,6 +905,15 @@ class VencordNative(private val activity: WeakReference<MainActivity>, wv: WebVi
     fun setBool(token: String?, id: String?, value: Boolean) {
         if (!isBridgeAuthorized(token)) return
         val safeId = id ?: return
+        // Type-safety: never write a Boolean to a key the app reads as a
+        // String. guardedPrefs' write-path ClassCastException recovery cannot
+        // cover this: putBoolean never reads the old value, so the write
+        // silently replaces the String. Checked before guardedPrefs so a
+        // rejected call consumes no rate-limit slot or distinct-key budget.
+        if (!isTypeSafeBridgeWrite("setBool", safeId)) {
+            VDELog.w("VN", "Rejected setBool on String-key: $safeId")
+            return
+        }
         guardedPrefs("setBool", safeId, Unit, true, true) { prefs ->
             // The CSS cache is READ-ONLY from page JS (populated only by the
             // native prefetch in VendroidApp). Mirror the setString guard: a

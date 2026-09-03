@@ -21,6 +21,33 @@ class VendroidApp : Application() {
         VDELog.init(applicationContext, persistToFile = isWebProcess)
         VDELog.i("VDE", "App started (PID=${android.os.Process.myPid()})")
 
+        // Self-heal a type-poisoned clientMod (a Boolean persisted by the
+        // setBool bridge bug of older builds). The startup fetch path read it
+        // with an unguarded getString (HttpClient.resolveBundleLocation),
+        // which crash-looped the process on every cold start; no recovery
+        // option cleared the key. Removing it restores the "vencord" default.
+        // Runs synchronously in every process before any reader; that
+        // ordering also neutralizes the stale-map resurrection race: a warm
+        // process can flush the poison back to disk, so each boot re-heals
+        // before its first read. Precedent: evictStaleCssCache and the CSS
+        // prefetch repair poisoned entries in place rather than crashing.
+        val bootPrefs = getSharedPreferences("settings", Context.MODE_PRIVATE)
+        try {
+            bootPrefs.getString("clientMod", null)
+        } catch (e: ClassCastException) {
+            val removed = try {
+                bootPrefs.edit().remove("clientMod").commit()
+            } catch (t: Throwable) {
+                VDELog.e("VDE", "Could not remove poisoned clientMod key", t)
+                false
+            }
+            if (removed) {
+                VDELog.w("VDE", "Removed type-poisoned clientMod key (legacy setBool bridge bug)")
+            } else {
+                VDELog.w("VDE", "clientMod heal did not persist; retrying next boot")
+            }
+        }
+
         // Log app + WebView versions for incident reports.
         try {
             @Suppress("NewApi")
@@ -52,8 +79,7 @@ class VendroidApp : Application() {
             // faster (vs ~200-500ms cold). Only do this once the user has
             // accepted the first-run risk warning; otherwise MainActivity
             // creates its own WebView.
-            val riskAccepted = getSharedPreferences("settings", Context.MODE_PRIVATE)
-                .getBoolean("riskWarningAccepted", false)
+            val riskAccepted = bootPrefs.getBoolean("riskWarningAccepted", false)
             if (riskAccepted) {
                 try {
                     prewarmedWebView = WebView(this).apply {
