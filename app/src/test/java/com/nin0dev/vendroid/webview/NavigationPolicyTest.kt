@@ -38,7 +38,7 @@ class NavigationPolicyTest {
     // in-app back path (media hardlock), so main-frame navigation is
     // deliberately rejected and these hosts route through the link popup.
     // Subresource loads (<img> etc.) are unaffected; the firewall governs
-    // those separately. See SECURITY_TRACKER.md (isNavigationAllowedDomain).
+    // those separately.
     @Test fun navAllowed_rawContentCdnRejected() {
         assertFalse(Constants.isNavigationAllowedDomain("discord.media"))
         assertFalse(Constants.isNavigationAllowedDomain("media.discord.media"))

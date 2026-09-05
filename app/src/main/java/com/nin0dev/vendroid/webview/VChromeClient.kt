@@ -2,9 +2,7 @@ package com.nin0dev.vendroid.webview
 
 import android.content.ActivityNotFoundException
 import android.graphics.Bitmap
-import android.graphics.Color
 import android.net.Uri
-import android.os.Build
 import android.util.Log
 import android.view.View
 import android.webkit.ConsoleMessage
@@ -39,8 +37,6 @@ class VChromeClient(activity: MainActivity) : WebChromeClient() {
     }
     private var customView: View? = null
     private var customViewCallback: CustomViewCallback? = null
-    private var originalStatusBarColor: Int = 0
-    private var originalStatusBarContrastEnforced: Boolean = true
     private lateinit var fullscreenContainer: FrameLayout
     private lateinit var webview: WebView
     private var cachedActivityRef: MainActivity? = null
@@ -170,18 +166,9 @@ class VChromeClient(activity: MainActivity) : WebChromeClient() {
         val controller = getInsetsController(activity)
         controller.systemBarsBehavior = WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
         controller.hide(WindowInsetsCompat.Type.navigationBars())
-        // statusBarColor and isStatusBarContrastEnforced are deprecated on
-        // API 35 but remain the only way to set bar color on pre-edge-to-edge
-        // devices.
-        @Suppress("DEPRECATION")
-        run {
-            originalStatusBarColor = activity.window.statusBarColor
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.VANILLA_ICE_CREAM) {
-                originalStatusBarContrastEnforced = activity.window.isStatusBarContrastEnforced
-                activity.window.isStatusBarContrastEnforced = false
-            }
-            activity.window.statusBarColor = Color.BLACK
-        }
+        // Bar colors are owned by MainActivity.barColors. Publish the
+        // state change and let it derive the colors.
+        activity.barColors.publishVideoFullscreen(true)
     }
 
     override fun onHideCustomView() {
@@ -198,6 +185,11 @@ class VChromeClient(activity: MainActivity) : WebChromeClient() {
             return
         }
 
+        // Publish the fullscreen exit before view teardown. Every remaining
+        // exit path must converge the bar-color state, and the reapply only
+        // touches window attributes, not the view hierarchy.
+        activity.barColors.publishVideoFullscreen(false)
+
         if (!::fullscreenContainer.isInitialized || !::webview.isInitialized) {
             localCallback?.onCustomViewHidden()
             return
@@ -211,13 +203,6 @@ class VChromeClient(activity: MainActivity) : WebChromeClient() {
         webview.visibility = View.VISIBLE
         val controller = getInsetsController(activity)
         controller.show(WindowInsetsCompat.Type.navigationBars())
-        @Suppress("DEPRECATION")
-        run {
-            activity.window.statusBarColor = originalStatusBarColor
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.VANILLA_ICE_CREAM) {
-                activity.window.isStatusBarContrastEnforced = originalStatusBarContrastEnforced
-            }
-        }
         localCallback?.onCustomViewHidden()
     }
 

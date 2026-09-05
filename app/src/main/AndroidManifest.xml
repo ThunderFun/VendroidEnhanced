@@ -49,11 +49,18 @@
                 <category android:name="android.intent.category.BROWSABLE" />
                 <category android:name="android.intent.category.DEFAULT" />
 
+                <!-- discord.gg: invite links load in-app (NavigationPolicy
+                     admits them, and they redirect to a Discord app origin),
+                     so admit them here too. Hosts match exactly (no
+                     wildcards); invites are apex-hosted, which covers
+                     real-world links. Activity hosts are never linked from
+                     outside the client and stay unadmitted. -->
                 <data android:scheme="https" />
                 <data android:host="discord.com" />
                 <data android:host="ptb.discord.com" />
                 <data android:host="canary.discord.com" />
                 <data android:host="discordapp.com" />
+                <data android:host="discord.gg" />
             </intent-filter>
         </activity>
 

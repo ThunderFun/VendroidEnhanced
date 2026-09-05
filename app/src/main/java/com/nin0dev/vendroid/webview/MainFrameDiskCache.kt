@@ -27,6 +27,8 @@ import kotlin.concurrent.withLock
  *    **never** cached, so a stale copy cannot be re-served into a sensitive flow.
  *  - Stale entries are served only within [MAX_AGE_MS]; beyond that the cache is
  *    treated as a miss so ancient markup is never shown.
+ *  - Disk is self-reclaiming: each committed write sweeps entries older than
+ *    [MAX_AGE_MS], so evicted or orphaned entries cannot accumulate on disk.
  *  - Writes are atomic (`.tmp` + `renameTo`) and the file is size-capped.
  *  - Reads are defensive (any failure is a cache miss → network fetch).
  */object MainFrameDiskCache {
@@ -40,19 +42,30 @@ import kotlin.concurrent.withLock
     /** Cap on the number of URLs recorded in the preload index. */
     private const val MAX_INDEXED_URLS = 64
 
-    /** Serializes the index.txt read-modify-write. */
+    /** Entry files are named "$base.<suffix>"; base is this many lowercase hex chars. */
+    private const val ENTRY_BASE_LEN = 32
+
+    /** Serializes the index.txt read-modify-write and the post-write stale sweep. */
     private val indexAddLock = ReentrantLock()
 
-    // App-shell routes safe to cache & re-serve. Mirrors the resume allowlist
-    // in MainActivity.isAppResumeUrl; deliberately excludes
-    // login/authorize/track, which can carry OAuth state/nonce/CSRF params.
-    private val CACHEABLE_PATHS = arrayOf(
-        "/app",
-        "/channels", // "/channels" and "/channels/..."
-        "/library",
-        "/store",
-        "/friends"
-    )
+    /**
+     * Single source of truth for "app-shell route": the resume gate
+     * ([isResumableRoute], called from MainActivity) and the disk-cache gate
+     * ([isCacheableRoute]) both call this predicate, so they cannot drift.
+     *
+     * Exact-or-slash-prefix only: `path == X || path.startsWith("$X/")`. A
+     * bare `startsWith` would admit /storexyz or /libraryanything, which
+     * Discord 404s; resuming one lands on a page with empty back history
+     * (hardlock). /app is exact only, no /app/... subpages exist. Excluded:
+     * login/authorize/track (OAuth state/nonce/CSRF params) and /blog
+     * (NavigationPolicy sends it to the external popup, no in-app back path).
+     */
+    fun isAppShellPath(path: String): Boolean =
+        path == "/app" || // exact only, no /app/... subpages exist
+            path == "/channels" || path.startsWith("/channels/") ||
+            path == "/library" || path.startsWith("/library/") ||
+            path == "/store" || path.startsWith("/store/") ||
+            path == "/friends" || path.startsWith("/friends/")
 
     private var cacheDir: File? = null
     private val initLock = Any()
@@ -69,18 +82,26 @@ import kotlin.concurrent.withLock
 
     /**
      * True if the URL may be persisted and re-served as a stale HTML shell.
-     * Requires a Discord host, HTTPS, and an app-shell path.
+     * Requires HTTPS, a Discord **app origin** (discord.com / ptb. / canary. /
+     * discordapp.com apex, never CDN/media subdomains, which serve
+     * attacker-uploaded content) and an app-shell path ([isAppShellPath]).
      */
     fun isCacheableRoute(url: Uri): Boolean {
         if (url.scheme != "https") return false
         val host = url.host ?: return false
-        if (!Constants.isDiscordDomain(host)) return false
-        val path = url.path ?: "/"
-        // "/channels" must match "/channels" and "/channels/..." but not
-        // "/channelssomething".
-        if (path == "/channels" || path.startsWith("/channels/")) return true
-        return CACHEABLE_PATHS.any { path == it }
+        if (!Constants.isDiscordAppOrigin(host)) return false
+        val path = url.path ?: return false
+        return isAppShellPath(path)
     }
+
+    /**
+     * The resume twin of [isCacheableRoute] and the only policy applied to a
+     * restored lastUrl: MainActivity restores it via `loadUrl()`, which
+     * bypasses shouldOverrideUrlLoading and NavigationPolicy.decide (the
+     * deep-link branch runs decide; this branch does not).
+     */
+    fun isResumableRoute(urlString: String): Boolean =
+        isCacheableRoute(Uri.parse(urlString))
 
     /**
      * Persists a raw HTML main-frame response. No-op unless [isCacheableRoute]
@@ -147,13 +168,15 @@ import kotlin.concurrent.withLock
                 return false
             }
 
-            // Best-effort: drop any older body file for this URL now that the new
-            // meta is committed. Safe even if a concurrent reader holds the old
-            // file open (deleting an open file just orphans the fd; a read that
-            // races the delete lands in the catch below and becomes a cache
-            // miss).
-            dir.listFiles { _, n -> n.startsWith("$base.") && n.endsWith(".html") && n != "$base.$nowMs.html" }
-                ?.forEach { it.delete() }
+            // Best-effort: drop every other file for this URL now that the new
+            // meta is committed, including superseded bodies and .tmp debris
+            // from an interrupted write. Safe even if a concurrent reader holds
+            // an old file open (deleting an open file just orphans the fd; a
+            // read that races the delete lands in the catch below and becomes
+            // a cache miss).
+            dir.listFiles { _, n ->
+                n.startsWith("$base.") && n != "$base.$nowMs.html" && n != "$base.meta"
+            }?.forEach { it.delete() }
 
             // Record the URL in the index so cold-start preload can enumerate it.
             indexAddLock.withLock {
@@ -165,10 +188,17 @@ import kotlin.concurrent.withLock
                 if (!lines.contains(urlString)) {
                     lines.add(urlString)
                     if (lines.size > MAX_INDEXED_URLS) {
+                        // Untrack the oldest URL. Its files may still be inside
+                        // the MAX_AGE_MS serve window, so leave deletion to the
+                        // sweep below, which reclaims them once they expire.
+                        // The dead index line is a harmless preload miss until
+                        // the FIFO cycles it out.
                         lines.removeAt(0)
                     }
                     try { idx.writeText(lines.joinToString("\n") + "\n") } catch (_: Exception) {}
                 }
+                // Reclaim aged-out entries (evicted URLs, crash debris).
+                sweepExpiredEntries(dir, nowMs)
             }
             true
         } catch (e: Exception) {
@@ -247,6 +277,42 @@ import kotlin.concurrent.withLock
     private fun readFetchedAt(metaFile: File): Long? =
         try { metaFile.readText().substringBefore('\n').toLongOrNull() } catch (_: Exception) { null }
 
+    /**
+     * Deletes every cache entry older than [MAX_AGE_MS]. Best-effort; runs
+     * after every committed write, inside [indexAddLock].
+     *
+     * Entries can outlive their index line through index eviction, a failed
+     * index write, or crash debris, and [readMainFrame] only reclaims an entry
+     * when that exact URL is read again. An expired entry can never be served
+     * again, so deleting it costs at most a cache miss. Entries younger than
+     * MAX_AGE_MS, including files just committed by a write that has not
+     * reached the index yet, are left alone. The sweep never touches
+     * index.txt; dead lines there are harmless preload misses.
+     */
+    private fun sweepExpiredEntries(dir: File, nowMs: Long) {
+        try {
+            val filesByBase = HashMap<String, MutableList<File>>()
+            for (f in dir.listFiles() ?: return) {
+                val base = f.name.substringBefore('.')
+                // Entry files are "$base.<suffix>" with a hex base of exactly
+                // ENTRY_BASE_LEN chars; anything else is not ours to touch.
+                if (base.length != ENTRY_BASE_LEN ||
+                    !base.all { it in '0'..'9' || it in 'a'..'f' }) continue
+                filesByBase.getOrPut(base) { mutableListOf() }.add(f)
+            }
+            for ((base, files) in filesByBase) {
+                // Age comes from the meta's fetch timestamp; fall back to the
+                // newest file mtime so debris without a readable meta still
+                // ages out.
+                val fetchedAt = readFetchedAt(File(dir, "$base.meta"))
+                    ?: files.maxOfOrNull { it.lastModified() }?.takeIf { it > 0L }
+                    ?: continue // undatable, leave alone
+                if (nowMs - fetchedAt <= MAX_AGE_MS) continue
+                files.forEach { it.delete() }
+            }
+        } catch (_: Exception) {}
+    }
+
     /** The cacheable URLs recorded during writes, for cold-start preload. */
     fun preloadableUrls(): List<String> {
         val dir = cacheDir ?: return emptyList()
@@ -272,10 +338,10 @@ import kotlin.concurrent.withLock
         // hex chars keeps collisions astronomically unlikely while staying
         // compact.
         val md = java.security.MessageDigest.getInstance("SHA-256")
-        val sb = StringBuilder(32)
+        val sb = StringBuilder(ENTRY_BASE_LEN)
         for (b in md.digest(urlString.toByteArray(Charsets.UTF_8))) {
             sb.append(((b.toInt() and 0xFF) + 0x100).toString(16).substring(1))
         }
-        return sb.toString().take(32)
+        return sb.toString().take(ENTRY_BASE_LEN)
     }
 }

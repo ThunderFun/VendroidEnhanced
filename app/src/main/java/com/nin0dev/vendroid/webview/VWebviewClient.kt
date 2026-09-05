@@ -351,14 +351,20 @@ class VWebviewClient(
      * Serves a stale-while-revalidate main-frame from the disk cache.
      * On a hit: injects the current firewall + CSS into the cached raw HTML and
      * returns it (no network wait), then refreshes the caches in the background
-     * so the next navigation is fresh. Returns null to fall through to a
-     * blocking fetch when there is no valid disk entry.
+     * so the next navigation is fresh. The refresh resolves redirects via
+     * [resolveRedirects]; a blocked chain just skips the refresh. Returns
+     * null to fall through to a blocking fetch when there is no valid disk
+     * entry.
      */
     private fun serveStaleMainFrame(
         req: WebResourceRequest,
         urlString: String,
         responseCacheKey: String
     ): WebResourceResponse? {
+        // The shell store (URL-keyed disk cache + preloaded shells) only ever
+        // holds GET-fetched HTML, so a HEAD/POST main frame must neither serve
+        // a shell nor spawn the revalidate below.
+        if (req.method != "GET") return null
         // Prefer the memory-preloaded shell (filled at cold start from the
         // disk cache). Other routes fall through to the per-URL disk entry via
         // the preload, so a /channels request never receives the /app body. We
@@ -408,9 +414,29 @@ class VWebviewClient(
                 try {
                     if (refreshBuilder != null) {
                         refreshResponse = HttpClient.sharedClient.newCall(refreshBuilder.build()).execute()
-                        // Redirects are never auto-followed (client config); a 3xx
-                        // here is served/ignored as-is for a best-effort refresh.
-                        fetchAndProcessResponse(refreshIsMainFrame, refreshResponse, false, CacheTarget.MAIN_FRAME, urlString, responseCacheKey)
+                        // Redirects are never auto-followed (client config); resolve
+                        // 3xx via the same allowlist gate as the foreground fetch,
+                        // so the refresh lands on the real final response. Null
+                        // (blocked chain) skips the refresh and leaves the caches
+                        // untouched; the shell MAX_AGE bounds that staleness, after
+                        // which the blocking foreground fetch self-heals.
+                        val resolved = resolveRedirects(refreshIsMainFrame, refreshResponse, urlString, 0, hashSetOf(urlString))
+                        if (resolved != null) {
+                            if (resolved !== refreshResponse) {
+                                // Close the consumed 3xx (resolveRedirects never closes its input).
+                                refreshResponse.close()
+                                refreshResponse = resolved
+                            }
+                            // fetchAndProcessResponse's return value is discarded
+                            // here, so the Chromium M138+ multi-cookie channel
+                            // (Set-Cookie attached to that object) would drop the
+                            // final response's cookies; replay them into the store
+                            // like resolveRedirects does for hops. Pre-M138,
+                            // fetchAndProcessResponse replays Set-Cookie into the
+                            // store itself, making this an idempotent overwrite.
+                            harvestRedirectCookies(resolved)
+                            fetchAndProcessResponse(refreshIsMainFrame, resolved, false, CacheTarget.MAIN_FRAME, urlString, responseCacheKey)
+                        }
                     }
                 } catch (_: Exception) {
                     // Best-effort refresh; failure just leaves the cache stale.
@@ -490,10 +516,7 @@ class VWebviewClient(
      */
     private fun okHttpRequestBuilder(req: WebResourceRequest, urlString: String): Request.Builder {
         val rb = Request.Builder().url(urlString)
-        // GET/HEAD carry no body; use an empty body for other methods so
-        // Request.Builder.method() accepts them.
-        val body = if (req.method == "GET" || req.method == "HEAD") null else RequestBody.EMPTY
-        rb.method(req.method, body)
+        applyMethodAndBody(rb, req.method)
         if (req.url.path?.endsWith(".css") == true && isVencordCssUrl(req.url)) {
             rb.header("Cache-Control", "no-cache")
             rb.header("Pragma", "no-cache")
@@ -521,24 +544,36 @@ class VWebviewClient(
      *
      * Returns the final (non-redirect) [Response], or null when the chain
      * cannot proceed: a hop rejected by the allowlist, a redirect loop, a
-     * missing/unresolvable Location, or the depth limit (a 4th redirect
-     * response). The caller turns null into a blocking response, so a 3xx is
+     * missing/unresolvable Location, a non-standard 3xx (only
+     * 301/302/303/307/308 are followed), or the depth limit (a 4th redirect
+     * response). The foreground caller turns null into a blocking response
+     * (the SWR refresh just skips, leaving caches untouched), so a 3xx is
      * never served as the resource. Chromium treats intercepted responses as
      * final and does not follow their Location; serving one would render the
      * redirect body (typically empty) as the page and pass its unvalidated
      * Location header to Chromium.
      *
+     * Method handling is per [redirectMethod] and [applyMethodAndBody]; see
+     * those for the RFC 9110 matrix, the wire-method derivation, and the
+     * body pairing.
+     *
      * [response] is owned by the caller; this method never closes it. It
      * closes any intermediate responses it allocates while following.
+     *
+     * [isMainFrame] is a snapshot of WebResourceRequest.isForMainFrame taken
+     * on the intercept thread, not the request object: the SWR refresh calls
+     * this off-thread, where the Chromium-owned request must not be
+     * dereferenced.
      */
     private fun resolveRedirects(
-        req: WebResourceRequest,
+        isMainFrame: Boolean,
         response: Response,
         urlString: String,
         depth: Int,
         seen: MutableSet<String>
     ): Response? {
         if (response.code !in 300..399) return response
+
         // Chromium would have applied this hop's Set-Cookie natively. Login
         // flows commonly set session cookies on a 302 before redirecting, so
         // replay each into the cookie store, scoped to the hop's own URL (the
@@ -547,6 +582,11 @@ class VWebviewClient(
         // only delivery path. resolveRedirects validates each hop URL before
         // fetching it, so replays never target an unvalidated host.
         harvestRedirectCookies(response)
+        // Fail closed on non-standard 3xx: 304 has no Location (its
+        // conditional headers are stripped here anyway), and 300-with-Location
+        // and 305/306 carry semantics this path does not implement. Runs
+        // after the cookie harvest, so even a blocked 3xx delivers Set-Cookie.
+        if (response.code !in FOLLOWABLE_REDIRECT_CODES) return null
         // Depth limit: a 4th redirect is never served (see KDoc).
         if (depth >= 3) return null
         val location = response.header("Location") ?: return null
@@ -562,7 +602,6 @@ class VWebviewClient(
         // subresource allowlist here would let a Discord-origin page 3xx to a
         // non-Discord allowlisted host and load it as the top frame in-app,
         // bypassing the popup that forces non-Discord hosts to the browser.
-        val isMainFrame = req.isForMainFrame
         if (isMainFrame) {
             if (!Constants.isNavigationAllowedDomain(resolvedHost)) return null
             // Mirror NavigationPolicy: Discord /blog pages route to the popup.
@@ -581,18 +620,28 @@ class VWebviewClient(
         // so no null check is needed here.
         val sourceHost = response.request.url.host
         val crossOrigin = sourceHost != resolvedHost
+        // Map the next hop's method from the wire method actually sent for
+        // the current one, not the original request's: an earlier hop may
+        // already have converted POST to GET (see redirectMethod).
+        val currentMethod = response.request.method
+        val nextMethod = redirectMethod(response.code, currentMethod)
+        val methodChanged = nextMethod != currentMethod
         val rb = Request.Builder().url(target)
+        applyMethodAndBody(rb, nextMethod)
         for ((key, value) in response.request.headers) {
             val lowerKey = key.lowercase()
             if (lowerKey in OKHTTP_RESTRICTED_HEADERS) continue
             if (lowerKey == "accept-encoding") continue
             if (lowerKey in STRIPPED_CONDITIONAL_HEADERS) continue
             if (crossOrigin && lowerKey in CREDENTIAL_HEADERS) continue
+            // The converted request carries no body; forwarding the old
+            // body's Content-Type would advertise one.
+            if (methodChanged && lowerKey == "content-type") continue
             rb.addHeader(key, value)
         }
         val follow = HttpClient.sharedClient.newCall(rb.build()).execute()
         return try {
-            val next = resolveRedirects(req, follow, urlString, depth + 1, seen)
+            val next = resolveRedirects(isMainFrame, follow, urlString, depth + 1, seen)
             if (next !== follow) {
                 // Close the consumed intermediate response; keep the deeper one.
                 follow.close()
@@ -624,7 +673,13 @@ class VWebviewClient(
             }
         }
 
-        if (isMainFrame) {
+        // Only GET main frames participate in the main-frame caches. The LRU
+        // key carries the request method, but a redirect chain can convert the
+        // wire method (POST→GET on 301/302/303), so a cached body is a GET
+        // artifact only if the request itself is GET. The preloaded shells and
+        // the disk cache are URL-keyed with no method separation and are
+        // GET-gated at their write sites instead; see fetchAndProcessResponse.
+        if (isMainFrame && req.method == "GET") {
             mainFrameCache.get(responseCacheKey)?.let { cached ->
                 if (System.currentTimeMillis() - cached.fetchedAt < MAIN_FRAME_TTL_MS) {
                     // The cache stores the RAW body, so inject the firewall /
@@ -679,7 +734,7 @@ class VWebviewClient(
             // response. Seed the loop guard with the original URL so a
             // self-3xx host doesn't add an extra hop before the loop is
             // detected.
-            val resolved = resolveRedirects(req, response, urlString, 0, hashSetOf(urlString))
+            val resolved = resolveRedirects(isMainFrame, response, urlString, 0, hashSetOf(urlString))
             if (resolved == null) {
                 return blockedResponse()
             }
@@ -938,7 +993,13 @@ class VWebviewClient(
         // Persist the RAW main-frame HTML (before injection) for stale-while-
         // revalidate on a later cold start. Injection is applied at serve time
         // with the current firewall config, so only app-shell routes qualify.
-        if (isDiscordDomain && isMainFrame && statusCode in 200..299 && bodyBytes.isNotEmpty()) {
+        // GET-only: the disk cache is URL-keyed with no method separation and
+        // is stale-served to GET navigations. A real HEAD body is empty anyway
+        // (isNotEmpty skips it); the gate exists for the 307-preserved POST
+        // whose HTML would otherwise seed the store.
+        if (isDiscordDomain && isMainFrame && statusCode in 200..299 && bodyBytes.isNotEmpty() &&
+            response.request.method == "GET"
+        ) {
             val ctLower = (modifiedHeaders.getOrDefault("content-type", "")).lowercase()
             if (ctLower.contains("text/html")) {
                 // bodyBytes is still raw here; injection happens below. Persist
@@ -1010,7 +1071,12 @@ class VWebviewClient(
             val entry = CachedResponse(statusCode, reasonPhrase, headersToCache, bytesToCache)
             when (cacheTarget) {
                 CacheTarget.THEME_CSS -> themeCssCache.put(cacheKey, entry)
-                CacheTarget.MAIN_FRAME -> {
+                CacheTarget.MAIN_FRAME -> if (response.request.method == "GET") {
+                    // GET-only: the LRU key carries the ORIGINAL request's
+                    // method, but resolveRedirects may have converted the wire
+                    // method, and a non-GET body under that key would serve a
+                    // later HEAD/POST navigation. The URL-keyed shell refresh
+                    // below is gated here too.
                     mainFrameCache.put(cacheKey, entry)
                     // Refresh the in-memory preloaded shell so the preferred serve
                     // path doesn't fall back to a stale startup-time copy.
@@ -1207,6 +1273,54 @@ class VWebviewClient(
                 else -> null
             }
         }
+        // 301/302/303 are the only codes that (may) change the request
+        // method; preserving it is the entire purpose of 307/308.
+        private val POST_TO_GET_REDIRECT_CODES = setOf(301, 302, 303)
+
+        // The only 3xx statuses followed by resolveRedirects. Derived from the
+        // conversion set so the invariant "every method-converting status is
+        // followable" cannot drift. 300-with-Location (RFC 9110 §15.4.1), 304
+        // and 305/306 have no semantics this path implements and fail closed;
+        // see the gate in resolveRedirects.
+        private val FOLLOWABLE_REDIRECT_CODES = POST_TO_GET_REDIRECT_CODES + setOf(307, 308)
+
+        /**
+         * The method a follow-up redirect request must use, given the redirect
+         * status and the method actually sent on the wire for this hop. Pure,
+         * so the matrix can be unit-tested directly.
+         *
+         * resolveRedirects derives the input from the current hop's
+         * [Response.request], never from the original [WebResourceRequest], so
+         * a POST→GET conversion on an early hop survives later 307/308 hops.
+         * The result is applied through [applyMethodAndBody].
+         *
+         *  - 307/308: preserve the method unconditionally (RFC 9110
+         *    §15.4.7/§15.4.8).
+         *  - 301/302/303: convert POST to GET, the historical browser behavior
+         *    and the only method change RFC 9110 sanctions. GET and HEAD keep
+         *    their method on every code, so a redirected HEAD never downloads
+         *    the target body.
+         *  - Anything else preserves the method; only [FOLLOWABLE_REDIRECT_CODES]
+         *    statuses reach here.
+         */
+        private fun redirectMethod(statusCode: Int, currentMethod: String): String {
+            if (currentMethod == "POST" && statusCode in POST_TO_GET_REDIRECT_CODES) return "GET"
+            return currentMethod
+        }
+
+        /**
+         * Applies [method] to [rb] with a body pairing OkHttp accepts.
+         * Request.Builder.method() throws IllegalArgumentException unless
+         * GET/HEAD are bodiless and every other method has one, and a builder
+         * defaults to GET, so the method must be set explicitly. WebResource
+         * requests expose no body, so non-GET/HEAD methods carry
+         * [RequestBody.EMPTY] (Content-Length: 0 on the wire).
+         */
+        private fun applyMethodAndBody(rb: Request.Builder, method: String) {
+            val body = if (method == "GET" || method == "HEAD") null else RequestBody.EMPTY
+            rb.method(method, body)
+        }
+
         /** Blocking response: 200 + empty text/plain body. A 204 can let
          *  Chromium serve a cached copy; a 200 with mismatched MIME makes the
          *  resource a no-op (no script execution, no CSS application). */

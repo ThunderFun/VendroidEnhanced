@@ -24,12 +24,15 @@ import com.nin0dev.vendroid.utils.FirewallConfig
 import com.nin0dev.vendroid.utils.JsPatches
 import com.nin0dev.vendroid.utils.VDELog
 import com.nin0dev.vendroid.ui.LoadingScreenManager
+import com.nin0dev.vendroid.webview.BarColorManager
 import com.nin0dev.vendroid.webview.HttpClient
 import com.nin0dev.vendroid.webview.HttpClient.fetchVencord
+import com.nin0dev.vendroid.webview.MainFrameDiskCache
 import com.nin0dev.vendroid.webview.UrlNormalizer
 import com.nin0dev.vendroid.webview.VChromeClient
 import com.nin0dev.vendroid.webview.VWebviewClient
 import com.nin0dev.vendroid.webview.VencordNative
+import com.nin0dev.vendroid.webview.WindowSystemBarTarget
 import java.lang.ref.WeakReference
 import java.util.concurrent.Executors
 import java.util.concurrent.RejectedExecutionException
@@ -70,6 +73,19 @@ class MainActivity : AppCompatActivity() {
     private var pendingDeepLink: String? = null
     private lateinit var chromeClient: VChromeClient
     private lateinit var vencordNative: VencordNative
+
+    /**
+     * Sole writer of this window's status/nav bar colors. The Vencord overlay
+     * and fullscreen video publish their state here instead of managing
+     * colors themselves; see [BarColorManager]. Route any future bar-color
+     * change through it. Direct window writes reintroduce the clobbering
+     * bug this replaced. Per-window by design; it dies with this activity
+     * instance, so a theme change (activity recreation) re-captures the new
+     * theme's colors rather than restoring a stale snapshot.
+     */
+    val barColors: BarColorManager by lazy {
+        BarColorManager(WindowSystemBarTarget(window) { runOnUiThread(it) })
+    }
 
     @JvmField
     var filePathCallback: ValueCallback<Array<Uri>>? = null
@@ -124,26 +140,28 @@ class MainActivity : AppCompatActivity() {
 
     private fun migrateSettings() {
         val sPrefs = getSharedPreferences("settings", Context.MODE_PRIVATE)
-        if (sPrefs.getBoolean("migratedSettings", false)) return;
+        // runCatching: migratedSettings itself can arrive wrong-typed (restored
+        // or hand-edited XML). Treating it as unmigrated is safe; the apply()
+        // below overwrites it with a real Boolean.
+        if (runCatching { sPrefs.getBoolean("migratedSettings", false) }.getOrDefault(false)) return
         val ed = sPrefs.edit()
-        ed.putBoolean("migratedSettings", true);
+        ed.putBoolean("migratedSettings", true)
 
-        ed.putBoolean("checkVDEUpdates", sPrefs.getBoolean("checkVendroidUpdates", true))
+        // Flag, derived values, and legacy-key removals share one apply(): a
+        // lost batch re-runs the whole migration instead of leaving the flag
+        // set with half the work done.
+        val migration = computeSettingsMigration(sPrefs.all)
+        for (key in migration.uncoercible) {
+            VDELog.w("Main", "$key type-poisoned; using default")
+        }
+        ed.putBoolean("checkVDEUpdates", migration.checkVDEUpdates)
         // Both toggles were historically controlled by the single legacy
         // checkVendroidUpdates flag; keep them in sync during migration so an
         // existing user does not silently lose one.
-        ed.putBoolean(
-            "checkAnnouncements",
-            sPrefs.getBoolean("checkVendroidUpdates", true)
-        )
+        ed.putBoolean("checkAnnouncements", migration.checkVDEUpdates)
         // Derive clientMod from the legacy boolean only if unset; re-runs
         // (reinstall/flag wipe) must not clobber an existing choice.
-        if (!sPrefs.contains("clientMod")) {
-            ed.putString(
-                "clientMod",
-                if (sPrefs.getBoolean("equicord", false)) "equicord" else "vencord"
-            )
-        }
+        migration.clientMod?.let { ed.putString("clientMod", it) }
 
         ed.remove("checkVendroidUpdates")
         ed.remove("equicord")
@@ -165,8 +183,13 @@ class MainActivity : AppCompatActivity() {
         }
         // Load settings once and reuse throughout onCreate.
         val sPrefs = getSharedPreferences("settings", Context.MODE_PRIVATE)
-        if (!sPrefs.getBoolean("migratedSettings", false)) {
+        // migrateSettings early-returns once migratedSettings is set. Its
+        // reads are guarded; this catch exists so a future unguarded read
+        // degrades to defaults instead of crash-looping cold start.
+        try {
             migrateSettings()
+        } catch (t: Throwable) {
+            VDELog.e("Main", "Settings migration failed; continuing with defaults", t)
         }
 
         // First-run security disclosure. Do not load Discord, the WebView, or
@@ -354,7 +377,12 @@ class MainActivity : AppCompatActivity() {
     private fun syncFeatureToggles(sPrefs: SharedPreferences) {
         // Read into a @Volatile field so shouldInterceptRequest does not hit
         // SharedPreferences per request.
-        val blockTyping = sPrefs.getBoolean("vendroid_blockTypingIndicator", false)
+        // runCatching: a String-typed key left by an older build would crash
+        // startup here, before the bridge's write-path recovery can purge it.
+        // The first setBool from the settings panel overwrites the bad value.
+        val blockTyping = runCatching { sPrefs.getBoolean("vendroid_blockTypingIndicator", false) }
+            .onFailure { VDELog.w("Main", "vendroid_blockTypingIndicator type-poisoned; using default: $it") }
+            .getOrDefault(false)
         VWebviewClient.updateTypingBlock(blockTyping)
 
         // Sync the external-link confirmation toggle to the link popup.
@@ -416,11 +444,15 @@ class MainActivity : AppCompatActivity() {
             HttpClient.vencordDisabled = true
             HttpClient.setVencordRuntime(null)
             HttpClient.setVencordMobileRuntime(null)
-            Toast.makeText(this, "Safe mode enabled, Vencord won't be loaded", Toast.LENGTH_SHORT)
-                .show()
-            VDELog.w("Main", "Safe mode enabled — Vencord will not load")
-            editor.putBoolean("safeMode", false)
-            editor.apply()
+            // First-entry gate: the kill switch persists across recreations,
+            // the pref does not, so only the first run toasts and resets.
+            if (sPrefs.getBoolean("safeMode", false)) {
+                Toast.makeText(this, "Safe mode enabled, Vencord won't be loaded", Toast.LENGTH_SHORT)
+                    .show()
+                VDELog.w("Main", "Safe mode enabled — Vencord will not load")
+                editor.putBoolean("safeMode", false)
+                editor.apply()
+            }
         }
     }
 
@@ -496,7 +528,8 @@ class MainActivity : AppCompatActivity() {
         if (intent.action == Intent.ACTION_VIEW) {
             val data = intent.data
             val host = data?.host
-            if (host != null && Constants.isDiscordDomain(host)) {
+            // Deep-link gate, see Constants.isDeepLinkHandledDomain.
+            if (host != null && Constants.isDeepLinkHandledDomain(host)) {
                 val target = data.toString()
                 // Route through NavigationPolicy so path rules (e.g. /blog ->
                 // popup) apply to deep links like in-WebView navigations,
@@ -505,6 +538,8 @@ class MainActivity : AppCompatActivity() {
                     == com.nin0dev.vendroid.webview.NavigationPolicy.Action.LOAD_IN_WEBVIEW) {
                     wv!!.loadUrl(target)
                     currentUrlForBridge = target
+                    // A discord.gg invite 302s to an app origin; onPageStarted
+                    // refreshes both fields on commit.
                     currentHostForBridge = host
                     return target
                 }
@@ -523,7 +558,11 @@ class MainActivity : AppCompatActivity() {
         }
         // Remember-last-channel off: load the app shell instead of a saved
         // position, and drop any saved URL so re-enabling can't restore one.
-        if (!sPrefs.getBoolean("vendroid_rememberLastChannel", false)) {
+        // runCatching: a String-typed key left by an older build would crash
+        // startup here, before the bridge's write-path recovery can purge it.
+        if (!runCatching { sPrefs.getBoolean("vendroid_rememberLastChannel", false) }
+                .onFailure { VDELog.w("Main", "vendroid_rememberLastChannel type-poisoned; using default: $it") }
+                .getOrDefault(false)) {
             if (sPrefs.contains("lastUrl")) {
                 sPrefs.edit { remove("lastUrl") }
             }
@@ -534,7 +573,11 @@ class MainActivity : AppCompatActivity() {
         val lastUrl = sPrefs.getString("lastUrl", null)
         if (lastUrl != null) {
             val host = Uri.parse(lastUrl).host
-            if (host != null && Constants.isDiscordDomain(host) && isAppResumeUrl(lastUrl)) {
+            // The restore below calls loadUrl(), which bypasses
+            // shouldOverrideUrlLoading and NavigationPolicy.decide, so
+            // isResumableRoute (https + app origin + app-shell path, the
+            // cache predicate) is the only policy the resumed URL gets.
+            if (host != null && MainFrameDiskCache.isResumableRoute(lastUrl)) {
                 wv!!.loadUrl(lastUrl)
                 currentUrlForBridge = lastUrl
                 currentHostForBridge = host
@@ -554,12 +597,13 @@ class MainActivity : AppCompatActivity() {
     private fun handleUrl(url: Uri?) {
         if (url == null) return
         val host = url.host
-        // Non-Discord links are dropped; resolveInitialUrl loads the app shell
+        // Unhandled hosts are dropped; resolveInitialUrl loads the app shell
         // for them on cold start, but a running session has nothing to load.
-        if (host == null || !Constants.isDiscordDomain(host)) return
+        // Deep-link gate, see Constants.isDeepLinkHandledDomain.
+        if (host == null || !Constants.isDeepLinkHandledDomain(host)) return
         val path = url.path ?: ""
         // Route through NavigationPolicy like the cold-start path
-        // (resolveInitialUrl, tracker #10). Otherwise a /blog link drives the
+        // (resolveInitialUrl). Otherwise a /blog link drives the
         // SPA to a page with no back path, and a cdn.discordapp.com link
         // builds a garbage transitionTo route from the URL's path.
         if (com.nin0dev.vendroid.webview.NavigationPolicy.decide(url, true)
@@ -571,6 +615,23 @@ class MainActivity : AppCompatActivity() {
             // non-app-origin host fails VencordNative's domain checks closed.
             VDELog.d("Main", "Deep link policy popup: ${UrlNormalizer.redactForLog(url.toString())}")
             com.nin0dev.vendroid.webview.LinkHandler(this).showLinkPopup(url)
+            return
+        }
+        if (!Constants.isDiscordAppOrigin(host)) {
+            // discord.gg invites and Activity hosts load as a full navigation,
+            // never via transitionTo. An SPA route change fires no page
+            // events, so currentHostForBridge would stay non-app-origin and
+            // every bridge domain check would fail closed until the next full
+            // navigation.
+            if (!wvInitialized || wv == null) {
+                // Defer until onCreate finishes; handleUrl re-runs the gate
+                // on every entry, including routePendingDeepLink.
+                pendingDeepLink = url.toString()
+            } else {
+                // Bridge fields stay untouched; onPageStarted refreshes them
+                // as the invite redirect commits.
+                wv?.loadUrl(url.toString())
+            }
             return
         }
         currentUrlForBridge = url.toString()
@@ -604,17 +665,6 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    private fun isAppResumeUrl(url: String): Boolean {
-        val path = Uri.parse(url).path ?: return false
-        return path == "/app" ||
-            // "/channels" must match "/channels" and "/channels/..." but not
-            // "/channelssomething" (mirrors MainFrameDiskCache.isCacheableRoute).
-            path == "/channels" || path.startsWith("/channels/") ||
-            path.startsWith("/library") ||
-            path.startsWith("/store") ||
-            path.startsWith("/friends")
-    }
-
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
         if (intent.action == Intent.ACTION_VIEW) {
@@ -628,13 +678,17 @@ class MainActivity : AppCompatActivity() {
             currentUrlForBridge = url
             currentHostForBridge = Uri.parse(url).host
             val host = currentHostForBridge
-            // Persist only resumable app routes (isAppResumeUrl) and only
-            // while remember-last-channel is enabled; a saved non-app page
-            // (e.g. /blog/...) would reload on restart with empty back
-            // history, trapping the user there.
+            // Persist only resumable app-shell routes (the
+            // MainFrameDiskCache.isResumableRoute predicate, shared with the
+            // disk-cache gate) and only while remember-last-channel is on; a
+            // saved /blog page would reload with empty back history.
             val prefs = getSharedPreferences("settings", Context.MODE_PRIVATE)
-            if (host != null && Constants.isDiscordDomain(host) && isAppResumeUrl(url) &&
-                prefs.getBoolean("vendroid_rememberLastChannel", false)) {
+            // runCatching: a String-typed key left by an older build would
+            // crash onPause. Falling back to off skips the persist.
+            if (host != null && MainFrameDiskCache.isResumableRoute(url) &&
+                runCatching { prefs.getBoolean("vendroid_rememberLastChannel", false) }
+                    .onFailure { VDELog.w("Main", "vendroid_rememberLastChannel type-poisoned; using default: $it") }
+                    .getOrDefault(false)) {
                 prefs.edit() { putString("lastUrl", url) }
             }
         }
@@ -702,12 +756,7 @@ class MainActivity : AppCompatActivity() {
         // Safe mode: never inject. Also covers the fetchVencord caller, which
         // publishes a downloaded bundle before calling this.
         if (HttpClient.vencordDisabled) return
-        val runtime: String?
-        val mobileRuntime: String?
-        synchronized(vencordRuntimeLock) {
-            runtime = HttpClient.VencordRuntime
-            mobileRuntime = HttpClient.VencordMobileRuntime
-        }
+        val (runtime, mobileRuntime) = HttpClient.runtimeSnapshot()
         if (wv == null || runtime == null || mobileRuntime == null) return
         // Only inject on Discord pages; the runtimes are designed for Discord
         // and must not run on whitelisted non-Discord pages.
@@ -900,11 +949,6 @@ class MainActivity : AppCompatActivity() {
         } catch (_: Exception) {}
     }
 
-    /** True while a video/movie is in fullscreen custom view, so the overlay's
-     *  status-bar color management can skip and avoid clobbering fullscreen. */
-    fun isVideoFullscreen(): Boolean =
-        ::chromeClient.isInitialized && chromeClient.isFullscreen
-
     fun showDiscordToast(message: String, type: String) {
         // message is JSON-encoded via gson.toJson before interpolation, but type
         // is concatenated raw. Keep the allowList strict; widening it would
@@ -921,10 +965,55 @@ class MainActivity : AppCompatActivity() {
 
     companion object {
         private val gson = Gson()
-        private val vencordRuntimeLock = Any()
 
         /** SharedPreferences key for the last boot state summary (recovery screen). */
         const val PREF_LAST_BOOT_STATE = "lastBootState"
+
+        /**
+         * Pure decision core of [migrateSettings]; internal so the contract
+         * can be pinned by a JVM unit test without Android (same pattern as
+         * [runSafetyNetLoad]).
+         *
+         * [all] is the getAll() snapshot of the "settings" file; a null value
+         * counts as an absent key. The legacy keys are not type-trusted: an
+         * older build could persist them as Strings, and a plain getBoolean
+         * on those threw ClassCastException, which crash-looped cold start.
+         * Reading through [coerceLegacyBoolean] cannot throw.
+         *
+         * Coercion contract: a Boolean passes through, exact "true"/"false"
+         * Strings coerce, anything else present falls back to the default and
+         * is reported in [SettingsMigrationPlan.uncoercible]. A fallback
+         * loses the user's setting for good, since migrateSettings removes
+         * the legacy keys right after; callers must log uncoercible keys.
+         */
+        internal fun computeSettingsMigration(all: Map<String, Any?>): SettingsMigrationPlan {
+            val checkUpdates = coerceLegacyBoolean(all["checkVendroidUpdates"])
+            val equicord = coerceLegacyBoolean(all["equicord"])
+            val clientMod = when {
+                all["clientMod"] != null -> null // already set; never clobber
+                equicord == true -> "equicord"
+                else -> "vencord"
+            }
+            val uncoercible = listOf("checkVendroidUpdates", "equicord").filter { key ->
+                all[key] != null && coerceLegacyBoolean(all[key]) == null
+            }
+            return SettingsMigrationPlan(checkUpdates ?: true, clientMod, uncoercible)
+        }
+
+        /**
+         * Best-effort read of a legacy key whose stored type is not trusted.
+         * Returns null when the value is absent or unrecoverable; the caller
+         * supplies the default.
+         */
+        internal fun coerceLegacyBoolean(raw: Any?): Boolean? = when (raw) {
+            is Boolean -> raw
+            is String -> when (raw) {
+                "true" -> true
+                "false" -> false
+                else -> null
+            }
+            else -> null
+        }
 
         /** Bound on the parse-completion retries in injectVencordAttempt (100ms apart). */
         private const val INJECT_POLL_MAX_ATTEMPTS = 20
@@ -942,10 +1031,11 @@ class MainActivity : AppCompatActivity() {
          *
          * Guards are re-evaluated at execution time: the queue wait can span a
          * safe-mode re-entry or an invalidateBundleCache() from the JS-bridge
-         * update path. Publishes are compare-and-sets under
-         * [vencordRuntimeLock] because the preload thread may publish the same
-         * content while this task waits; an unconditional set would clobber
-         * it, and make tests that stub the runtimes flaky.
+         * update path. Publishes go through the compare-and-set helpers
+         * [HttpClient.setVencordMobileRuntimeIfNull] and
+         * [HttpClient.setVencordRuntimeIfNull] because the preload thread may
+         * publish the same content while this task waits; an unconditional set
+         * would clobber it, and make tests that stub the runtimes flaky.
          */
         internal fun runSafetyNetLoad(
             sPrefs: SharedPreferences,
@@ -963,11 +1053,8 @@ class MainActivity : AppCompatActivity() {
                     val mobile = res.openRawResource(R.raw.vencord_mobile).use {
                         HttpClient.readAsText(it)
                     }
-                    synchronized(vencordRuntimeLock) {
-                        if (!HttpClient.vencordDisabled && HttpClient.VencordMobileRuntime == null) {
-                            HttpClient.setVencordMobileRuntime(mobile)
-                            published = true
-                        }
+                    if (HttpClient.setVencordMobileRuntimeIfNull(mobile)) {
+                        published = true
                     }
                 }
                 // 2. Main runtime (~1 MB from disk).
@@ -982,15 +1069,14 @@ class MainActivity : AppCompatActivity() {
                             // readBundleFromDisk patches when the persisted flag
                             // is stale; the result is ready to publish.
                             val fileContent = HttpClient.readBundleFromDisk(sPrefs, vendroidFile)
-                            synchronized(vencordRuntimeLock) {
-                                // The vencordDisabled re-check matters: safe
-                                // mode nulls the runtime, so a queued read
-                                // could otherwise publish into a safe-mode
-                                // session.
-                                if (!HttpClient.vencordDisabled && HttpClient.VencordRuntime == null) {
-                                    HttpClient.setVencordRuntime(fileContent)
-                                    published = true
+                            // stillValid re-checks the guards at publish time;
+                            // the read can stall across a clientMod switch,
+                            // which deletes the file and forces a redownload.
+                            if (HttpClient.setVencordRuntimeIfNull(fileContent) {
+                                    !HttpClient.needsBundleRedownload(sPrefs) && vendroidFile.exists()
                                 }
+                            ) {
+                                published = true
                             }
                         } catch (e: Exception) {
                             VDELog.e("Main", "Failed to read vendroidFile", e)
@@ -1018,3 +1104,13 @@ class MainActivity : AppCompatActivity() {
         }
     }
 }
+
+/** See [MainActivity.computeSettingsMigration] for the contract. */
+internal data class SettingsMigrationPlan(
+    /** Value for checkVDEUpdates; checkAnnouncements mirrors it. */
+    val checkVDEUpdates: Boolean,
+    /** null leaves an existing clientMod untouched. */
+    val clientMod: String?,
+    /** Legacy keys stored under an unrecoverable type. */
+    val uncoercible: List<String>
+)

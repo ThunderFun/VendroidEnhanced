@@ -76,6 +76,22 @@ object Constants {
     }
 
     /**
+     * Deep-link gate for VIEW intents landing in MainActivity. Union of
+     * [isDiscordDomain] and [isNavigationAllowedDomain]. [isDiscordDomain]
+     * admits every *.discord.com / *.discordapp.com subdomain, so non-app
+     * hosts (support.discord.com, cdn.discordapp.com) still reach
+     * NavigationPolicy and route to the link popup; [isNavigationAllowedDomain]
+     * adds discord.gg invites and the Activity hosts, which load in-WebView.
+     *
+     * Broader than the manifest intent-filter, which admits apexes only
+     * (Android matches hosts exactly, no wildcards). Explicit VIEW intents
+     * from other apps can name any host. NavigationPolicy decides
+     * LOAD_IN_WEBVIEW vs popup for everything that passes.
+     */
+    fun isDeepLinkHandledDomain(host: String): Boolean =
+        isDiscordDomain(host) || isNavigationAllowedDomain(host)
+
+    /**
      * WebView domain allowlist, backed by [FirewallConfig]. Entries use
      * leading-dot form (".example.com") so apex/subdomain matches do not
      * falsely match lookalikes such as "evildiscord.com".

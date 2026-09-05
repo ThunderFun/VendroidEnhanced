@@ -4,9 +4,7 @@ import android.content.ComponentName
 import android.content.Context
 import android.content.SharedPreferences
 import android.content.pm.PackageManager
-import android.graphics.Color
 import android.net.Uri
-import android.os.Build
 import android.os.Handler
 import android.os.Looper
 import android.webkit.JavascriptInterface
@@ -38,10 +36,10 @@ class VencordNative(private val activity: WeakReference<MainActivity>, wv: WebVi
         private const val MAX_STRING_VALUE_LENGTH = 64 * 1024 // 64 KB
         // Settings keys the rest of the app reads as Booleans (via
         // SharedPreferences.getBoolean). Writing a String to any of these (e.g.
-        // via setString) would make getBoolean throw ClassCastException — a
-        // crash loop at startup for vendroid_confirmExternalLinks and a silent
-        // toggle defeat for the others. setString must never write to them.
-        // String-read mirror: STRING_SETTING_KEYS below.
+        // via setString) makes getBoolean throw ClassCastException. That was
+        // a cold-start crash loop before the fallbacks went into MainActivity;
+        // now it silently defeats the toggle. setString must never write to
+        // them. String-read mirror: STRING_SETTING_KEYS below.
         internal val BOOLEAN_SETTING_KEYS = setOf(
             "vendroid_confirmExternalLinks",
             "vendroid_blockTypingIndicator",
@@ -393,10 +391,6 @@ class VencordNative(private val activity: WeakReference<MainActivity>, wv: WebVi
     }
 
     @Volatile
-    var overlayActive = false
-        private set
-
-    @Volatile
     private var logsDialogActive = false
 
     @Volatile
@@ -404,9 +398,6 @@ class VencordNative(private val activity: WeakReference<MainActivity>, wv: WebVi
 
     @Volatile
     private var quickCssDialogActive = false
-
-    private var originalStatusBarColor: Int? = null
-    private var originalNavBarColor: Int? = null
 
     // Eagerly initialize SharedPreferences in the constructor (which runs on
     // the main thread during WebView setup) instead of lazily on the JS bridge
@@ -648,6 +639,14 @@ class VencordNative(private val activity: WeakReference<MainActivity>, wv: WebVi
     fun shutdown() {
         isShutdown = true
         executor.shutdown()
+        // Drops the WebView reference so every wvRef consumer sees null and
+        // bails. Runs on the UI thread, in the same handler message as
+        // wv.destroy(); the only call site is MainActivity.onDestroy. A
+        // bridge-posted runnable therefore executes either before that
+        // message, with the WebView alive, or after it, where goBack's
+        // checks bail. If onDestroy reorders these calls, goBack's
+        // catch(Throwable) is the only guard left.
+        wvRef.clear()
     }
 
     /**
@@ -669,40 +668,34 @@ class VencordNative(private val activity: WeakReference<MainActivity>, wv: WebVi
     fun setOverlayActive(token: String?, active: Boolean) {
         if (!isBridgeAuthorized(token)) return
         if (!isOnDiscordDomain()) return
-        overlayActive = active
+        // Bar colors are owned by MainActivity.barColors. Forward the overlay
+        // state and let it re-derive status/nav colors. The manager is
+        // order-independent, so interleaving with fullscreen video is safe.
         val act = activity.get() ?: return
-        act.runOnUiThread {
-            // Don't fight the fullscreen video path over status/nav bar colors.
-            if (act.isVideoFullscreen()) return@runOnUiThread
-            @Suppress("DEPRECATION")
-            if (active) {
-                if (originalStatusBarColor == null) {
-                    originalStatusBarColor = act.window.statusBarColor
-                }
-                if (originalNavBarColor == null) {
-                    originalNavBarColor = act.window.navigationBarColor
-                }
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.VANILLA_ICE_CREAM) {
-                    act.window.isStatusBarContrastEnforced = false
-                    act.window.isNavigationBarContrastEnforced = false
-                }
-                act.window.statusBarColor = Color.BLACK
-                act.window.navigationBarColor = Color.BLACK
-            } else {
-                act.window.statusBarColor = originalStatusBarColor ?: act.window.statusBarColor
-                act.window.navigationBarColor = originalNavBarColor ?: act.window.navigationBarColor
-            }
-        }
+        act.barColors.publishOverlayActive(active)
     }
 
     @JavascriptInterface
     fun goBack(token: String?) {
         if (!isBridgeAuthorized(token)) return
         if (!isOnDiscordDomain()) return
-        activity.get()?.runOnUiThread {
+        // Early skip only; shutdown() can still run between here and the
+        // runnable below.
+        if (isShutdown) return
+        val act = activity.get() ?: return
+        act.runOnUiThread {
+            // Surviving these checks proves wv.destroy() has not run; see
+            // shutdown().
+            if (isShutdown) return@runOnUiThread
             val wv = wvRef.get() ?: return@runOnUiThread
-            if (wv.canGoBack()) wv.goBack() else
-                activity.get()?.finish()
+            try {
+                if (wv.canGoBack()) wv.goBack() else act.finish()
+            } catch (t: Throwable) {
+                // Catch Throwable rather than IllegalStateException.
+                // Destroyed-WebView calls throw NPE inside Chromium on some
+                // builds; see the threading-model note on MainActivity.wv.
+                VDELog.e("VN", "goBack failed", t)
+            }
         }
     }
 
@@ -846,10 +839,8 @@ class VencordNative(private val activity: WeakReference<MainActivity>, wv: WebVi
         val safeId = id ?: return
         val safeValue = value ?: return
         // Type-safety: never write a String to a key the app reads as a
-        // Boolean. Writing a String to vendroid_confirmExternalLinks or
-        // vendroid_blockTypingIndicator would make the startup getBoolean()
-        // throw ClassCastException (a crash loop for the former, a silent
-        // toggle defeat for the latter).
+        // Boolean (see BOOLEAN_SETTING_KEYS). A String there silently
+        // defeats the toggle.
         if (!isTypeSafeBridgeWrite("setString", safeId)) {
             VDELog.w("VN", "Rejected setString on Boolean-key: $safeId")
             return
@@ -884,6 +875,7 @@ class VencordNative(private val activity: WeakReference<MainActivity>, wv: WebVi
                     putInt("lastMajorUpdateThatUserHasUpdatedVencord", 0)
                     remove(HttpClient.PREF_ETAG)
                     remove(HttpClient.PREF_ETAG_LOCATION)
+                    remove(HttpClient.PREF_ETAG_REQUEST_URL)
                     remove(HttpClient.PREF_BUNDLE_PATCHED)
                     remove(HttpClient.PREF_BUNDLE_PATCH_SET)
                     // The putInt above already forces needsBundleRedownload,

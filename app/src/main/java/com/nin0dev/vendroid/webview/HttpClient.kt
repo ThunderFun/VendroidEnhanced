@@ -16,15 +16,24 @@ import java.io.InputStream
 import java.util.Locale
 import java.util.concurrent.TimeUnit
 import okhttp3.ConnectionPool
+import okhttp3.HttpUrl
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.Response
+import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 import java.net.HttpURLConnection
-import java.net.URL
 
 object HttpClient {
     // Generous ceiling for any text body read into memory (bundle, CSS).
     const val MAX_READ_BYTES = 16 * 1024 * 1024 // 16 MB
+
+    /**
+     * Maximum redirect hops followed manually. Each hop can consume the full
+     * connect+read timeouts (30s), and updateVencord holds a bridge call
+     * while the loop runs, so the cap bounds worst-case latency. Further
+     * hops throw IOException and hit the cached-bundle fallback.
+     */
+    private const val MAX_REDIRECT_HOPS = 5
     /**
      * Shared app-wide OkHttp client. Reuses pooled TCP/TLS connections across
      * requests to the same host, avoiding a fresh connect + TLS handshake.
@@ -80,11 +89,68 @@ object HttpClient {
      */
     private val bundleWriteLock = Any()
 
-    @JvmStatic
-    fun setVencordRuntime(value: String?) { VencordRuntime = value }
+    /**
+     * Serializes runtime publishes and the pair-read behind [runtimeSnapshot].
+     * The fields are @Volatile, but the disk-loading publishers are
+     * check-then-read-then-publish, so a publish whose read stalled on slow
+     * storage can land after a fresher publish or an invalidation and
+     * resurrect stale content.
+     */
+    private val vencordRuntimeLock = Any()
 
     @JvmStatic
-    fun setVencordMobileRuntime(value: String?) { VencordMobileRuntime = value }
+    fun setVencordRuntime(value: String?) {
+        synchronized(vencordRuntimeLock) { VencordRuntime = value }
+    }
+
+    @JvmStatic
+    fun setVencordMobileRuntime(value: String?) {
+        synchronized(vencordRuntimeLock) { VencordMobileRuntime = value }
+    }
+
+    /**
+     * Compare-and-set publish for the mobile runtime: installs [value] only
+     * while the mobile runtime is still unset and safe mode is not raised.
+     * Returns true when this call performed the publish.
+     */
+    @JvmStatic
+    fun setVencordMobileRuntimeIfNull(value: String?): Boolean =
+        synchronized(vencordRuntimeLock) {
+            if (VencordMobileRuntime == null && !vencordDisabled) {
+                VencordMobileRuntime = value
+                true
+            } else false
+        }
+
+    /**
+     * Compare-and-set publish for the main runtime: installs [value] only
+     * while the runtime is still unset and safe mode is not raised, re-running
+     * the caller's pre-read guards via [stillValid] under the lock. Returns
+     * true when this call performed the publish.
+     *
+     * [stillValid] covers what the null-check cannot: the clientMod switch
+     * nulls an already-null runtime, so only a re-check of the guards catches
+     * a read that stalled across the switch. The fresh-download publish in
+     * [downloadStoreAndSync] is deliberately not a compare-and-set; it is
+     * authoritative and must win.
+     */
+    @JvmStatic
+    fun setVencordRuntimeIfNull(value: String?, stillValid: (() -> Boolean)? = null): Boolean =
+        synchronized(vencordRuntimeLock) {
+            if (VencordRuntime == null && !vencordDisabled && (stillValid == null || stillValid())) {
+                VencordRuntime = value
+                true
+            } else false
+        }
+
+    /**
+     * Consistent pair-read of both runtimes for the injection decision. A
+     * publish that has installed the mobile runtime but not yet the main one
+     * must never be observed torn.
+     */
+    @JvmStatic
+    fun runtimeSnapshot(): Pair<String?, String?> =
+        synchronized(vencordRuntimeLock) { VencordRuntime to VencordMobileRuntime }
 
     // Vencord bundle patches applied at download time. The Slate/command-browser
     // fix is applied at runtime in vencord_mobile.js. Each patch carries a
@@ -175,6 +241,11 @@ object HttpClient {
 
     /** SharedPreferences key of the bundle URL the stored ETag belongs to. */
     const val PREF_ETAG_LOCATION = "vencordEtagLocation"
+
+    /** SharedPreferences key of the URL whose response issued [PREF_ETAG]
+     *  (the last hop of the fetch; can differ from [PREF_ETAG_LOCATION]
+     *  after a redirect). */
+    const val PREF_ETAG_REQUEST_URL = "vencordEtagRequestUrl"
 
     /** SharedPreferences key of the epoch-ms of the last definitive freshness
      *  answer (304 or fresh download); boots inside [BUNDLE_CHECK_INTERVAL_MS]
@@ -301,6 +372,7 @@ object HttpClient {
         sPrefs.edit()
             .remove(PREF_ETAG)
             .remove(PREF_ETAG_LOCATION)
+            .remove(PREF_ETAG_REQUEST_URL)
             .remove(PREF_BUNDLE_BUILD)
             .remove(PREF_BUNDLE_HASH)
             .remove(PREF_BUNDLE_PATCHED)
@@ -465,16 +537,16 @@ object HttpClient {
             return
         }
 
-        // Ignore a stored ETag from a different bundle URL: after a location
-        // change it would produce spurious 304s against the new endpoint.
-        val storedEtag = sPrefs.getString(PREF_ETAG, null)
-            ?.takeIf { sPrefs.getString(PREF_ETAG_LOCATION, null) == vencordLocation }
+        // A validator is only ever sent to the URL whose response issued it.
+        val storedEtag = storedEtagFor(sPrefs, vencordLocation, vencordLocation)
         var resp: Response? = null
         try {
             // ETag-conditional GET: 304 keeps the cache (cheap), 200 swaps in
             // a newer build. Detects new Vencord builds without wiping app
             // data.
-            resp = executeVencordGetResolvingRedirect(vencordLocation, storedEtag)
+            resp = executeVencordGetResolvingRedirect(vencordLocation, storedEtag) { hopUrl ->
+                storedEtagFor(sPrefs, vencordLocation, hopUrl)
+            }
             var responseCode = resp.code
             val responseEtag = resp.header("ETag")
             VDELog.i(
@@ -487,7 +559,9 @@ object HttpClient {
                 responseCode == HttpURLConnection.HTTP_NOT_MODIFIED && vendroidFile.exists() -> {
                     VDELog.i("HTTP", "Bundle branch: 304 (cache hit, fresh)")
                     if (VencordRuntime == null) {
-                        VencordRuntime = readBundleFromDisk(sPrefs, vendroidFile)
+                        setVencordRuntimeIfNull(readBundleFromDisk(sPrefs, vendroidFile)) {
+                            vendroidFile.exists()
+                        }
                     }
                     bundleCheckedThisSession = true
                     // Definitive freshness answer: stamp the window so later
@@ -501,7 +575,7 @@ object HttpClient {
 
                 responseCode == HttpURLConnection.HTTP_NOT_MODIFIED -> {
                     // 304 with no local file; re-request unconditionally,
-                    // following one validated redirect like the primary path.
+                    // following validated redirects like the primary path.
                     resp?.close()
                     resp = executeVencordGetResolvingRedirect(vencordLocation, null)
                     responseCode = resp.code
@@ -520,7 +594,9 @@ object HttpClient {
                     // so startup doesn't break; otherwise surface the failure.
                     if (vendroidFile.exists() && VencordRuntime == null) {
                         VDELog.e("HTTP", "Bundle branch: fallback-cache (HTTP $responseCode)")
-                        VencordRuntime = readBundleFromDisk(sPrefs, vendroidFile)
+                        setVencordRuntimeIfNull(readBundleFromDisk(sPrefs, vendroidFile)) {
+                            vendroidFile.exists()
+                        }
                         bundleCheckedThisSession = true
                     } else {
                         throw IOException("HTTP $responseCode fetching Vencord bundle from $vencordLocation")
@@ -532,7 +608,9 @@ object HttpClient {
             // when a cached bundle exists; only the no-cache case propagates.
             if (vendroidFile.exists() && VencordRuntime == null) {
                 VDELog.e("HTTP", "Bundle branch: fallback-cache (network error: ${io.message})")
-                VencordRuntime = readBundleFromDisk(sPrefs, vendroidFile)
+                setVencordRuntimeIfNull(readBundleFromDisk(sPrefs, vendroidFile)) {
+                    vendroidFile.exists()
+                }
                 bundleCheckedThisSession = true
             } else {
                 throw io
@@ -548,8 +626,7 @@ object HttpClient {
 
     /**
      * Executes a conditional GET for the Vencord bundle over the shared pooled
-     * client. Redirects are never auto-followed (client config); the caller
-     * validates any redirect host against the allowlist.
+     * client. Redirects are never auto-followed (client config).
      */
     private fun executeVencordGet(url: String, etag: String?): Response {
         val rb = Request.Builder().url(url)
@@ -558,37 +635,96 @@ object HttpClient {
     }
 
     /**
-     * Executes a conditional GET, resolving one redirect hop against the HTTPS
-     * + host allowlist (redirects are never auto-followed by the client).
+     * The stored ETag, but only when the stored state still belongs to
+     * [originUrl] (a location or clientMod switch must not reuse validators
+     * across resources) and it was issued by [requestUrl]'s own response.
+     * An ETag compared against a resource that did not issue it can produce
+     * a false 304 that pins a stale bundle as fresh.
+     */
+    private fun storedEtagFor(
+        sPrefs: SharedPreferences,
+        originUrl: String,
+        requestUrl: String
+    ): String? =
+        sPrefs.getString(PREF_ETAG, null)
+            ?.takeIf { sPrefs.getString(PREF_ETAG_LOCATION, null) == originUrl }
+            ?.takeIf { sPrefs.getString(PREF_ETAG_REQUEST_URL, null) == requestUrl }
+
+    /**
+     * Resolves a redirect Location against the current hop's URL (relative
+     * references per RFC 3986) and gates the target on HTTPS + the host
+     * allowlist.
+     */
+    private fun resolveRedirectTarget(currentUrl: String, location: String): HttpUrl {
+        if (location.isBlank()) {
+            throw IOException("Redirect with blank Location header from $currentUrl")
+        }
+        val base = currentUrl.toHttpUrlOrNull()
+            ?: throw IOException("Unparseable current URL: $currentUrl")
+        val target = base.resolve(location)
+            ?: throw IOException("Unresolvable redirect Location from $currentUrl: $location")
+        if (!target.isHttps) {
+            throw IOException("Redirect to non-HTTPS scheme: ${target.scheme}")
+        }
+        if (!Constants.isAllowedVencordHost(target.host)) {
+            throw IOException("Redirect to disallowed host: ${target.host}")
+        }
+        return target
+    }
+
+    /**
+     * Executes a GET, following up to [MAX_REDIRECT_HOPS] redirects manually
+     * (the client never auto-follows). Every target is validated against
+     * HTTPS + the host allowlist before it is requested; Locations resolve
+     * against the current hop's URL, so relative redirects stay correct
+     * mid-chain.
+     *
+     * [etag] conditions the first request. [redirectEtag] may condition each
+     * followed hop and must only return a validator for a URL whose own
+     * response issued it (see [storedEtagFor]); the default never conditions
+     * a followed hop.
      *
      * Precondition: the caller validated the initial [url]; only redirect
      * targets are validated here.
      */
     @Throws(IOException::class)
-    fun executeVencordGetResolvingRedirect(url: String, etag: String?): Response {
-        val resp = executeVencordGet(url, etag)
-        // 304 is a cache hit, not a redirect. Without this, 304 responses
-        // (which have no Location header) throw and permanently pin the app
-        // to the cached bundle once an ETag is stored.
-        if (resp.code == HttpURLConnection.HTTP_NOT_MODIFIED) return resp
-        if (resp.code !in 300..399) return resp
-        val location = resp.header("Location")
-            ?: run {
-                resp.close()
-                throw IOException("Redirect with no Location header")
+    fun executeVencordGetResolvingRedirect(
+        url: String,
+        etag: String?,
+        redirectEtag: (hopUrl: String) -> String? = { null }
+    ): Response {
+        var currentUrl = url
+        var currentEtag = etag
+        var hops = 0
+        while (true) {
+            val resp = executeVencordGet(currentUrl, currentEtag)
+            // 304 is a cache hit with no Location header; it must
+            // short-circuit before redirect handling or a stored ETag
+            // throws here and pins the cached bundle forever.
+            if (resp.code == HttpURLConnection.HTTP_NOT_MODIFIED) return resp
+            if (resp.code !in 300..399) return resp
+            val location = resp.header("Location")
+            // Release each 3xx's connection; the caller closes only the
+            // final response.
+            resp.close()
+            if (location == null) {
+                throw IOException("Redirect with no Location header from $currentUrl")
             }
-        resp.close()
-        val redirectUrl = URL(URL(url), location)
-        if (!redirectUrl.protocol.equals("https", ignoreCase = true)) {
-            throw IOException("Redirect to non-HTTPS scheme: ${redirectUrl.protocol}")
+            if (hops >= MAX_REDIRECT_HOPS) {
+                throw IOException(
+                    "Too many redirects (>$MAX_REDIRECT_HOPS) fetching Vencord bundle from $url"
+                )
+            }
+            val target = resolveRedirectTarget(currentUrl, location)
+            hops++
+            VDELog.d(
+                "HTTP",
+                "Following redirect hop $hops to host=${target.host} " +
+                    "etagSent=${currentEtag != null}"
+            )
+            currentUrl = target.toString()
+            currentEtag = redirectEtag(currentUrl)
         }
-        val redirectHost = redirectUrl.host
-        // Reject null host so the whitelist stays a hard gate rather than
-        // relying on openConnection() to throw later.
-        if (redirectHost == null || !Constants.isAllowedVencordHost(redirectHost)) {
-            throw IOException("Redirect to disallowed or unresolvable host: $redirectHost")
-        }
-        return executeVencordGet(redirectUrl.toString(), etag)
     }
 
     /**
@@ -652,13 +788,18 @@ object HttpClient {
             val e = sPrefs.edit()
             val responseEtag = resp.header("ETag")
             if (responseEtag != null) {
+                // One batch: the url+etag keys must flip atomically so a
+                // concurrent reader never pairs a validator with a URL that
+                // did not issue it.
                 e.putString(PREF_ETAG, responseEtag)
                 e.putString(PREF_ETAG_LOCATION, bundleLocation)
+                e.putString(PREF_ETAG_REQUEST_URL, resp.request.url.toString())
             } else {
                 // A server that stops sending ETags must not leave a stale one
                 // behind.
                 e.remove(PREF_ETAG)
                 e.remove(PREF_ETAG_LOCATION)
+                e.remove(PREF_ETAG_REQUEST_URL)
             }
             e.putInt(PREF_LAST_BUNDLE_UPDATE, BuildConfig.VERSION_CODE)
             // A fresh download is a definitive freshness answer for every

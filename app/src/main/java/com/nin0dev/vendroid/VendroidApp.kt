@@ -141,7 +141,7 @@ class VendroidApp : Application() {
                     // 1. VencordMobile runtime (65 KB raw resource, memory-mapped)
                     if (HttpClient.VencordMobileRuntime == null) {
                         resources.openRawResource(R.raw.vencord_mobile).use { inputStream ->
-                            HttpClient.setVencordMobileRuntime(HttpClient.readAsText(inputStream))
+                            HttpClient.setVencordMobileRuntimeIfNull(HttpClient.readAsText(inputStream))
                         }
                     }
                     VDELog.i("VDE", "VencordMobile runtime preloaded")
@@ -159,10 +159,21 @@ class VendroidApp : Application() {
                             // applied during a previous download. Skip the
                             // redundant ~1MB regex scan by trusting the
                             // persisted patched flag + patch-set key.
-                            HttpClient.setVencordRuntime(
+                            //
+                            // stillValid re-checks the guards at publish time;
+                            // the read can stall for seconds on slow storage
+                            // while a clientMod switch deletes the file and
+                            // forces a redownload.
+                            val published = HttpClient.setVencordRuntimeIfNull(
                                 HttpClient.readBundleFromDisk(sPrefs, vendroidFile)
-                            )
-                            VDELog.i("VDE", "Vencord runtime preloaded (${vendroidFile.length()} bytes)")
+                            ) {
+                                !HttpClient.needsBundleRedownload(sPrefs) && vendroidFile.exists()
+                            }
+                            if (published) {
+                                VDELog.i("VDE", "Vencord runtime preloaded (${vendroidFile.length()} bytes)")
+                            } else {
+                                VDELog.i("VDE", "Vencord runtime preload skipped (published or invalidated elsewhere)")
+                            }
                         } catch (ex: Exception) {
                             VDELog.e("VDE", "Failed to apply Vencord patches: ${ex.message}", ex)
                         }
