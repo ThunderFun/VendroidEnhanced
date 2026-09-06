@@ -195,7 +195,12 @@ class MainActivity : AppCompatActivity() {
         // First-run security disclosure. Do not load Discord, the WebView, or
         // any injected code until the user accepts the risks of a modified
         // Discord client running third-party code.
-        if (!sPrefs.getBoolean("riskWarningAccepted", false)) {
+        // runCatching: a poisoned value would crash-loop the :web cold start,
+        // and no recovery action rewrites this key. Defaulting to false
+        // re-shows the warning; accepting overwrites the key with a real Boolean.
+        if (!runCatching { sPrefs.getBoolean("riskWarningAccepted", false) }
+                .onFailure { VDELog.w("Main", "riskWarningAccepted type-poisoned; showing warning: $it") }
+                .getOrDefault(false)) {
             showFirstRunWarning(sPrefs)
             return
         }
@@ -219,9 +224,10 @@ class MainActivity : AppCompatActivity() {
             .setNegativeButton(android.R.string.cancel) { _, _ -> finish() }
             .create()
         dialog.setOnDismissListener {
+            unregisterDialog(dialog)
             // Teardown dismissal must not re-enter finish() on a dying activity.
             if (isFinishing || isDestroyed) return@setOnDismissListener
-            if (!sPrefs.getBoolean("riskWarningAccepted", false)) finish()
+            if (!runCatching { sPrefs.getBoolean("riskWarningAccepted", false) }.getOrDefault(false)) finish()
         }
         registerDialog(dialog)
         dialog.show()
@@ -332,6 +338,8 @@ class MainActivity : AppCompatActivity() {
             wv!!.settings.userAgentString =
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
         }
+        // Sync the UA cache VWebviewClient uses for intercepted fetches.
+        VWebviewClient.updateWebViewUserAgent(wv!!.settings.userAgentString)
         val s = wv!!.settings
         s.javaScriptEnabled = true
         s.domStorageEnabled = true
@@ -646,7 +654,7 @@ class MainActivity : AppCompatActivity() {
                 // Safe mode never consumes a deferred link (no runtimes to
                 // inject), and the pref is already reset by now, so key on
                 // the session flag.
-                VDELog.w("Main", "Safe mode active; loading deep link directly: $url")
+                VDELog.w("Main", "Safe mode active; loading deep link directly: ${UrlNormalizer.redactForLog(url.toString())}")
                 wv?.loadUrl(url.toString())
             } else {
                 // Runtime not injected into this page yet; transitionTo would
@@ -814,6 +822,9 @@ class MainActivity : AppCompatActivity() {
                     // the missing part.
                     try { w.evaluateJavascript(mobileRuntime + ";", null) }
                     catch (_: IllegalStateException) {}
+                    // The page-finished probe may have already persisted a fail
+                    // with the mobile runtime absent; re-verify after the repair.
+                    scheduleBootVerify("mobile-repair")
                     routePendingDeepLink()
                 }
                 else -> {

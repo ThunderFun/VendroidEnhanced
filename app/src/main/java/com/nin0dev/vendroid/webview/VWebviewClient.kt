@@ -509,7 +509,10 @@ class VWebviewClient(
      *  - drop OkHttp-reserved (hop-by-hop) headers,
      *  - drop accept-encoding so OkHttp's transparent gzip handling is used
      *    (the app relies on this when rewriting Content-Length/Content-Encoding),
-     *  - for theme CSS, also drop the conditional headers (folded into the cache key).
+     *  - for theme CSS, also drop the conditional headers (folded into the cache key),
+     *  - add the WebView UA when the request carries none (Chromium never
+     *    surfaces User-Agent in requestHeaders; without this, OkHttp sends
+     *    its okhttp/x.y.z default and a desktopMode override is lost),
      *
      * Redirects are not handled here; the caller resolves 3xx manually through
      * the allowlist gate (see [resolveRedirects]).
@@ -527,6 +530,10 @@ class VWebviewClient(
             if (lowerKey == "accept-encoding") continue
             if (lowerKey in STRIPPED_CONDITIONAL_HEADERS) continue
             rb.addHeader(key, value)
+        }
+        val ua = webViewUserAgent
+        if (ua != null && req.requestHeaders.keys.none { it.equals("user-agent", ignoreCase = true) }) {
+            rb.header("User-Agent", ua)
         }
         return rb
     }
@@ -1240,6 +1247,16 @@ class VWebviewClient(
             blockTypingIndicator = block
         }
 
+        // Cached WebView UA for intercepted fetches. Read on Chromium network
+        // threads, which must not query WebView settings.
+        @Volatile
+        private var webViewUserAgent: String? = null
+
+        /** Refreshes the cache. Called at WebView setup and on recreation. */
+        fun updateWebViewUserAgent(userAgent: String?) {
+            webViewUserAgent = userAgent
+        }
+
         /**
          * Returns a blocking [WebResourceResponse] if the request matches a
          * privacy filter, or null to allow. Always blocks telemetry (/science,
@@ -1444,6 +1461,11 @@ class VWebviewClient(
                 shells[url] = cached
             }
             preloadedShells = shells
+        }
+
+        /** Drops the in-memory preloaded shells. Called by [MainFrameDiskCache.clear]. */
+        fun clearPreloadedShells() {
+            preloadedShells = emptyMap()
         }
 
         /** Looks up a shell from the in-memory preload, or null. */

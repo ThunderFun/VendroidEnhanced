@@ -323,8 +323,14 @@ import kotlin.concurrent.withLock
         }
     }
 
-    /** Best-effort cleanup for tests / cache management. Not called on the hot path. */
+    /**
+     * Best-effort cleanup for tests / cache management. Not called on the hot
+     * path. Also drops the in-memory preloaded shells, because the stale-serve
+     * path in [VWebviewClient] reads only memory and would otherwise keep
+     * serving entries whose disk files no longer exist.
+     */
     fun clear() {
+        VWebviewClient.clearPreloadedShells()
         val dir = cacheDir ?: return
         try {
             dir.listFiles()?.forEach { it.delete() }

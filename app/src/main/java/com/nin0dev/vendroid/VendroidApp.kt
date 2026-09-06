@@ -79,7 +79,11 @@ class VendroidApp : Application() {
             // faster (vs ~200-500ms cold). Only do this once the user has
             // accepted the first-run risk warning; otherwise MainActivity
             // creates its own WebView.
-            val riskAccepted = bootPrefs.getBoolean("riskWarningAccepted", false)
+            // runCatching: Application.onCreate runs before MainActivity, so
+            // a poisoned value would crash-loop :web cold start.
+            val riskAccepted = runCatching { bootPrefs.getBoolean("riskWarningAccepted", false) }
+                .onFailure { VDELog.w("VDE", "riskWarningAccepted type-poisoned; skipping prewarm: $it") }
+                .getOrDefault(false)
             if (riskAccepted) {
                 try {
                     prewarmedWebView = WebView(this).apply {
@@ -253,8 +257,10 @@ class VendroidApp : Application() {
                                 }
                             }
                         } catch (ex: Exception) {
-                            VDELog.e("VDE", "CSS fetch failed for $url", ex)
-                            VDELog.w("VDE", "CSS fetch failed for $url: ${ex.message}")
+                            // Stack traces only reach the log file.
+                            // getRecentLogs shows the message alone, so the
+                            // exception text is included here.
+                            VDELog.e("VDE", "CSS fetch failed for $url: ${ex.message ?: ex.javaClass.simpleName}", ex)
                         }
                     }
                     editor.apply()

@@ -872,16 +872,10 @@ class VencordNative(private val activity: WeakReference<MainActivity>, wv: WebVi
                 // the new mod cleanly, rather than injecting both the old
                 // (from preload) and new (from fetchVencord) runtimes.
                 prefs.edit {
-                    putInt("lastMajorUpdateThatUserHasUpdatedVencord", 0)
-                    remove(HttpClient.PREF_ETAG)
-                    remove(HttpClient.PREF_ETAG_LOCATION)
-                    remove(HttpClient.PREF_ETAG_REQUEST_URL)
-                    remove(HttpClient.PREF_BUNDLE_PATCHED)
-                    remove(HttpClient.PREF_BUNDLE_PATCH_SET)
-                    // The putInt above already forces needsBundleRedownload,
-                    // which bypasses the freshness window; clearing the stamp
-                    // too keeps "invalidate" consistent everywhere it happens.
-                    remove(HttpClient.PREF_LAST_BUNDLE_CHECK)
+                    // Zero the version stamp so the next launch redownloads
+                    // unconditionally.
+                    putInt(HttpClient.PREF_LAST_BUNDLE_UPDATE, 0)
+                    clearBundleIdentityKeys()
                     activity.get()?.filesDir?.let { File(it, "vencord.js").delete() }
                     HttpClient.setVencordRuntime(null)
                 }

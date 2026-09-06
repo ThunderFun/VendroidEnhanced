@@ -30,6 +30,10 @@
         <item name="android:windowDrawsSystemBarBackgrounds">true</item>
         <item name="android:statusBarColor">@color/status_bar_color</item>
         <item name="android:navigationBarColor">@color/status_bar_color</item>
+        <!-- Dark launch: icon splash (API 31+) and pre-setContentView window
+             background (API 26-30). Matches the loading screen. -->
+        <item name="android:windowSplashScreenBackground">@color/status_bar_color</item>
+        <item name="android:windowBackground">@color/status_bar_color</item>
         <item name="android:windowOptOutEdgeToEdgeEnforcement">true</item>
     </style>
 </resources>

@@ -5,6 +5,7 @@ import android.content.Context
 import android.content.SharedPreferences
 import android.net.Uri
 import android.widget.Toast
+import androidx.core.content.edit
 import com.nin0dev.vendroid.BuildConfig
 import com.nin0dev.vendroid.R
 import com.nin0dev.vendroid.utils.Constants
@@ -369,16 +370,7 @@ object HttpClient {
      *  stamp, so a discarded corrupt file cannot ride a window earned by a
      *  previous, different bundle. */
     private fun invalidateBundleCache(sPrefs: SharedPreferences) {
-        sPrefs.edit()
-            .remove(PREF_ETAG)
-            .remove(PREF_ETAG_LOCATION)
-            .remove(PREF_ETAG_REQUEST_URL)
-            .remove(PREF_BUNDLE_BUILD)
-            .remove(PREF_BUNDLE_HASH)
-            .remove(PREF_BUNDLE_PATCHED)
-            .remove(PREF_BUNDLE_PATCH_SET)
-            .remove(PREF_LAST_BUNDLE_CHECK)
-            .apply()
+        sPrefs.edit { clearBundleIdentityKeys() }
     }
 
     /**
@@ -941,4 +933,25 @@ object HttpClient {
             "HTTP error for host: " + (resp.request.url.host ?: "unknown")
         }
     }
+}
+
+/**
+ * Clears the bundle identity keys: where the cached bundle came from, what
+ * build and hash it carries, whether it is patched, and when it was last
+ * verified. Both invalidation call sites clear exactly this set, so the
+ * lists cannot drift.
+ *
+ * [HttpClient.PREF_LAST_BUNDLE_UPDATE] is deliberately excluded; zeroing it
+ * forces a full redownload and only the clientMod switch wants that. The
+ * on-disk file and the in-memory runtime are caller decisions as well.
+ */
+internal fun SharedPreferences.Editor.clearBundleIdentityKeys() {
+    remove(HttpClient.PREF_ETAG)
+    remove(HttpClient.PREF_ETAG_LOCATION)
+    remove(HttpClient.PREF_ETAG_REQUEST_URL)
+    remove(HttpClient.PREF_BUNDLE_BUILD)
+    remove(HttpClient.PREF_BUNDLE_HASH)
+    remove(HttpClient.PREF_BUNDLE_PATCHED)
+    remove(HttpClient.PREF_BUNDLE_PATCH_SET)
+    remove(HttpClient.PREF_LAST_BUNDLE_CHECK)
 }
