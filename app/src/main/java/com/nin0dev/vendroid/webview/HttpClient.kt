@@ -308,9 +308,16 @@ object HttpClient {
         } else {
             Constants.JS_BUNDLE_URL
         }
+        // Same guard as the clientMod read above.
+        val customLocation = try {
+            sPrefs.getString("vencordLocation", null)
+        } catch (e: ClassCastException) {
+            VDELog.w("HTTP", "vencordLocation pref wrong-typed (${e.javaClass.simpleName}); using default")
+            null
+        }
         // Normalize so trivial variants of a known URL (whitespace, trailing
         // slash) do not count as a custom location.
-        return sPrefs.getString("vencordLocation", null)
+        return customLocation
             ?.trim()?.removeSuffix("/")
             ?.takeIf { it.isNotEmpty() }
             ?: defaultUrl
@@ -319,6 +326,45 @@ object HttpClient {
     private fun isCustomBundleLocation(location: String): Boolean =
         !location.equals(Constants.JS_BUNDLE_URL, ignoreCase = true) &&
             !location.equals(Constants.EQUICORD_BUNDLE_URL, ignoreCase = true)
+
+    /**
+     * Single definition of "the bundle fetch path can accept this location":
+     * returns null when fetchVencord's validation gates would pass, else a
+     * short URL-free reason (safe to log or show; a custom value can carry
+     * credentials in its query string).
+     *
+     * Both parsers must accept the URL. Android's Uri historically gated the
+     * fetch, but OkHttp's HttpUrl builds the actual request: a value Uri
+     * tolerates and HttpUrl rejects used to escape validation as an
+     * IllegalArgumentException (not IOException) from Request.Builder().url(),
+     * and values the parsers read differently could fetch a host the
+     * allowlist never saw. Requiring agreement fails closed in both
+     * directions.
+     *
+     * Custom-location detection (isCustomBundleLocation) deliberately stays
+     * on the raw string form; this function never canonicalizes, so a value
+     * differing from an official URL only by OkHttp-normalizable syntax keeps
+     * forcing revalidation as before.
+     *
+     * Shared with the boot-time heal (VendroidApp.healUnusableVencordLocation)
+     * and VencordNative.updateVencord so the gate, the heal, and the bridge
+     * update path cannot drift apart.
+     */
+    internal fun bundleLocationFetchProblem(location: String): String? {
+        val uriHost = Uri.parse(location).host
+        if (uriHost == null || !Constants.isAllowedVencordHost(uriHost)) {
+            return "host '${uriHost ?: "<none>"}' is not in the allowed list"
+        }
+        val url = location.toHttpUrlOrNull()
+            ?: return "not a fetchable URL"
+        if (!Constants.isAllowedVencordHost(url.host)) {
+            return "host '${url.host}' is not in the allowed list"
+        }
+        if (!location.startsWith("https://")) {
+            return "must use HTTPS"
+        }
+        return null
+    }
 
     /**
      * Single definition of "the cached bundle must not be reused as-is": app
@@ -451,13 +497,12 @@ object HttpClient {
         // Log only the host, not the full URL (a custom URL could carry a token
         // in a query string, which would leak into the shareable log).
         VDELog.i("HTTP", "Fetching bundle from host: $vencordHost")
-        // Reject null host explicitly; the bundle is arbitrary JS executed in
-        // the Discord origin, so the host whitelist must be a hard gate.
-        if (vencordHost == null || !Constants.isAllowedVencordHost(vencordHost)) {
-            throw IOException("Vencord location host '$vencordHost' is not in allowed list")
-        }
-        if (!vencordLocation.startsWith("https://")) {
-            throw IOException("Vencord location must use HTTPS: $vencordLocation")
+        // Gate before any network work: the bundle is arbitrary JS executed
+        // in the Discord origin. bundleLocationFetchProblem owns the contract.
+        bundleLocationFetchProblem(vencordLocation)?.let { problem ->
+            throw IOException(
+                "Vencord location rejected: $problem (${UrlNormalizer.redactForLog(vencordLocation)})"
+            )
         }
         val vendroidFile = File(activity.filesDir, "vencord.js")
         // Discard a zero-length file (interrupted write) or an oversized one

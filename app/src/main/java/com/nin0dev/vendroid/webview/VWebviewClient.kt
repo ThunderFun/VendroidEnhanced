@@ -121,8 +121,8 @@ class VWebviewClient(
      * placed first: the downloaded runtime may itself contain a literal
      * `</head>`, so re-scanning the patched string could relocate the style
      * into script text where it is never applied. Runtime content is escaped
-     * via [escapeScriptTagContent] so a literal `</script>` cannot terminate
-     * the inline tag early.
+     * via [escapeScriptTagContent] so neither a `</script>` nor a `<!--` can
+     * stop the inline tag from terminating.
      *
      * @return an [InjectionResult] whose [InjectionResult.html] is the patched
      *   HTML, or null when no `</head>` was found (callers serve the unpatched
@@ -199,29 +199,6 @@ class VWebviewClient(
         val e = EscapedJs(raw, escapeScriptTagContent(raw))
         escapedMobileRuntime = e
         return e.escaped
-    }
-
-    /**
-     * Escapes [s] for safe inlining inside an HTML `<script>` block by replacing
-     * `</script` (case-insensitive) with `<\/script`. The HTML parser no longer
-     * recognizes the closing tag, while `\/` evaluates to `/` at runtime, so JS
-     * semantics are unchanged.
-     *
-     * Scans [s] itself with ignoreCase matching, never a lowercased copy:
-     * lowercasing can change string length (İ U+0130 becomes i + U+0307), so
-     * offsets taken from the copy slice [s] at wrong positions, corrupting
-     * the tail or leaving `</script` unescaped.
-     */    private fun escapeScriptTagContent(s: String): String {
-        if (!s.contains("</script", ignoreCase = true)) return s
-        val sb = StringBuilder(s.length + 16)
-        var i = 0
-        while (i < s.length) {
-            val next = s.indexOf("</script", i, ignoreCase = true)
-            if (next < 0) { sb.append(s, i, s.length); break }
-            sb.append(s, i, next).append("<\\/script")
-            i = next + "</script".length
-        }
-        return sb.toString()
     }
 
     /**
@@ -1478,4 +1455,54 @@ class VWebviewClient(
             return entry
         }
     }
+}
+
+/**
+ * Escapes [s] for safe inlining inside an HTML `<script>` block by replacing
+ * `</script` (case-insensitive) with `<\/script` and `<!--` with `<\!--`. The
+ * parser no longer recognizes either sequence, while `\/` and `\!` evaluate
+ * to `/` and `!` at runtime, so JS string and template-literal contents are
+ * unchanged. (`\!` is a SyntaxError inside `u`-flagged regexes; the vendored
+ * snapshot only has `<!--` inside a template literal.)
+ *
+ * `<!--` cannot end the element, but it puts the tokenizer into the
+ * script-data escaped state, where a later `<script` enters the
+ * double-escaped state. There the element's own `</script>` closer no longer
+ * ends the tag. The rest of the document is swallowed as script text and the
+ * embedded payload never runs. Bundles legitimately carry both sequences, so
+ * both are escaped here rather than assumed absent. With `<!--` neutralized
+ * the tokenizer never leaves plain script-data state, so bare `<script` is
+ * inert and needs no rewriting.
+ *
+ * Scans [s] itself with ignoreCase matching, never a lowercased copy:
+ * lowercasing can change string length (İ U+0130 becomes i + U+0307), so
+ * offsets taken from the copy slice [s] at wrong positions, corrupting
+ * the tail or leaving `</script` unescaped. Returns [s] itself when neither
+ * token occurs, so clean payloads skip the copy.
+ *
+ * Internal so the contract tests in EscapeScriptTagContentTest can pin both
+ * escapes.
+ */
+internal fun escapeScriptTagContent(s: String): String {
+    var sb: StringBuilder? = null
+    var i = 0
+    while (true) {
+        val nextScript = s.indexOf("</script", i, ignoreCase = true)
+        val nextComment = s.indexOf("<!--", i)
+        val next = when {
+            nextScript < 0 -> nextComment
+            nextComment < 0 -> nextScript
+            else -> minOf(nextScript, nextComment)
+        }
+        if (next < 0) break
+        if (sb == null) sb = StringBuilder(s.length + 16)
+        if (next == nextScript) {
+            sb.append(s, i, next).append("<\\/script")
+            i = next + "</script".length
+        } else {
+            sb.append(s, i, next).append("<\\!--")
+            i = next + "<!--".length
+        }
+    }
+    return sb?.append(s, i, s.length)?.toString() ?: s
 }

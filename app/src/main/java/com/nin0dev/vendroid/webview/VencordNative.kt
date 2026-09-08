@@ -729,19 +729,13 @@ class VencordNative(private val activity: WeakReference<MainActivity>, wv: WebVi
         if (!isBridgeAuthorized(token)) return
         if (!isOnDiscordDomainStrict()) return
         if (!rateLimitWrite("updateVencord", 5 * 60 * 1_000_000_000L)) return
-        // Resolve and validate the bundle location before scheduling any
-        // network work, so a misconfigured vencordLocation fails fast.
+        // Fail fast on a misconfigured vencordLocation, before any network work.
         val sPrefs = settingsPrefs ?: return
         val vencordLocation = HttpClient.resolveBundleLocation(sPrefs)
-        // Enforce HTTPS here (as fetchVencord does) so a clear-text bundle
-        // download cannot be MITM-ed regardless of HttpClient.fetch's check.
-        if (!vencordLocation.startsWith("https://")) {
-            VDELog.e("VN", "Vencord location must use HTTPS: ${UrlNormalizer.redactForLog(vencordLocation)}")
-            return
-        }
-        val vencordHost = Uri.parse(vencordLocation).host
-        if (vencordHost == null || !Constants.isAllowedVencordHost(vencordHost)) {
-            VDELog.e("VN", "Vencord location host '$vencordHost' is not in allowed list")
+        // Same gate as fetchVencord's; the contract lives on
+        // HttpClient.bundleLocationFetchProblem.
+        HttpClient.bundleLocationFetchProblem(vencordLocation)?.let { problem ->
+            VDELog.e("VN", "Vencord location rejected: $problem (${UrlNormalizer.redactForLog(vencordLocation)})")
             return
         }
         safeExecute {

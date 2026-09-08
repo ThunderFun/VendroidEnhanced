@@ -1339,6 +1339,9 @@
     var _vendroidGifPatched = false;
     var _vendroidGifOverlayPatched = false;
     var _vendroidGifRetryCount = 0;
+    // Verify failures are deterministic per webpack state (a read-only export
+    // stays read-only), so unlike module resolution this budget stays small.
+    var _vendroidGifPatchRetryCount = 0;
 
     function setupGifPickerButton() {
         if (_vendroidGifPatched) return;
@@ -1433,8 +1436,7 @@
                             OverlayModule.A.type = patchedOverlay;
                             // A getter-only .type would silently ignore the
                             // assignment; verify it took so the catch below
-                            // clears the patched flag and retries on the next
-                            // overlay open.
+                            // clears the patched flag and retries.
                             if (OverlayModule.A.type !== patchedOverlay) throw new Error("memo .type is read-only");
                         } else {
                             // Plain function component: React calls A(props)
@@ -1449,10 +1451,20 @@
                         }
                         console.warn("[Vendroid] GIF: patched overlay (Fr scoped to render only)");
                     } catch(e) {
-                        // Leave unpatched so a later overlay open retries
-                        // instead of being masked by the patched flag.
+                        // Return so the code below cannot mark setup complete
+                        // and mask this failure for the session.
                         _vendroidGifOverlayPatched = false;
                         console.error("[Vendroid] GIF: overlay patch failed: " + e.message);
+                        // Reset the view even on failure; a persisted GIF
+                        // lastActiveView would otherwise open the picker on
+                        // a view whose tab is hidden.
+                        try {
+                            ExpressionPickerStore.U(ExpressionPickerViewTypes.kx.EMOJI);
+                        } catch(e2) {
+                            console.error("[Vendroid] GIF: failed to reset lastActiveView: " + e2.message);
+                        }
+                        if (_vendroidGifPatchRetryCount++ < 10) setTimeout(setupGifPickerButton, 200);
+                        return;
                     }
                 } else {
                     console.error("[Vendroid] GIF: overlay not found (A type=" + (OverlayModule ? typeof OverlayModule.A : "null") + ")");
@@ -1940,6 +1952,7 @@
         } else {
             console.warn("[Vendroid] Search overlay hidden (native search session left running)");
         }
+        notifyOverlayState();
     }
 
     // Top-anchored card hosting only the input; the native results dock
@@ -1952,7 +1965,14 @@
         if (_vendroidSearchOverlay && _vendroidSearchOverlay.ctxKey === ctxKey &&
             document.body.contains(_vendroidSearchOverlay.el)) {
             _vendroidSearchOverlay.el.style.display = 'flex';
+            // closeSearchOverlay(false) removes the Esc handler on hide;
+            // re-add it (remove() is a no-op if still attached).
+            try {
+                document.removeEventListener('keydown', _vendroidSearchOverlay.onKey, true);
+                document.addEventListener('keydown', _vendroidSearchOverlay.onKey, true);
+            } catch(e) {}
             console.warn("[Vendroid] Search overlay re-shown for same channel");
+            notifyOverlayState();
             return;
         }
         closeSearchOverlay(true);
@@ -2011,6 +2031,7 @@
             fdUnsub: typeof fdUnsubFactory === "function" ? fdUnsubFactory() : null
         };
         console.warn("[Vendroid] Search overlay opened for " + ctxKey);
+        notifyOverlayState();
     }
 
     // Pinned snapshot of the HeaderBar desktop loader from an older web
@@ -2130,6 +2151,9 @@
     let imgOverlayOpenTime = 0;
 
     function notifyOverlayState() {
+        // Search is excluded: the flag only drives bar colors, a search card
+        // is not a fullscreen surface, and hidden search sessions would keep
+        // the bars black until disposal. onBackPress unwinds search on its own.
         try { VencordMobileNative.setOverlayActive(!!(vfsState || imgOverlay)); } catch(e) {}
     }
 

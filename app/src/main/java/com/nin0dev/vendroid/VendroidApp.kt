@@ -2,10 +2,12 @@ package com.nin0dev.vendroid
 
 import android.app.Application
 import android.content.Context
+import android.content.SharedPreferences
 import android.os.Build
 import android.view.View
 import android.webkit.WebView
 import com.nin0dev.vendroid.webview.HttpClient
+import com.nin0dev.vendroid.webview.clearBundleIdentityKeys
 import com.nin0dev.vendroid.utils.FirewallConfig
 import com.nin0dev.vendroid.utils.VDELog
 import java.io.File
@@ -47,6 +49,15 @@ class VendroidApp : Application() {
                 VDELog.w("VDE", "clientMod heal did not persist; retrying next boot")
             }
         }
+
+        // Self-heal an unusable vencordLocation (see
+        // healUnusableVencordLocation below). Same placement contract as the
+        // clientMod heal above: synchronous, every process, before any
+        // reader, so no preload or fetch observes the stale value.
+        healUnusableVencordLocation(
+            bootPrefs,
+            File(filesDir, "vencord.js")
+        )
 
         // Log app + WebView versions for incident reports.
         try {
@@ -300,6 +311,14 @@ class VendroidApp : Application() {
             internal set
 
         /**
+         * One-shot notice flag for MainActivity, set when
+         * healUnusableVencordLocation removes an unusable vencordLocation.
+         * Native-only: the bridge key allowlist (VencordNative.isBridgeKeyAllowed)
+         * rejects this name, so page JS can never read or flip it.
+         */
+        internal const val PREF_VENCORD_LOCATION_HEALED = "vencordLocationHealed"
+
+        /**
          * Destroys the pre-warmed WebView if MainActivity never consumed it.
          * Call from MainActivity.onDestroy() when prewarmUsed == false to
          * avoid leaking the renderer process.
@@ -307,6 +326,83 @@ class VendroidApp : Application() {
         fun destroyPrewarmedWebViewIfUnused() {
             prewarmedWebView?.destroy()
             prewarmedWebView = null
+        }
+
+        /**
+         * Removes a persisted vencordLocation the bundle fetch path can
+         * never accept, so a value carried over from an older build cannot
+         * brick Vencord forever.
+         *
+         * A rejected location is otherwise unrecoverable: HttpClient.fetchVencord
+         * throws before its offline-fallback try/catch, both runtime preloads
+         * skip the cached file while the location counts as custom, and the
+         * bridge rejects every read and write of the key. An older build's
+         * custom URL therefore means an unmodded Discord on every boot, with
+         * no in-app way to clear the key.
+         *
+         * Contract (mirrors the clientMod heal in onCreate): commit()
+         * makes the removal durable before anything reads, and the check
+         * is condition-based rather than flag-guarded. A key resurrected
+         * by a warm process flushing its stale in-memory map, or by a
+         * restored backup, is healed again on the next boot; the healed
+         * state is the fixed point.
+         *
+         * Cleared alongside the key:
+         *  - PREF_LAST_BUNDLE_UPDATE zeroed: the first boot after a heal
+         *    must revalidate unconditionally even when no app version bump
+         *    would force it (a hand-edited or restored pref can carry a
+         *    current stamp).
+         *  - bundle identity keys (ETag trio, patch flags, freshness
+         *    stamp): validators describe the old location.
+         *  - the cached vencord.js: it was fetched from a source the
+         *    operator no longer permits; nothing from that source runs
+         *    again. Cost: an offline first boot after the heal loads no
+         *    bundle until the network returns; the official location is
+         *    fetchable by then, so the fetch's cached-file fallback works
+         *    normally from that point on.
+         *
+         * Internal + explicit-file so the repair logic can be pinned by
+         * Robolectric tests without booting the Application.
+         */
+        internal fun healUnusableVencordLocation(prefs: SharedPreferences, vendroidFile: File) {
+            var wrongTyped = false
+            val stored = try {
+                prefs.getString("vencordLocation", null)
+            } catch (e: ClassCastException) {
+                wrongTyped = true
+                null
+            }
+            // Same normalization as resolveBundleLocation: an empty value
+            // already resolves to the default and needs no heal.
+            val location = stored?.trim()?.removeSuffix("/")?.takeIf { it.isNotEmpty() }
+            val problem = when {
+                wrongTyped -> "wrong-typed value"
+                location != null -> HttpClient.bundleLocationFetchProblem(location)
+                else -> null
+            } ?: return
+
+            val editor = prefs.edit()
+            editor.remove("vencordLocation")
+            editor.putInt(HttpClient.PREF_LAST_BUNDLE_UPDATE, 0)
+            editor.clearBundleIdentityKeys()
+            editor.putBoolean(PREF_VENCORD_LOCATION_HEALED, true)
+            val committed = try {
+                editor.commit()
+            } catch (t: Throwable) {
+                VDELog.e("VDE", "vencordLocation heal did not persist", t)
+                false
+            }
+            if (!committed) {
+                VDELog.w("VDE", "vencordLocation heal did not persist; retrying next boot")
+                return
+            }
+            VDELog.w("VDE", "Removed unusable vencordLocation: $problem")
+            if (!vendroidFile.delete() && vendroidFile.exists()) {
+                VDELog.w("VDE", "Could not delete cached bundle after vencordLocation heal; the next download overwrites it")
+            }
+            // Belt: nothing from the removed source survives this boot. The
+            // preload thread has not started yet, so this is normally a no-op.
+            HttpClient.setVencordRuntime(null)
         }
     }
 

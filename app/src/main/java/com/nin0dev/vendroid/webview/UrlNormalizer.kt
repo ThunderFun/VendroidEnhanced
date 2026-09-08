@@ -61,9 +61,14 @@ import java.net.IDN
             // file:///path?x=1#f) as opaque, which drops their query and
             // fragment.
             val isOpaque = uri.isOpaque
-            val rawPath = if (isOpaque) (uri.schemeSpecificPart ?: uri.path.orEmpty()) else uri.path.orEmpty()
-            val rawQuery = if (isOpaque) null else uri.query
-            val rawFragment = if (isOpaque) null else uri.fragment
+            // percentEncode's %XX pass-through assumes already-encoded
+            // text, and the decoded accessors are lossy (invalid UTF-8
+            // escapes collapse to U+FFFD; %3F/%23 decode into chars that
+            // get re-emitted raw). Build from the encoded ones instead;
+            // decodeForDisplay does the single decode for display.
+            val rawPath = if (isOpaque) (uri.encodedSchemeSpecificPart ?: uri.encodedPath.orEmpty()) else uri.encodedPath.orEmpty()
+            val rawQuery = if (isOpaque) null else uri.encodedQuery
+            val rawFragment = if (isOpaque) null else uri.encodedFragment
 
             val launchStr = buildEncodedUrl(
                 scheme, asciiHost, rawHost, port,

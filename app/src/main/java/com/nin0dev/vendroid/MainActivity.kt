@@ -192,6 +192,26 @@ class MainActivity : AppCompatActivity() {
             VDELog.e("Main", "Settings migration failed; continuing with defaults", t)
         }
 
+        // One-shot notice for the boot-time vencordLocation heal
+        // (VendroidApp.healUnusableVencordLocation). First-entry gate, same
+        // pattern as safeMode below: the flag persists until a MainActivity
+        // runs, so launching RecoveryActivity first just delays the notice.
+        // The heal writes the flag as a Boolean; runCatching contains any
+        // future regression instead of crash-looping cold start.
+        if (runCatching { sPrefs.getBoolean(VendroidApp.PREF_VENCORD_LOCATION_HEALED, false) }
+                .onFailure { VDELog.w("Main", "heal notice flag type-poisoned; ignoring: $it") }
+                .getOrDefault(false)) {
+            Toast.makeText(
+                this,
+                "Removed custom Vencord source (no longer permitted); the official bundle is used instead",
+                Toast.LENGTH_LONG
+            ).show()
+            // Clear after showing: a crash in between repeats the notice
+            // once rather than losing it.
+            sPrefs.edit().remove(VendroidApp.PREF_VENCORD_LOCATION_HEALED).apply()
+            VDELog.i("Main", "Notified: unusable vencordLocation was healed at boot")
+        }
+
         // First-run security disclosure. Do not load Discord, the WebView, or
         // any injected code until the user accepts the risks of a modified
         // Discord client running third-party code.

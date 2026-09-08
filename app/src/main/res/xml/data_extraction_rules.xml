@@ -10,6 +10,10 @@
         <exclude domain="sharedpref" path="css_cache.xml" />
         <exclude domain="sharedpref" path="announcements.xml" />
         <exclude domain="file" path="vencord.js" />
+        <!-- The mobile runtime is a raw resource that is never written to
+             the files dir. Excluded in case it is ever cached there like
+             vencord.js. -->
+        <exclude domain="file" path="vencord-mobile.js" />
         <exclude domain="file" path="vde_logs.txt" />
         <exclude domain="file" path="main_frame_cache" />
         <!-- WebView credential store (Cookies.db, Local Storage/, IndexedDB/)
@@ -22,6 +26,7 @@
         <exclude domain="sharedpref" path="css_cache.xml" />
         <exclude domain="sharedpref" path="announcements.xml" />
         <exclude domain="file" path="vencord.js" />
+        <exclude domain="file" path="vencord-mobile.js" />
         <exclude domain="file" path="vde_logs.txt" />
         <exclude domain="file" path="main_frame_cache" />
         <exclude domain="root" path="app_webview" />

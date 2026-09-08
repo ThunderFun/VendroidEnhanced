@@ -337,4 +337,147 @@ class UrlNormalizerTest {
         assertFalse("query token leaked: $r", r.contains("secret"))
         assertFalse("fragment token leaked: $r", r.contains("abc"))
     }
+
+    // ------------------------------------------------------------------
+    //  Round-trip fidelity
+    //
+    //  The launch/clipboard form must denote the same resource as the
+    //  input href: escapes survive byte-for-byte, raw unsafe chars get
+    //  encoded, and display decodes exactly once.
+    // ------------------------------------------------------------------
+
+    @Test fun normalize_doubleEncodedPath_launchFaithful_displaySingleDecoded() {
+        val n = UrlNormalizer.normalize(Uri.parse("https://x/dir/file%2520name"))
+        assertFalse(n.malformed)
+        assertEquals("https://x/dir/file%2520name", n.clipboardString)
+        // The resource is literally named "file%20name"; showing
+        // "file name" would mean the display decoded twice.
+        assertTrue(n.displayString.contains("file%20name"))
+        assertFalse(n.displayString.contains("file name"))
+    }
+
+    @Test fun normalize_doubleEncodedQuery_roundTrips() {
+        val n = UrlNormalizer.normalize(Uri.parse("https://x/p?q=a%2520b"))
+        assertEquals("https://x/p?q=a%2520b", n.clipboardString)
+    }
+
+    @Test fun normalize_doubleEncodedFragment_roundTrips() {
+        val n = UrlNormalizer.normalize(Uri.parse("https://x/p#a%2520b"))
+        assertEquals("https://x/p#a%2520b", n.clipboardString)
+    }
+
+    @Test fun normalize_structuralEscapes_notReemittedRaw() {
+        // %3F and %23 decode into '?'/'#'. Re-emitting them raw would turn
+        // the rest of the path into a query, or truncate it into a fragment.
+        assertEquals(
+            "https://x/a%3Fb",
+            UrlNormalizer.normalize(Uri.parse("https://x/a%3Fb")).clipboardString
+        )
+        assertEquals(
+            "https://x/a%23b",
+            UrlNormalizer.normalize(Uri.parse("https://x/a%23b")).clipboardString
+        )
+        assertEquals(
+            "https://x/p?x=1%23b",
+            UrlNormalizer.normalize(Uri.parse("https://x/p?x=1%23b")).clipboardString
+        )
+    }
+
+    @Test fun normalize_semanticEscapes_preservedByteFaithfully() {
+        // Some servers distinguish these from their decoded forms
+        // (/a%2Fb vs /a/b path matching, '+' vs space in form queries).
+        assertEquals(
+            "https://x/a%2Fb",
+            UrlNormalizer.normalize(Uri.parse("https://x/a%2Fb")).clipboardString
+        )
+        assertEquals(
+            "https://x/s?q=a%2Bb",
+            UrlNormalizer.normalize(Uri.parse("https://x/s?q=a%2Bb")).clipboardString
+        )
+    }
+
+    @Test fun normalize_escapeCasePreserved() {
+        val n = UrlNormalizer.normalize(Uri.parse("https://x/%e4%b8%ad"))
+        assertEquals("https://x/%e4%b8%ad", n.clipboardString)
+    }
+
+    @Test fun normalize_invalidUtf8Escapes_preservedNotReplaced() {
+        // The framework decodes invalid UTF-8 bytes to U+FFFD, which
+        // re-encodes to different bytes. The launch form must keep the
+        // original bytes.
+        assertEquals("https://x/%FF", UrlNormalizer.normalize(Uri.parse("https://x/%FF")).clipboardString)
+        assertEquals("https://x/%C0%80", UrlNormalizer.normalize(Uri.parse("https://x/%C0%80")).clipboardString)
+        assertEquals(
+            "https://x/%E4%B8%AD%FF",
+            UrlNormalizer.normalize(Uri.parse("https://x/%E4%B8%AD%FF")).clipboardString
+        )
+    }
+
+    @Test fun normalize_strayAndTruncatedPercent_leftAlone() {
+        // A '%' outside a valid escape is copied verbatim. A trailing %25
+        // must keep its hex digits: pass-through needs two chars after '%'.
+        assertEquals("https://x/50%off", UrlNormalizer.normalize(Uri.parse("https://x/50%off")).clipboardString)
+        assertEquals("https://x/s?50%off", UrlNormalizer.normalize(Uri.parse("https://x/s?50%off")).clipboardString)
+        assertEquals("https://x/p#50%off", UrlNormalizer.normalize(Uri.parse("https://x/p#50%off")).clipboardString)
+        assertEquals("https://x/%2", UrlNormalizer.normalize(Uri.parse("https://x/%2")).clipboardString)
+        assertEquals("https://x/%25", UrlNormalizer.normalize(Uri.parse("https://x/%25")).clipboardString)
+    }
+
+    @Test fun normalize_encodedAstralEmoji_roundTrips() {
+        val n = UrlNormalizer.normalize(Uri.parse("https://x/%F0%9F%98%80"))
+        assertEquals("https://x/%F0%9F%98%80", n.clipboardString)
+    }
+
+    @Test fun normalize_nulEscape_launchPreserved_displayStripped() {
+        val n = UrlNormalizer.normalize(Uri.parse("https://x/a%00b"))
+        assertEquals("https://x/a%00b", n.clipboardString)
+        assertFalse(n.displayString.contains("\u0000"))
+    }
+
+    @Test fun normalize_structureOddities_preserved() {
+        // Empty-but-present components and repeated delimiters must survive.
+        assertEquals("https://x", UrlNormalizer.normalize(Uri.parse("https://x")).clipboardString)
+        assertEquals("https://x?", UrlNormalizer.normalize(Uri.parse("https://x?")).clipboardString)
+        assertEquals("https://x/#", UrlNormalizer.normalize(Uri.parse("https://x/#")).clipboardString)
+        assertEquals(
+            "https://x/p?a?b#c#d",
+            UrlNormalizer.normalize(Uri.parse("https://x/p?a?b#c#d")).clipboardString
+        )
+    }
+
+    @Test fun normalize_rawUnsafeChars_stillEncodedForLaunch() {
+        // Reading encoded input must not stop the pipeline from encoding
+        // chars the href carried raw.
+        assertEquals("https://x/a%20b", UrlNormalizer.normalize(Uri.parse("https://x/a b")).clipboardString)
+        assertEquals("https://x/%5Ba%5D/b%7Cc", UrlNormalizer.normalize(Uri.parse("https://x/[a]/b|c")).clipboardString)
+        val q = UrlNormalizer.normalize(Uri.parse("https://x/s?q=搜索"))
+        assertTrue(q.clipboardString.contains("%E6%90%9C%E7%B4%A2"))
+        assertTrue(q.displayString.contains("搜索"))
+    }
+
+    @Test fun normalize_opaqueEscapesPreserved_displayDecoded() {
+        val d = UrlNormalizer.normalize(Uri.parse("data:text/html,%3Cb%3E"))
+        assertEquals("data:text/html,%3Cb%3E", d.clipboardString)
+        assertTrue(d.displayString.contains("<b>"))
+
+        val m = UrlNormalizer.normalize(Uri.parse("mailto:foo%40bar.com"))
+        assertEquals("mailto:foo%40bar.com", m.clipboardString)
+        assertEquals("mailto:foo@bar.com", m.displayString)
+    }
+
+    @Test fun normalize_idempotent_overItsOwnOutput() {
+        val inputs = listOf(
+            "https://x/dir/file%2520name", "https://x/a%3Fb", "https://x/a%23b",
+            "https://x/a%2Fb", "https://x/s?q=a%2Bb", "https://x/%FF",
+            "https://x/%e4%b8%ad", "https://x/50%off", "https://x/a b",
+            "https://example.com/搜索", "https://x/s?50%off", "https://x/p#a%2520b",
+            "data:text/html,%3Cb%3E", "mailto:foo%40bar.com", "https://x/%C0%80",
+            "https://x/%E4%B8%AD%FF", "https://x/%F0%9F%98%80"
+        )
+        for (u in inputs) {
+            val once = UrlNormalizer.normalize(Uri.parse(u)).clipboardString
+            val twice = UrlNormalizer.normalize(Uri.parse(once)).clipboardString
+            assertEquals("not idempotent for $u", once, twice)
+        }
+    }
 }
