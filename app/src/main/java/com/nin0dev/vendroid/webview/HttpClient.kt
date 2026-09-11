@@ -86,7 +86,8 @@ object HttpClient {
     /**
      * Serializes bundle file and prefs writes between the startup path and
      * the JS-bridge update path, so the file, ETag, and patch flags always
-     * describe the same download.
+     * describe the same download. Also orders the startup path's runtime
+     * publish with the write; see [vencordRuntimeLock] for the lock order.
      */
     private val bundleWriteLock = Any()
 
@@ -96,6 +97,11 @@ object HttpClient {
      * check-then-read-then-publish, so a publish whose read stalled on slow
      * storage can land after a fresher publish or an invalidation and
      * resurrect stale content.
+     *
+     * Lock order: [downloadStoreAndSync] acquires this lock while holding
+     * [bundleWriteLock], never the reverse. The `stillValid` callbacks run
+     * under this lock and must not acquire [bundleWriteLock] or call
+     * [downloadStoreAndSync].
      */
     private val vencordRuntimeLock = Any()
 
@@ -131,9 +137,12 @@ object HttpClient {
      *
      * [stillValid] covers what the null-check cannot: the clientMod switch
      * nulls an already-null runtime, so only a re-check of the guards catches
-     * a read that stalled across the switch. The fresh-download publish in
-     * [downloadStoreAndSync] is deliberately not a compare-and-set; it is
-     * authoritative and must win.
+     * a read that stalled across the switch. It runs under [vencordRuntimeLock];
+     * the acquisition rule lives on that lock.
+     *
+     * The fresh-download publish in [downloadStoreAndSync] is deliberately not
+     * a compare-and-set; it is authoritative and publishes through
+     * [setVencordRuntime], so a stalled CAS cannot overwrite it.
      */
     @JvmStatic
     fun setVencordRuntimeIfNull(value: String?, stillValid: (() -> Boolean)? = null): Boolean =
@@ -250,9 +259,9 @@ object HttpClient {
 
     /** SharedPreferences key of the epoch-ms of the last definitive freshness
      *  answer (304 or fresh download); boots inside [BUNDLE_CHECK_INTERVAL_MS]
-     *  skip the conditional GET entirely. Always read through [runCatching]:
-     *  page JS can write settings-pref strings via the bridge, so a non-Long
-     *  value must degrade to "never checked" (window due), never to "fresh". */
+     *  skip the conditional GET entirely. Always read through [runCatching].
+     *  Hand-edited or restored XML can carry a non-Long value, which must
+     *  degrade to "never checked" (window due), never to "fresh". */
     const val PREF_LAST_BUNDLE_CHECK = "lastBundleCheckMs"
 
     /** How long a definitive freshness answer (304 / fresh download) lets
@@ -282,10 +291,47 @@ object HttpClient {
         vencordRuntimePatches.joinToString("|") { it.pattern.pattern + "->" + it.replacement }
             .hashCode().toString()
 
-    /** True when the persisted patched flag covers the current patch set. */
-    private fun isPersistedPatchCurrent(sPrefs: SharedPreferences): Boolean =
-        sPrefs.getBoolean(PREF_BUNDLE_PATCHED, false) &&
-            sPrefs.getString(PREF_BUNDLE_PATCH_SET, null) == bundlePatchSetKey
+    /**
+     * String read that treats a wrong-typed value as absent. The bridge
+     * allowlist rejects the bundle bookkeeping keys, so poison only comes
+     * from hand-edited or restored XML; throwing would skip fetchVencord's
+     * cached-bundle fallback.
+     */
+    private fun stringPrefOrNull(sPrefs: SharedPreferences, key: String): String? =
+        try {
+            sPrefs.getString(key, null)
+        } catch (_: ClassCastException) {
+            VDELog.w("HTTP", "$key pref wrong-typed; ignoring stored value")
+            null
+        }
+
+    /**
+     * Bundle version stamp, 0 when absent or wrong-typed. Both readers run
+     * on the startup path, so a poison value must force a redownload, not
+     * throw.
+     */
+    private fun bundleVersionStamp(sPrefs: SharedPreferences): Int =
+        try {
+            sPrefs.getInt(PREF_LAST_BUNDLE_UPDATE, 0)
+        } catch (_: ClassCastException) {
+            VDELog.w("HTTP", "Bundle version stamp wrong-typed; forcing redownload")
+            0
+        }
+
+    /**
+     * True when the persisted patched flag covers the current patch set.
+     * Wrong-typed fields count as not current, so the file is re-checked and
+     * re-patched rather than the read throwing.
+     */
+    private fun isPersistedPatchCurrent(sPrefs: SharedPreferences): Boolean {
+        val patched = try {
+            sPrefs.getBoolean(PREF_BUNDLE_PATCHED, false)
+        } catch (_: ClassCastException) {
+            VDELog.w("HTTP", "Bundle patch flag wrong-typed; re-patching")
+            false
+        }
+        return patched && stringPrefOrNull(sPrefs, PREF_BUNDLE_PATCH_SET) == bundlePatchSetKey
+    }
 
     /** Resolves the effective bundle URL from prefs, honoring clientMod. */
     fun resolveBundleLocation(sPrefs: SharedPreferences): String {
@@ -372,7 +418,7 @@ object HttpClient {
      * activity code all consult this so the paths cannot drift apart.
      */
     fun needsBundleRedownload(sPrefs: SharedPreferences): Boolean =
-        sPrefs.getInt(PREF_LAST_BUNDLE_UPDATE, 0) < BuildConfig.VERSION_CODE ||
+        bundleVersionStamp(sPrefs) < BuildConfig.VERSION_CODE ||
             isCustomBundleLocation(resolveBundleLocation(sPrefs)) ||
             BuildConfig.DEBUG
 
@@ -520,7 +566,7 @@ object HttpClient {
         // changed). Custom URLs and debug builds keep the ETag so an unchanged
         // bundle costs a 304, not ~1MB. The cached file stays on disk as the
         // offline fallback; downloadStoreAndSync overwrites it atomically.
-        val versionBump = sPrefs.getInt(PREF_LAST_BUNDLE_UPDATE, 0) < BuildConfig.VERSION_CODE
+        val versionBump = bundleVersionStamp(sPrefs) < BuildConfig.VERSION_CODE
         val customUrl = isCustomBundleLocation(vencordLocation)
         val needsRedownload = versionBump || customUrl || BuildConfig.DEBUG
 
@@ -683,9 +729,9 @@ object HttpClient {
         originUrl: String,
         requestUrl: String
     ): String? =
-        sPrefs.getString(PREF_ETAG, null)
-            ?.takeIf { sPrefs.getString(PREF_ETAG_LOCATION, null) == originUrl }
-            ?.takeIf { sPrefs.getString(PREF_ETAG_REQUEST_URL, null) == requestUrl }
+        stringPrefOrNull(sPrefs, PREF_ETAG)
+            ?.takeIf { stringPrefOrNull(sPrefs, PREF_ETAG_LOCATION) == originUrl }
+            ?.takeIf { stringPrefOrNull(sPrefs, PREF_ETAG_REQUEST_URL) == requestUrl }
 
     /**
      * Resolves a redirect Location against the current hop's URL (relative
@@ -851,7 +897,9 @@ object HttpClient {
             e.putBoolean(PREF_BUNDLE_PATCHED, true)
             e.putString(PREF_BUNDLE_PATCH_SET, bundlePatchSetKey)
             e.apply()
-            if (publishToRuntime) VencordRuntime = patched
+            // Publish through the setter: a stalled disk-load CAS must not
+            // overwrite this fresher download.
+            if (publishToRuntime) setVencordRuntime(patched)
             bundleCheckedThisSession = true
             VDELog.i("HTTP", "Bundle patched and saved to disk (build=${buildTag ?: "unknown"} sha256=$hash)")
         }

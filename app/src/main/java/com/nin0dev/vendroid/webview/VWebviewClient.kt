@@ -22,6 +22,7 @@ import com.nin0dev.vendroid.utils.VDELog
 import java.io.ByteArrayInputStream
 import java.util.concurrent.ConcurrentHashMap
 import java.lang.ref.WeakReference
+import okhttp3.HttpUrl
 import okhttp3.Request
 import okhttp3.RequestBody
 import okhttp3.Response
@@ -342,6 +343,10 @@ class VWebviewClient(
         // holds GET-fetched HTML, so a HEAD/POST main frame must neither serve
         // a shell nor spawn the revalidate below.
         if (req.method != "GET") return null
+        // Enforce the "app-shell Discord routes only" premise at the consumer:
+        // preloadedShells is process-lifetime state and the injection below
+        // hardcodes isDiscordMainFrame = true. Mirrors the disk read gate.
+        if (!MainFrameDiskCache.isCacheableRoute(req.url)) return null
         // Prefer the memory-preloaded shell (filled at cold start from the
         // disk cache). Other routes fall through to the per-URL disk entry via
         // the preload, so a /channels request never receives the /app body. We
@@ -586,15 +591,17 @@ class VWebviewClient(
         // subresource allowlist here would let a Discord-origin page 3xx to a
         // non-Discord allowlisted host and load it as the top frame in-app,
         // bypassing the popup that forces non-Discord hosts to the browser.
+        // The path-consuming gates below compare the decoded path, matching
+        // the direct-request callers and NavigationPolicy (see decodedPath).
+        val path = decodedPath(resolved)
         if (isMainFrame) {
             if (!Constants.isNavigationAllowedDomain(resolvedHost)) return null
             // Mirror NavigationPolicy: Discord /blog pages route to the popup.
-            val path = resolved.encodedPath ?: ""
             if (path == "/blog" || path.startsWith("/blog/")) return null
         } else {
-            if (shouldBlockUri(resolved.scheme, resolvedHost, resolved.encodedPath)) return null
+            if (shouldBlockUri(resolved.scheme, resolvedHost, path)) return null
         }
-        if (shouldBlockForPrivacy(resolvedHost, resolved.encodedPath) != null) return null
+        if (shouldBlockForPrivacy(resolvedHost, path) != null) return null
 
         // Never forward credential-bearing headers to a different origin: the
         // original request may carry them, and a cross-origin redirect would
@@ -650,6 +657,11 @@ class VWebviewClient(
 
         if (isThemeCss) {
             themeCssCache.get(responseCacheKey)?.let { cached ->
+                // An empty body must never be served; drop and refetch.
+                if (cached.body.isEmpty()) {
+                    themeCssCache.remove(responseCacheKey)
+                    return@let
+                }
                 if (System.currentTimeMillis() - cached.fetchedAt < THEME_CSS_TTL_MS) {
                     return WebResourceResponse("text/css", "utf-8", cached.statusCode, cached.reasonPhrase, cached.headers, ByteArrayInputStream(cached.body))
                 }
@@ -665,13 +677,23 @@ class VWebviewClient(
         // GET-gated at their write sites instead; see fetchAndProcessResponse.
         if (isMainFrame && req.method == "GET") {
             mainFrameCache.get(responseCacheKey)?.let { cached ->
+                // An empty body must never be served; drop and refetch.
+                if (cached.body.isEmpty()) {
+                    mainFrameCache.remove(responseCacheKey)
+                    return@let
+                }
                 if (System.currentTimeMillis() - cached.fetchedAt < MAIN_FRAME_TTL_MS) {
                     // The cache stores the RAW body, so inject the firewall /
                     // runtimes at serve time with the current config (same model
                     // as the disk cache). This way a tightened firewall applies
                     // on the very next serve instead of serving a stale embed.
                     val text = String(cached.body, Charsets.UTF_8)
-                    val result = injectFirewallAndCss(text, urlString, isDiscordMainFrame = true)
+                    // Derived from the request URL, not hardcoded: keep the
+                    // serve path safe even if a cache writer misses its gate.
+                    val result = injectFirewallAndCss(
+                        text, urlString,
+                        isDiscordMainFrame = Constants.isDiscordAppOrigin(req.url.host ?: "")
+                    )
                     val patched = result.html
                     val serveBytes = (patched ?: text).toByteArray(Charsets.UTF_8)
                     // Snapshot verdict and stranded-claim removes; see
@@ -886,7 +908,10 @@ class VWebviewClient(
         // runtimes embedded into attacker-controlled content rendered in the
         // Discord origin.
         val host = response.request.url.host ?: ""
-        val isDiscordDomain = Constants.isDiscordAppOrigin(host)
+        // The app-origin capability predicate, deliberately narrower than the
+        // raw Discord-domain check in Constants. Every injection and
+        // cache-write decision below keys on it.
+        val isAppOrigin = Constants.isDiscordAppOrigin(host)
         val isMainFrame = isForMainFrame
 
         val statusCode = response.code
@@ -897,7 +922,7 @@ class VWebviewClient(
         val modifiedHeaders = HashMap<String, String>(response.headers.size.coerceAtLeast(16))
         for ((key, value) in response.headers) {
             val lowerKey = key.lowercase()
-            if (isDiscordDomain && lowerKey == "content-security-policy") {
+            if (isAppOrigin && lowerKey == "content-security-policy") {
                 if (BuildConfig.ENFORCE_STRICT_CSP) {
                     // Enforce the strict policy; the browser itself blocks
                     // exfiltration (connect-src) to non-allowlisted hosts.
@@ -913,9 +938,14 @@ class VWebviewClient(
                 }
                 continue
             }
-            if (isDiscordDomain && lowerKey == "content-security-policy-report-only") continue
+            if (isAppOrigin && lowerKey == "content-security-policy-report-only") continue
             ResponseHeaderMerge.merge(modifiedHeaders, setCookies, lowerKey, value)
         }
+        // Server-declared media type, captured before the MIME normalization
+        // below: the 2xx app-origin pin forces content-type to text/html, so
+        // a later read of modifiedHeaders can no longer tell a shell from a
+        // JSON endpoint body.
+        val declaredCt = modifiedHeaders["content-type"]?.lowercase()
         if (isCss) modifiedHeaders["content-type"] = "text/css"
         // HTTP/2 has no reason phrase (OkHttp returns ""), so the old "OK"
         // fallback reported a 404 as "404 OK". Use the standard IANA phrase
@@ -930,7 +960,7 @@ class VWebviewClient(
         // Content-Type and strips Content-Encoding/Content-Length, and the
         // body has already been fully read, so those framing headers are
         // stale at any status code.
-        if (isDiscordDomain && isMainFrame) {
+        if (isAppOrigin && isMainFrame) {
             if (statusCode in 200..299) {
                 // The app shell is always HTML. Pin a clean MIME so the
                 // injection gate below agrees.
@@ -981,10 +1011,12 @@ class VWebviewClient(
         // is stale-served to GET navigations. A real HEAD body is empty anyway
         // (isNotEmpty skips it); the gate exists for the 307-preserved POST
         // whose HTML would otherwise seed the store.
-        if (isDiscordDomain && isMainFrame && statusCode in 200..299 && bodyBytes.isNotEmpty() &&
+        if (isAppOrigin && isMainFrame && statusCode in 200..299 && bodyBytes.isNotEmpty() &&
             response.request.method == "GET"
         ) {
-            val ctLower = (modifiedHeaders.getOrDefault("content-type", "")).lowercase()
+            // declaredCt, not modifiedHeaders: the serving type is pinned to
+            // text/html above, so that read can never fail here.
+            val ctLower = declaredCt.orEmpty()
             if (ctLower.contains("text/html")) {
                 // bodyBytes is still raw here; injection happens below. Persist
                 // off the network thread with the sanitized headers so a stale
@@ -1003,12 +1035,12 @@ class VWebviewClient(
         // alongside when both are in memory, so the renderer parses them at
         // document time instead of blocking the UI thread on a ~1 MB
         // evaluateJavascript round-trip.
-        if (isDiscordDomain && isMainFrame && statusCode in 200..299 && bodyBytes.isNotEmpty()) {
+        if (isAppOrigin && isMainFrame && statusCode in 200..299 && bodyBytes.isNotEmpty()) {
             val ctLower = (modifiedHeaders.getOrDefault("content-type", "")).lowercase()
             if (ctLower.contains("text/html")) {
                 try {
                     val text = bodyBytes.toString(Charsets.UTF_8)
-                    val result = injectFirewallAndCss(text, urlString, isDiscordMainFrame = isDiscordDomain)
+                    val result = injectFirewallAndCss(text, urlString, isDiscordMainFrame = isAppOrigin)
                     val patched = result.html
                     if (patched != null && patched !== text) {
                         bodyBytes = patched.toByteArray(Charsets.UTF_8)
@@ -1036,14 +1068,25 @@ class VWebviewClient(
                     }
                 } catch (_: Exception) {}
             }
+        } else if (isMainFrame) {
+            // The gate above skipped the embed. Drop any claim stranded by an
+            // earlier Discord-body serve of this URL, so onPageStarted falls
+            // back to evaluateJavascript instead of skipping on a stale
+            // claim. Main frames only: claims are never held for
+            // subresource URLs.
+            firewallEmbeddedUrls.remove(urlString)
+            runtimeEmbeddedUrls.remove(urlString)
         }
 
-        if (statusCode in 200..299 && cacheTarget != null) {
-            // MAIN_FRAME caches the RAW (pre-injection) body; the firewall and
-            // runtimes are injected at serve time so a config change applies on
-            // the next serve. THEME_CSS has no injected content, so it caches
-            // the final bytes.
-            val bytesToCache = if (cacheTarget == CacheTarget.MAIN_FRAME) rawBodyBytes else bodyBytes
+        // MAIN_FRAME caches the RAW (pre-injection) body; the firewall and
+        // runtimes are injected at serve time so a config change applies on
+        // the next serve. THEME_CSS has no injected content, so it caches
+        // the final bytes.
+        val bytesToCache = if (cacheTarget == CacheTarget.MAIN_FRAME) rawBodyBytes else bodyBytes
+        // An empty body is never a valid entry. A failed or over-cap read
+        // would otherwise be cached as a blank 200 and served for the full
+        // TTL, since fresh LRU hits never revalidate.
+        if (statusCode in 200..299 && cacheTarget != null && bytesToCache.isNotEmpty()) {
             // Set-Cookie never enters modifiedHeaders (diverted to setCookies),
             // so cached headers are cookie-free by construction. A cached
             // replay cannot resurrect an old token (zombie session) or cross
@@ -1055,7 +1098,17 @@ class VWebviewClient(
             val entry = CachedResponse(statusCode, reasonPhrase, headersToCache, bytesToCache)
             when (cacheTarget) {
                 CacheTarget.THEME_CSS -> themeCssCache.put(cacheKey, entry)
-                CacheTarget.MAIN_FRAME -> if (response.request.method == "GET") {
+                CacheTarget.MAIN_FRAME -> if (response.request.method == "GET" &&
+                    // Same final-host gate as the injection block above:
+                    // cacheTarget is keyed on the original request, so a
+                    // redirected third-party body must not land under a
+                    // Discord URL (the serve paths inject with trust derived
+                    // from that URL). MainFrameDiskCache re-gates the disk
+                    // write.
+                    isAppOrigin &&
+                    // HTML only, judged on the declared type (see declaredCt).
+                    declaredCt != null && declaredCt.contains("text/html")
+                ) {
                     // GET-only: the LRU key carries the ORIGINAL request's
                     // method, but resolveRedirects may have converted the wire
                     // method, and a non-GET body under that key would serve a
@@ -1064,7 +1117,9 @@ class VWebviewClient(
                     mainFrameCache.put(cacheKey, entry)
                     // Refresh the in-memory preloaded shell so the preferred serve
                     // path doesn't fall back to a stale startup-time copy.
-                    if (urlString == "https://discord.com/app") {
+                    // isAppOrigin restated: this writes process-lifetime
+                    // state and must not rely on the enclosing gate.
+                    if (urlString == "https://discord.com/app" && isAppOrigin) {
                         val refreshed = MainFrameDiskCache.CachedMainFrame(
                             rawBodyBytes, reasonPhrase, headersToCache, System.currentTimeMillis()
                         )
@@ -1233,6 +1288,18 @@ class VWebviewClient(
         fun updateWebViewUserAgent(userAgent: String?) {
             webViewUserAgent = userAgent
         }
+
+        /**
+         * Decoded full path of an OkHttp URL, mirroring Android Uri.getPath():
+         * percent-decoded segments joined with "/". HttpUrl has no decoded
+         * full-path accessor and encodedPath preserves escapes like %62, so
+         * the shared gates must not compare encoded paths ("/%62log" would
+         * slip past a check for "/blog" or "/science"). The result always
+         * carries a leading "/"; an empty path yields "/" where Uri yields
+         * "", and no rule matches either.
+         */
+        internal fun decodedPath(url: HttpUrl): String =
+            "/" + url.pathSegments.joinToString("/")
 
         /**
          * Returns a blocking [WebResourceResponse] if the request matches a
@@ -1449,7 +1516,9 @@ class VWebviewClient(
         private fun inMemoryShell(urlString: String): MainFrameDiskCache.CachedMainFrame? {
             val shells = preloadedShells
             val entry = shells[urlString]
-            if (entry == null || System.currentTimeMillis() - entry.fetchedAt > MainFrameDiskCache.MAX_AGE_MS) {
+            if (entry == null || entry.body.isEmpty() ||
+                System.currentTimeMillis() - entry.fetchedAt > MainFrameDiskCache.MAX_AGE_MS
+            ) {
                 return null
             }
             return entry
