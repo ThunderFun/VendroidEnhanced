@@ -35,6 +35,12 @@ object HttpClient {
      * hops throw IOException and hit the cached-bundle fallback.
      */
     private const val MAX_REDIRECT_HOPS = 5
+
+    /**
+     * Cap on the Location header text embedded in redirect failure messages;
+     * the header is server-controlled and unbounded.
+     */
+    private const val MAX_LOGGED_LOCATION_CHARS = 300
     /**
      * Shared app-wide OkHttp client. Reuses pooled TCP/TLS connections across
      * requests to the same host, avoiding a fresh connect + TLS handshake.
@@ -49,6 +55,11 @@ object HttpClient {
         .connectTimeout(15, TimeUnit.SECONDS)
         .readTimeout(15, TimeUnit.SECONDS)
         .writeTimeout(15, TimeUnit.SECONDS)
+        // Bounds the whole exchange, including the body read: readTimeout
+        // resets per socket read, so a host dribbling bytes can hold an
+        // executor thread indefinitely (the 16MB cap limits bytes, not
+        // time). Per call, so each redirect hop gets its own window.
+        .callTimeout(30, TimeUnit.SECONDS)
         .followRedirects(false)       // keep false; see security note
         .followSslRedirects(false)    // keep false; OkHttp default is true
         .connectionPool(ConnectionPool(5, 5, TimeUnit.MINUTES))
@@ -105,6 +116,12 @@ object HttpClient {
      */
     private val vencordRuntimeLock = Any()
 
+    /**
+     * Unconditional write. Clears go through this, including MainActivity's
+     * safe-mode branch, so it must not check [vencordDisabled]; enforcement
+     * belongs at the publish sites ([setVencordRuntimeIfNull],
+     * [setVencordRuntimeIfEnabled]).
+     */
     @JvmStatic
     fun setVencordRuntime(value: String?) {
         synchronized(vencordRuntimeLock) { VencordRuntime = value }
@@ -148,6 +165,26 @@ object HttpClient {
     fun setVencordRuntimeIfNull(value: String?, stillValid: (() -> Boolean)? = null): Boolean =
         synchronized(vencordRuntimeLock) {
             if (VencordRuntime == null && !vencordDisabled && (stillValid == null || stillValid())) {
+                VencordRuntime = value
+                true
+            } else false
+        }
+
+    /**
+     * Publish for the authoritative download path: installs [value] only
+     * while the safe-mode kill switch is down. No null-check, unlike the CAS
+     * publishers; a fresh download must not be blocked by a stale in-memory
+     * runtime (see [setVencordRuntimeIfNull]).
+     *
+     * The check runs under [vencordRuntimeLock], so safe mode cannot be
+     * entered between the check and the write: the publish either precedes
+     * the raise, and the safe-mode clear nulls it, or it observes the raised
+     * flag and skips. Returns true when this call performed the publish.
+     */
+    @JvmStatic
+    fun setVencordRuntimeIfEnabled(value: String?): Boolean =
+        synchronized(vencordRuntimeLock) {
+            if (!vencordDisabled) {
                 VencordRuntime = value
                 true
             } else false
@@ -537,6 +574,14 @@ object HttpClient {
     @JvmStatic
     @Throws(IOException::class)
     fun fetchVencord(activity: Activity) {
+        // Self-gate on the kill switch so no caller can trigger a bundle
+        // download in a safe-mode session. The publish in
+        // [downloadStoreAndSync] re-checks under vencordRuntimeLock, which
+        // also covers safe mode entered mid-fetch.
+        if (vencordDisabled) {
+            VDELog.i("HTTP", "fetchVencord skipped: safe mode kill switch raised")
+            return
+        }
         val sPrefs = activity.getSharedPreferences("settings", Context.MODE_PRIVATE)
         val vencordLocation = resolveBundleLocation(sPrefs)
         val vencordHost = Uri.parse(vencordLocation).host
@@ -623,6 +668,9 @@ object HttpClient {
         // A validator is only ever sent to the URL whose response issued it.
         val storedEtag = storedEtagFor(sPrefs, vencordLocation, vencordLocation)
         var resp: Response? = null
+        // Set while a cache read inside the try is in flight, so the catch
+        // can tell a cache-read failure from a network failure.
+        var readingCache = false
         try {
             // ETag-conditional GET: 304 keeps the cache (cheap), 200 swaps in
             // a newer build. Detects new Vencord builds without wiping app
@@ -642,15 +690,19 @@ object HttpClient {
                 responseCode == HttpURLConnection.HTTP_NOT_MODIFIED && vendroidFile.exists() -> {
                     VDELog.i("HTTP", "Bundle branch: 304 (cache hit, fresh)")
                     if (VencordRuntime == null) {
-                        setVencordRuntimeIfNull(readBundleFromDisk(sPrefs, vendroidFile)) {
+                        readingCache = true
+                        val cached = readBundleFromDisk(sPrefs, vendroidFile)
+                        readingCache = false
+                        setVencordRuntimeIfNull(cached) {
                             vendroidFile.exists()
                         }
                     }
                     bundleCheckedThisSession = true
                     // Definitive freshness answer: stamp the window so later
                     // boots skip the round trip entirely. The fallback
-                    // branches below deliberately do not stamp: a failed
-                    // check must not masquerade as a fresh one.
+                    // branches below deliberately set neither this stamp nor
+                    // bundleCheckedThisSession. A failed check must not
+                    // masquerade as a fresh one in this process or the next.
                     sPrefs.edit()
                         .putLong(PREF_LAST_BUNDLE_CHECK, System.currentTimeMillis())
                         .apply()
@@ -663,7 +715,7 @@ object HttpClient {
                     resp = executeVencordGetResolvingRedirect(vencordLocation, null)
                     responseCode = resp.code
                     if (responseCode !in 200..299) {
-                        throw IOException("HTTP $responseCode fetching Vencord bundle from $vencordLocation")
+                        throw bundleHttpFailure(responseCode, vencordLocation)
                     }
                     downloadStoreAndSync(resp, vendroidFile, sPrefs, publishToRuntime = true, bundleLocation = vencordLocation)
                 }
@@ -677,24 +729,36 @@ object HttpClient {
                     // so startup doesn't break; otherwise surface the failure.
                     if (vendroidFile.exists() && VencordRuntime == null) {
                         VDELog.e("HTTP", "Bundle branch: fallback-cache (HTTP $responseCode)")
-                        setVencordRuntimeIfNull(readBundleFromDisk(sPrefs, vendroidFile)) {
+                        readingCache = true
+                        val cached = readBundleFromDisk(sPrefs, vendroidFile)
+                        readingCache = false
+                        setVencordRuntimeIfNull(cached) {
                             vendroidFile.exists()
                         }
-                        bundleCheckedThisSession = true
                     } else {
-                        throw IOException("HTTP $responseCode fetching Vencord bundle from $vencordLocation")
+                        throw bundleHttpFailure(responseCode, vencordLocation)
                     }
                 }
             }
         } catch (io: IOException) {
-            // Network failure during the version check must not brick startup
-            // when a cached bundle exists; only the no-cache case propagates.
+            // The failed operation was the cache read itself (304 hit or
+            // HTTP-error fallback). These failures are deterministic, so
+            // retrying would only throw again and escape as a fresh
+            // exception masking the original; rethrow io as-is. This also
+            // skips the mislabeled "network error" log line below.
+            if (readingCache) throw io
+            // Fall back to the cache only when there is something to load;
+            // rethrowing otherwise is fine: a missing file means nothing to
+            // load, and an in-memory runtime makes this a refresh, which
+            // MainActivity logs.
             if (vendroidFile.exists() && VencordRuntime == null) {
                 VDELog.e("HTTP", "Bundle branch: fallback-cache (network error: ${io.message})")
+                // Unlike the guarded reads above, a failure here propagates:
+                // the cache is unreadable and there is nothing left to fall
+                // back to. Fail closed.
                 setVencordRuntimeIfNull(readBundleFromDisk(sPrefs, vendroidFile)) {
                     vendroidFile.exists()
                 }
-                bundleCheckedThisSession = true
             } else {
                 throw io
             }
@@ -706,6 +770,15 @@ object HttpClient {
             (activity as? com.nin0dev.vendroid.MainActivity)?.injectVencordIfReady()
         }
     }
+
+    /**
+     * Non-2xx failure for the bundle fetch path. The location is redacted for
+     * the shareable log (best-effort: userinfo and token-like query/fragment
+     * params; a secret in the path still shows). Fresh instance per call so
+     * stack traces point at the real throw site.
+     */
+    private fun bundleHttpFailure(code: Int, location: String): IOException =
+        IOException("HTTP $code fetching Vencord bundle from ${UrlNormalizer.redactForLog(location)}")
 
     /**
      * Executes a conditional GET for the Vencord bundle over the shared pooled
@@ -723,15 +796,28 @@ object HttpClient {
      * across resources) and it was issued by [requestUrl]'s own response.
      * An ETag compared against a resource that did not issue it can produce
      * a false 304 that pins a stale bundle as fresh.
+     *
+     * The stored request URL is OkHttp's canonical form (resp.request.url),
+     * but hop 1 passes the raw bundle location, which can differ from it
+     * (host-only URL, uppercase host, default port, dot segments). The
+     * comparison also accepts [requestUrl]'s parsed form; two spellings
+     * match only when they denote the same resource. Redirect hop URLs are
+     * already canonical, so parsing is a no-op there.
      */
     private fun storedEtagFor(
         sPrefs: SharedPreferences,
         originUrl: String,
         requestUrl: String
-    ): String? =
-        stringPrefOrNull(sPrefs, PREF_ETAG)
+    ): String? {
+        val storedRequestUrl = stringPrefOrNull(sPrefs, PREF_ETAG_REQUEST_URL)
+        val canonicalRequestUrl = requestUrl.toHttpUrlOrNull()?.toString()
+        return stringPrefOrNull(sPrefs, PREF_ETAG)
             ?.takeIf { stringPrefOrNull(sPrefs, PREF_ETAG_LOCATION) == originUrl }
-            ?.takeIf { stringPrefOrNull(sPrefs, PREF_ETAG_REQUEST_URL) == requestUrl }
+            ?.takeIf {
+                storedRequestUrl == requestUrl ||
+                    (canonicalRequestUrl != null && storedRequestUrl == canonicalRequestUrl)
+            }
+    }
 
     /**
      * Resolves a redirect Location against the current hop's URL (relative
@@ -739,13 +825,18 @@ object HttpClient {
      * allowlist.
      */
     private fun resolveRedirectTarget(currentUrl: String, location: String): HttpUrl {
+        // Hop 1 is the caller's raw bundle location, so failure messages
+        // redact it (see bundleHttpFailure).
         if (location.isBlank()) {
-            throw IOException("Redirect with blank Location header from $currentUrl")
+            throw IOException("Redirect with blank Location header from ${UrlNormalizer.redactForLog(currentUrl)}")
         }
         val base = currentUrl.toHttpUrlOrNull()
-            ?: throw IOException("Unparseable current URL: $currentUrl")
+            ?: throw IOException("Unparseable current URL: ${UrlNormalizer.redactForLog(currentUrl)}")
         val target = base.resolve(location)
-            ?: throw IOException("Unresolvable redirect Location from $currentUrl: $location")
+            ?: throw IOException(
+                "Unresolvable redirect Location from ${UrlNormalizer.redactForLog(currentUrl)}: " +
+                    UrlNormalizer.redactForLog(location.take(MAX_LOGGED_LOCATION_CHARS))
+            )
         if (!target.isHttps) {
             throw IOException("Redirect to non-HTTPS scheme: ${target.scheme}")
         }
@@ -791,11 +882,11 @@ object HttpClient {
             // final response.
             resp.close()
             if (location == null) {
-                throw IOException("Redirect with no Location header from $currentUrl")
+                throw IOException("Redirect with no Location header from ${UrlNormalizer.redactForLog(currentUrl)}")
             }
             if (hops >= MAX_REDIRECT_HOPS) {
                 throw IOException(
-                    "Too many redirects (>$MAX_REDIRECT_HOPS) fetching Vencord bundle from $url"
+                    "Too many redirects (>$MAX_REDIRECT_HOPS) fetching Vencord bundle from ${UrlNormalizer.redactForLog(url)}"
                 )
             }
             val target = resolveRedirectTarget(currentUrl, location)
@@ -821,8 +912,9 @@ object HttpClient {
      * [resp].
      *
      * @param publishToRuntime when true, the in-memory runtime is replaced
-     *   immediately (startup path). The JS-bridge update path passes false so
-     *   the running bundle stays until the user restarts.
+     *   immediately (startup path) via [setVencordRuntimeIfEnabled], which
+     *   respects the safe-mode kill switch. The JS-bridge update path passes
+     *   false so the running bundle stays until the user restarts.
      */
     @Throws(IOException::class)
     fun downloadStoreAndSync(
@@ -897,9 +989,12 @@ object HttpClient {
             e.putBoolean(PREF_BUNDLE_PATCHED, true)
             e.putString(PREF_BUNDLE_PATCH_SET, bundlePatchSetKey)
             e.apply()
-            // Publish through the setter: a stalled disk-load CAS must not
-            // overwrite this fresher download.
-            if (publishToRuntime) setVencordRuntime(patched)
+            // Flag-guarded setter: a stalled disk-load CAS must not overwrite
+            // this fresher download, and a raised kill switch must block the
+            // publish.
+            if (publishToRuntime && !setVencordRuntimeIfEnabled(patched)) {
+                VDELog.w("HTTP", "Safe mode raised; bundle saved to disk only, runtime not published")
+            }
             bundleCheckedThisSession = true
             VDELog.i("HTTP", "Bundle patched and saved to disk (build=${buildTag ?: "unknown"} sha256=$hash)")
         }
@@ -999,8 +1094,10 @@ object HttpClient {
     ): ByteArray {
         // Seed the buffer from the expected content length (clamped) instead
         // of the full maxBytes ceiling, so a large max doesn't force a big
-        // up-front allocation on every small fetch.
-        val bos = ByteArrayOutputStream(initialSize.coerceIn(8192, maxBytes))
+        // up-front allocation on every small fetch. coerceIn(8192, maxBytes)
+        // throws IllegalArgumentException when maxBytes < 8192, so apply the
+        // floor and cap separately.
+        val bos = ByteArrayOutputStream(initialSize.coerceAtLeast(8192).coerceAtMost(maxBytes))
         val buf = ByteArray(8192)
         var total = 0
         while (true) {
@@ -1014,17 +1111,14 @@ object HttpClient {
     }
 
     class HttpException(resp: Response) : IOException() {
-        override val message: String? = try {
-            String.format(
-                    Locale.ENGLISH,
-                    "HTTP %d: %s (%s)",
-                    resp.code,
-                    resp.message,
-                    resp.request.url.host
-            )
-        } catch (_: IOException) {
-            "HTTP error for host: " + (resp.request.url.host ?: "unknown")
-        }
+        // No catch needed: resp.message and url.host are non-null in OkHttp.
+        override val message: String? = String.format(
+                Locale.ENGLISH,
+                "HTTP %d: %s (%s)",
+                resp.code,
+                resp.message,
+                resp.request.url.host
+        )
     }
 }
 

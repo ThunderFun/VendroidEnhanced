@@ -140,8 +140,17 @@ class VendroidApp : Application() {
             // this process. Read synchronously; Application.onCreate always
             // precedes Activity.onCreate here, so the read cannot race the
             // one-shot pref reset in MainActivity.
-            val safeMode = getSharedPreferences("settings", Context.MODE_PRIVATE)
-                .getBoolean("safeMode", false)
+            // runCatching: the first safeMode reader in the process, so a
+            // String-typed key (restored or hand-edited XML) would crash-loop
+            // :web cold start here, before MainActivity's guarded reads run.
+            // TRUE is the fail-safe fallback and only applies to a wrong
+            // type: the session runs without Vencord, and MainActivity's
+            // one-shot reset overwrites the poison with a real Boolean.
+            val safeMode = runCatching {
+                getSharedPreferences("settings", Context.MODE_PRIVATE)
+                    .getBoolean("safeMode", false)
+            }.onFailure { VDELog.w("VDE", "safeMode type-poisoned; failing safe: $it") }
+                .getOrDefault(true)
             if (safeMode) {
                 HttpClient.vencordDisabled = true
                 VDELog.w("VDE", "Safe mode: skipping Vencord runtime preload")

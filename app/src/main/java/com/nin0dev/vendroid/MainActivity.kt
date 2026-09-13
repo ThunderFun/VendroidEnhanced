@@ -282,6 +282,20 @@ class MainActivity : AppCompatActivity() {
         val initialUrl = resolveInitialUrl(sPrefs, intent)
         currentUrlForBridge = initialUrl
 
+        // resolveInitialUrl just consumed the launch intent; defuse it.
+        // configChanges (manifest) omits uiMode/locale/density, so dark-mode
+        // and locale changes recreate this activity. The recreation
+        // redelivers this same intent, setIntent included, so without the
+        // defuse every recreation re-ran the deep link: invites threw the
+        // user out of their channel and policy-triggering links re-showed
+        // the popup. A plain Intent() has a null action, so recreation falls
+        // through to the remembered-URL path. setIntent(null) would instead
+        // NPE resolveInitialUrl's intent.action read. Client-side only, so
+        // a process-death relaunch still redelivers the original link once.
+        if (intent.action == Intent.ACTION_VIEW) {
+            setIntent(Intent())
+        }
+
         wvInitialized = true
 
         // Apply a deep link stashed by onNewIntent during onCreate.
@@ -449,7 +463,16 @@ class MainActivity : AppCompatActivity() {
      *  Runs on the UI thread; disk I/O is delegated to
      *  [loadVencordRuntimesFromDisk]. */
     private fun loadVencordRuntimes(sPrefs: SharedPreferences, editor: SharedPreferences.Editor) {
-        if (!HttpClient.vencordDisabled && !sPrefs.getBoolean("safeMode", false)) {
+        // runCatching: a String-typed safeMode key (restored or hand-edited
+        // XML) would crash-loop :web cold start. The fallback is TRUE, not
+        // the file's usual false: false means "load Vencord", which would
+        // silently ignore the user's recovery request forever, since nothing
+        // rewrites a poisoned key. True fails safe and routes into the else
+        // branch, where the one-shot reset below overwrites the poison with
+        // a real Boolean.
+        if (!HttpClient.vencordDisabled && !runCatching { sPrefs.getBoolean("safeMode", false) }
+                .onFailure { VDELog.w("Main", "safeMode type-poisoned; failing safe: $it") }
+                .getOrDefault(true)) {
             vencordNative = VencordNative(WeakReference(this), wv!!)
             wv?.addJavascriptInterface(vencordNative, "VencordMobileNative")
             // Usually a no-op: VendroidApp.onCreate() preloads both runtimes
@@ -474,7 +497,14 @@ class MainActivity : AppCompatActivity() {
             HttpClient.setVencordMobileRuntime(null)
             // First-entry gate: the kill switch persists across recreations,
             // the pref does not, so only the first run toasts and resets.
-            if (sPrefs.getBoolean("safeMode", false)) {
+            // Guarded like the read above. It cannot throw in practice: the
+            // else branch is only reachable after this process already read
+            // the key, and the cached type cannot change mid-process.
+            // Defense-in-depth against a future reorder. TRUE keeps the
+            // reset below reachable on poison, so the key still heals.
+            if (runCatching { sPrefs.getBoolean("safeMode", false) }
+                    .onFailure { VDELog.w("Main", "safeMode type-poisoned; failing safe: $it") }
+                    .getOrDefault(true)) {
                 Toast.makeText(this, "Safe mode enabled, Vencord won't be loaded", Toast.LENGTH_SHORT)
                     .show()
                 VDELog.w("Main", "Safe mode enabled — Vencord will not load")
@@ -510,11 +540,12 @@ class MainActivity : AppCompatActivity() {
         Handler(Looper.getMainLooper()).postDelayed({
             val act = weakSelf.get()
             if (act == null || act.isFinishing || act.isDestroyed) return@postDelayed
-            // Mirrors runSafetyNetLoad's enqueue-race guard; fetchVencord
-            // does not self-gate on the kill switch. No in-process path
-            // currently flips vencordDisabled after scheduling (RecoveryActivity
-            // kills the :web process before committing safeMode, and the pref
-            // is one-shot-reset), so this check is cheap insurance.
+            // Mirrors runSafetyNetLoad's enqueue-race guard. fetchVencord now
+            // self-gates on the kill switch, so this only avoids enqueueing
+            // the task in safe mode. No in-process path currently flips
+            // vencordDisabled after scheduling (RecoveryActivity kills the
+            // :web process before committing safeMode, and the pref is
+            // one-shot-reset), so the check is cheap insurance.
             if (HttpClient.vencordDisabled) return@postDelayed
             try {
                 executor.execute {
@@ -551,7 +582,8 @@ class MainActivity : AppCompatActivity() {
     }
 
     /** Resolves the initial URL from a deep link intent or the last resume
-     *  URL. */
+     *  URL. The caller defuses a consumed deep-link launch (setIntent) so
+     *  recreation cannot re-run it. */
     private fun resolveInitialUrl(sPrefs: SharedPreferences, intent: Intent): String {
         if (intent.action == Intent.ACTION_VIEW) {
             val data = intent.data
