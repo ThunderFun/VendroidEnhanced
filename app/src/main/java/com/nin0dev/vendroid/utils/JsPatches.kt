@@ -74,10 +74,13 @@ object JsPatches {
             // data: workers execute code, so they stay blocked. Unparseable
             // strings fail open.
             "function bad(u,w){var s=g(u);if(s===null)return false;var p;try{p=new URL(s,location.href);}catch(e){return false;}var c=p.protocol;" +
-            "if(c==='blob:'){try{return !ok(new URL(p.pathname).host);}catch(e){return true;}}" +
+            "if(c==='blob:'){try{return !ok(new URL(p.pathname).hostname);}catch(e){return true;}}" +
             "if(c==='data:')return !!w;" +
             "if(c!=='https:'&&c!=='wss:')return true;" +
-            "return !ok(p.host);}" +
+            // hostname, not host: URL.host includes the port (voice RTC uses
+            // :2096), so an allowlist entry like .discord.media would never
+            // match the voice gateway.
+            "return !ok(p.hostname);}" +
             // Redact query/fragment so token-bearing URLs never reach the shareable log.
             "function redact(u){if(!u)return u;try{var q=u.indexOf('?'),f=u.indexOf('#'),e=q<0?f:(f<0?q:Math.min(q,f));return e<0?u:u.slice(0,e)+'[...]';}catch(e){return u;}}" +
             "var of=window.fetch;window.fetch=function(u,o){if(bad(u)){console.warn('[Vendroid] Blocked fetch: '+redact(g(u)));return Promise.reject(new TypeError('Blocked by Vendroid firewall'));}return of.apply(this,arguments);};" +

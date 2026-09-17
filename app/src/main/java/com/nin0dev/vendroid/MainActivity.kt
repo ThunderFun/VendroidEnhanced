@@ -14,6 +14,7 @@ import android.os.Handler
 import android.os.Looper
 import java.io.File
 import android.view.View
+import android.webkit.PermissionRequest
 import android.webkit.ValueCallback
 import android.webkit.WebView
 import android.webkit.WebChromeClient
@@ -89,6 +90,13 @@ class MainActivity : AppCompatActivity() {
 
     @JvmField
     var filePathCallback: ValueCallback<Array<Uri>>? = null
+
+    // WebView capture (getUserMedia) permission flow. onPermissionRequest
+    // runs on the UI thread, but the runtime prompt is answered later, so the
+    // request is parked here until onRequestPermissionsResult. UI thread only,
+    // like wv.
+    private var pendingPermissionRequest: PermissionRequest? = null
+    private var pendingPermissionResources: Array<String> = emptyArray()
 
     val fileChooserLauncher: ActivityResultLauncher<Intent> = registerForActivityResult(
         ActivityResultContracts.StartActivityForResult()
@@ -594,7 +602,8 @@ class MainActivity : AppCompatActivity() {
                 // Route through NavigationPolicy so path rules (e.g. /blog ->
                 // popup) apply to deep links like in-WebView navigations,
                 // instead of bypassing them via a direct loadUrl.
-                if (com.nin0dev.vendroid.webview.NavigationPolicy.decide(data, true)
+                val action = com.nin0dev.vendroid.webview.NavigationPolicy.decide(data, true)
+                if (action
                     == com.nin0dev.vendroid.webview.NavigationPolicy.Action.LOAD_IN_WEBVIEW) {
                     wv!!.loadUrl(target)
                     currentUrlForBridge = target
@@ -603,9 +612,12 @@ class MainActivity : AppCompatActivity() {
                     currentHostForBridge = host
                     return target
                 }
-                // Path/domain rule triggered (e.g. /blog or a CDN host): route
-                // to the link popup and land on the app shell.
-                com.nin0dev.vendroid.webview.LinkHandler(this).showLinkPopup(data)
+                // Path/domain rule (e.g. /blog or a CDN host): show the popup
+                // and load the app shell. IGNORE skips the popup.
+                if (action
+                    == com.nin0dev.vendroid.webview.NavigationPolicy.Action.SHOW_POPUP) {
+                    com.nin0dev.vendroid.webview.LinkHandler(this).showLinkPopup(data)
+                }
                 currentUrlForBridge = "https://discord.com/app"
                 currentHostForBridge = "discord.com"
                 wv!!.loadUrl("https://discord.com/app")
@@ -666,8 +678,11 @@ class MainActivity : AppCompatActivity() {
         // (resolveInitialUrl). Otherwise a /blog link drives the
         // SPA to a page with no back path, and a cdn.discordapp.com link
         // builds a garbage transitionTo route from the URL's path.
-        if (com.nin0dev.vendroid.webview.NavigationPolicy.decide(url, true)
-            != com.nin0dev.vendroid.webview.NavigationPolicy.Action.LOAD_IN_WEBVIEW) {
+        val action = com.nin0dev.vendroid.webview.NavigationPolicy.decide(url, true)
+        if (action == com.nin0dev.vendroid.webview.NavigationPolicy.Action.IGNORE) {
+            return
+        }
+        if (action != com.nin0dev.vendroid.webview.NavigationPolicy.Action.LOAD_IN_WEBVIEW) {
             // Path/domain rule triggered (e.g. /blog or a CDN host): show the
             // link popup and stay on the current page (cold start has no
             // current page, so it loads the shell instead). Leave the bridge
@@ -722,6 +737,94 @@ class MainActivity : AppCompatActivity() {
                     "{Vencord.Webpack.Common.NavigationRouter.transitionTo(${gson.toJson(path)})}",
                 null
             )
+        }
+    }
+
+    /**
+     * Answers a WebView capture permission request from [VChromeClient]. Only
+     * audio maps to an Android runtime permission; everything else is denied.
+     * Grants wait until RECORD_AUDIO is held, since the WebView rejects
+     * getUserMedia if the app grants capture without it.
+     *
+     * Runs on the UI thread.
+     */
+    fun requestVoicePermissions(
+        request: PermissionRequest,
+        resources: Array<String>
+    ) {
+        // Grant only resources backed by an Android permission this app holds.
+        // A page can bundle camera capture into the same request; granting the
+        // full list would hand out permissions we never requested.
+        val grantable = resources.filter {
+            it == PermissionRequest.RESOURCE_AUDIO_CAPTURE
+        }.toTypedArray()
+        val androidPerms = grantable.mapNotNull {
+            when (it) {
+                PermissionRequest.RESOURCE_AUDIO_CAPTURE ->
+                    android.Manifest.permission.RECORD_AUDIO
+                else -> null
+            }
+        }.toTypedArray()
+        if (androidPerms.isEmpty()) {
+            VDELog.w("Voice", "Capture request with no grantable resource; denying")
+            request.deny()
+            return
+        }
+        val missing = androidPerms.filter {
+            checkSelfPermission(it) != android.content.pm.PackageManager.PERMISSION_GRANTED
+        }.toTypedArray()
+        if (missing.isEmpty()) {
+            VDELog.i("Voice", "Granting WebView capture (runtime permission already held)")
+            request.grant(grantable)
+            return
+        }
+        // Deny a stale request before parking the new one, or the page waits
+        // forever.
+        pendingPermissionRequest?.let { stale ->
+            VDELog.w("Voice", "Superseding an unanswered WebView capture request")
+            try {
+                stale.deny()
+            } catch (t: Throwable) {
+                VDELog.w("Voice", "Superseded deny failed: $t")
+            }
+        }
+        pendingPermissionRequest = request
+        pendingPermissionResources = grantable
+        VDELog.i("Voice", "Requesting Android runtime permission: ${missing.joinToString(",")}")
+        requestPermissions(missing, VOICE_PERMISSION_REQUEST)
+    }
+
+    override fun onRequestPermissionsResult(
+        requestCode: Int,
+        permissions: Array<out String>,
+        grantResults: IntArray
+    ) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+        if (requestCode != VOICE_PERMISSION_REQUEST) return
+        val req = pendingPermissionRequest
+        val res = pendingPermissionResources
+        pendingPermissionRequest = null
+        pendingPermissionResources = emptyArray()
+        if (req == null) {
+            VDELog.w("Voice", "Permission result with no pending capture request")
+            return
+        }
+        val granted = grantResults.isNotEmpty() &&
+            grantResults.all { it == android.content.pm.PackageManager.PERMISSION_GRANTED }
+        if (granted) {
+            VDELog.i("Voice", "Android microphone permission granted; granting WebView capture")
+            try {
+                req.grant(res)
+            } catch (t: Throwable) {
+                VDELog.e("Voice", "Granting WebView capture failed", t)
+            }
+        } else {
+            VDELog.w("Voice", "Android microphone permission denied; denying WebView capture")
+            try {
+                req.deny()
+            } catch (t: Throwable) {
+                VDELog.e("Voice", "Denying WebView capture failed", t)
+            }
         }
     }
 
@@ -785,6 +888,17 @@ class MainActivity : AppCompatActivity() {
     }
 
     override fun onDestroy() {
+        // Deny a request that never got a runtime-permission answer; the
+        // WebView may already be destroyed.
+        pendingPermissionRequest?.let {
+            try {
+                it.deny()
+            } catch (t: Throwable) {
+                VDELog.w("Voice", "Could not deny pending capture request on destroy: $t")
+            }
+        }
+        pendingPermissionRequest = null
+        pendingPermissionResources = emptyArray()
         // Dismiss tracked dialogs before anything else. After onDestroy the
         // framework's window cleanup logs WindowLeaked and removes the views
         // without running dismiss listeners. SecureWebViewDialog destroys its
@@ -1080,6 +1194,9 @@ class MainActivity : AppCompatActivity() {
 
         /** Bound on the parse-completion retries in injectVencordAttempt (100ms apart). */
         private const val INJECT_POLL_MAX_ATTEMPTS = 20
+
+        /** requestCode for the WebView capture runtime-permission flow. */
+        private const val VOICE_PERMISSION_REQUEST = 0x564F
 
         /** Delay before the deferred bundle freshness check fires (see
          *  [scheduleDeferredBundleCheck]). Tunable; should sit past the boot

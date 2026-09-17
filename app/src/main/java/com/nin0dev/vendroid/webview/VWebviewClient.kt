@@ -70,6 +70,8 @@ class VWebviewClient(
         // Non-allowlisted links go to the link popup (Copy / Open / Share / Cancel).
         when (NavigationPolicy.decide(url, request.isForMainFrame)) {
             NavigationPolicy.Action.LOAD_IN_WEBVIEW -> return false
+            // Non-browser schemes: cancel, no popup.
+            NavigationPolicy.Action.IGNORE -> return true
             NavigationPolicy.Action.SHOW_POPUP -> {
                 VDELog.d("WV", "External link: ${UrlNormalizer.redactForLog(url.toString())}")
                 linkHandler.showLinkPopup(url)
@@ -837,43 +839,6 @@ class VWebviewClient(
             .ifEmpty { "frame-ancestors 'none'; base-uri 'none'; object-src 'none'" }
     }
 
-    /**
-     * Strict CSP for Discord main-frame responses. `connect-src` is tightened
-     * to block token/message exfiltration to non-allowlisted hosts; the forge
-     * hosts in `style-src` keep user themes working.
-     *
-     * Notes:
-     *  - `script-src` needs 'unsafe-inline' + 'unsafe-eval' (webpack + the
-     *    injected firewall <script>), so this guards exfil, not XSS.
-     *  - `style-src` needs 'unsafe-inline' + data: for injectStyle().
-     */
-    private fun buildVencordCompatibleCsp(): String =
-        "default-src 'self'; " +
-            "script-src 'self' 'unsafe-inline' 'unsafe-eval'; " +
-            "style-src 'self' 'unsafe-inline' data: " +
-            "https://*.githack.com https://cbcdn.githack.com " +
-            "https://raw.githubusercontent.com https://cdn.jsdelivr.net " +
-            "https://*.github.io https://*.codeberg.page; " +
-            "connect-src 'self' https://*.discord.com https://*.discordapp.com " +
-            "https://*.discord.media https://*.discordapp.net " +
-            // Wildcards, not bare hosts: Discord assigns regional gateways
-            // (wss://gateway-us-east1-b.discord.gg) and voice gateways on
-            // *.discord.media, which a bare wss://gateway.discord.gg misses.
-            "wss://*.discord.gg wss://*.discord.media " +
-            // Attachment uploads PUT files directly to signed URLs on these
-            // Discord-owned buckets. Pinned, not *.storage.googleapis.com, so
-            // attacker-created buckets stay blocked as exfil targets.
-            "https://discord-attachments-uploads-prd.storage.googleapis.com " +
-            "https://discord-attachments-upstream-prd.storage.googleapis.com " +
-            "https://vde-builds.nin0.dev " +
-            "https://badges.vencord.dev https://vendroid.nin0.dev; " +
-            "img-src * data: blob:; " +
-            "media-src * blob:; " +
-            "font-src * data:; " +
-            "worker-src 'self' blob:; " +
-            "child-src * blob:; " +
-            "object-src 'none'; base-uri 'none'; frame-ancestors 'none'"
-
     /** Cache key = URL + method + variant/conditional headers, so a cached
      *  body is only served to an identical request.
      */
@@ -926,14 +891,14 @@ class VWebviewClient(
                 if (BuildConfig.ENFORCE_STRICT_CSP) {
                     // Enforce the strict policy; the browser itself blocks
                     // exfiltration (connect-src) to non-allowlisted hosts.
-                    modifiedHeaders["content-security-policy"] = buildVencordCompatibleCsp()
+                    modifiedHeaders["content-security-policy"] = VencordCsp.build()
                 } else {
                     // Report-only: keep the enforced policy loose and attach the
                     // strict policy as Report-Only to collect violations first.
                     val stripped = stripVencordIncompatibleCsp(value)
                     if (stripped.isNotEmpty()) modifiedHeaders["content-security-policy"] = stripped
                     if (isMainFrame) {
-                        modifiedHeaders["content-security-policy-report-only"] = buildVencordCompatibleCsp()
+                        modifiedHeaders["content-security-policy-report-only"] = VencordCsp.build()
                     }
                 }
                 continue

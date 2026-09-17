@@ -7,6 +7,7 @@ import android.util.Log
 import android.view.View
 import android.webkit.ConsoleMessage
 import android.webkit.ConsoleMessage.MessageLevel
+import android.webkit.PermissionRequest
 import android.webkit.ValueCallback
 import android.webkit.WebChromeClient
 import android.webkit.WebView
@@ -111,6 +112,36 @@ class VChromeClient(activity: MainActivity) : WebChromeClient() {
             }
         }
         return true
+    }
+
+    /**
+     * Routes a page capture request (getUserMedia) through the Android
+     * runtime permission flow. Only audio is granted; camera, MIDI and
+     * protected media are denied. The grant itself happens in
+     * [MainActivity.requestVoicePermissions] once RECORD_AUDIO is held, since
+     * the WebView rejects getUserMedia if the app grants capture without it.
+     */
+    override fun onPermissionRequest(request: PermissionRequest) {
+        val activity = activityRef.get()
+        if (activity == null) {
+            VDELog.w("Voice", "Capture request denied: activity gone")
+            request.deny()
+            return
+        }
+        if (!request.resources.contains(PermissionRequest.RESOURCE_AUDIO_CAPTURE)) {
+            VDELog.w(
+                "Voice",
+                "Capture request denied: resources=${request.resources.joinToString(",")}"
+            )
+            request.deny()
+            return
+        }
+        // request.origin is a Uri; redact its query/fragment before logging.
+        VDELog.i(
+            "Voice",
+            "Audio capture requested by ${UrlNormalizer.redactForLog(request.origin?.toString() ?: "?")}"
+        )
+        activity.requestVoicePermissions(request, request.resources)
     }
 
     override fun onShowFileChooser(
