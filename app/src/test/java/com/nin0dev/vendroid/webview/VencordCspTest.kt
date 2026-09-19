@@ -3,14 +3,12 @@ package com.nin0dev.vendroid.webview
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
-/**
- * Regression tests for [VencordCsp.build].
- *
- * A CSP host-source with no explicit port only matches the scheme default
- * (443 for wss), so the voice RTC gateway on 2053/2096 was rejected as a
- * connect-src violation even with `wss://*.discord.media` listed. Covers both
- * that and the matching `URL.host` vs `URL.hostname` firewall check.
- */
+// Regression tests for VencordCsp.build. A CSP host-source with no explicit
+// port only matches the scheme default (443 for wss), so the voice RTC
+// gateway on 2053/2096 was rejected as a connect-src violation even with a
+// wildcard entry for .discord.media. Also covers the matching URL.host vs
+// URL.hostname firewall check.
+
 class VencordCspTest {
 
     private val csp = VencordCsp.build()

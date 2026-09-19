@@ -163,8 +163,17 @@ object JsPatches {
      * is unusable (the bundle destructures it once at line 46, so a later
      * recovery cannot help). Engage state is logged so device reports show it.
      *
-     * Idempotent (__vdeEnvShim guard). Must contain no "</script" / "<!--"
-     * because callers concatenate it raw inside <script> tags.
+     * Output-device shim. Android Chromium lacks setSinkId (Chromium bug
+     * 41276355), and Discord's WebRTC engine reads that absence at
+     * module-eval as its AUDIO_OUTPUT_DEVICE capability, which gates the
+     * output-device warning in Voice & Video. A no-op sink and a synthetic
+     * Default output clear it. Routing stays with the OS. This runs before
+     * Discord's deferred bundles; setupOutputDeviceSupport() covers the
+     * evaluate fallback path.
+     *
+     * Idempotent (__vdeEnvShim, __vendroidOutputShim, __vendroidOutputEnum).
+     * Must contain no "</script" / "<!--" because callers concatenate it raw
+     * inside <script> tags.
      */
     const val VENCORD_PRELUDE_JS: String =
         "(function(){" +
@@ -183,6 +192,48 @@ object JsPatches {
                     "Object.defineProperty(window.navigator.mediaDevices,'getDisplayMedia',{value:rej,configurable:true,writable:true});" +
                 "}" +
             "}catch(e){console.warn('[Vendroid] env shim mediaDevices failed:',e)}" +
+            // See the KDoc. Installs only when setSinkId is absent, so a
+            // future Android WebView implementation is never shadowed.
+            "try{" +
+                "if(!window.__vendroidOutputShim){" +
+                    "window.__vendroidOutputShim=1;" +
+                    "var vdeProto=(window.HTMLMediaElement&&HTMLMediaElement.prototype)||null;" +
+                    "var vdeShimmed=false;" +
+                    "if(vdeProto&&!('setSinkId' in vdeProto)){" +
+                        "try{" +
+                            "Object.defineProperty(vdeProto,'setSinkId',{configurable:true,writable:true,value:function(deviceId){" +
+                                "try{this.sinkId=deviceId}catch(e){}" +
+                                "return Promise.resolve();" +
+                            "}});" +
+                            "vdeShimmed=true;" +
+                            "console.warn('[Vendroid] Output: setSinkId shim installed')" +
+                        "}catch(e){console.warn('[Vendroid] Output: setSinkId shim failed: '+e.message)}" +
+                    "}else if(vdeProto){" +
+                        "console.warn('[Vendroid] Output: native setSinkId present; shim skipped')" +
+                    "}" +
+                    "var vdeMd=window.navigator&&window.navigator.mediaDevices;" +
+                    "if(vdeShimmed&&vdeMd&&typeof vdeMd.enumerateDevices==='function'&&!vdeMd.__vendroidOutputEnum){" +
+                        "try{" +
+                            "var vdeOrig=vdeMd.enumerateDevices.bind(vdeMd);" +
+                            "Object.defineProperty(vdeMd,'enumerateDevices',{configurable:true,writable:true,value:function(){" +
+                                "return vdeOrig().then(function(list){" +
+                                    "var out=(list&&typeof list.length==='number')?Array.prototype.slice.call(list):[];" +
+                                    "var have=false;" +
+                                    "for(var i=0;i<out.length;i++){if(out[i]&&out[i].kind==='audiooutput'){have=true;break}}" +
+                                    "if(!have){" +
+                                        "var dev={deviceId:'default',kind:'audiooutput',label:'Default',groupId:'vendroid'};" +
+                                        "try{Object.defineProperty(dev,'toJSON',{value:function(){return {deviceId:'default',kind:'audiooutput',label:'Default',groupId:'vendroid'}}})}catch(e){}" +
+                                        "out.push(dev);" +
+                                    "}" +
+                                    "return out;" +
+                                "});" +
+                            "}});" +
+                            "Object.defineProperty(vdeMd,'__vendroidOutputEnum',{value:true,configurable:true});" +
+                            "console.warn('[Vendroid] Output: enumerateDevices shim installed')" +
+                        "}catch(e){console.warn('[Vendroid] Output: enumerateDevices shim failed: '+e.message)}" +
+                    "}" +
+                "}" +
+            "}catch(e){console.warn('[Vendroid] Output: shim failed: '+e.message)}" +
             // In-memory fallback only when storage looks broken
             "try{" +
                 "var ls=null;try{ls=window.localStorage}catch(_){ls=undefined}" +
